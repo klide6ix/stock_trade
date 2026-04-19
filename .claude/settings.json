@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import dotenv; print\\(dotenv.__file__\\)\")",
+      "Bash(python3 -c \"import dotenv\")",
+      "Bash(pip3 list:*)",
+      "Bash(python -c \"import dotenv; print\\(''OK''\\)\")",
+      "Bash(python -c \"from dotenv import load_dotenv; load_dotenv\\(\\); import os; print\\(''APP_KEY:'', ''SET'' if os.getenv\\(''APP_KEY''\\) else ''MISSING''\\); print\\(''APP_SECRET:'', ''SET'' if os.getenv\\(''APP_SECRET''\\) else ''MISSING''\\); print\\(''ACCOUNT_NO:'', ''SET'' if os.getenv\\(''ACCOUNT_NO''\\) else ''MISSING''\\)\")",
+      "Bash(streamlit --version)",
+      "Bash(python -c \"from core.trader import run; from core.logger import log; from ui.dashboard import render_log; print\\(''imports OK''\\)\")",
+      "Bash(python -m compileall -q core main.py ui)",
+      "Read(//Users/klide6/.claude/**)",
+      "Edit(/.claude/skills/readme-sync/**)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('core/trader.py'\\).read\\(\\)\\); ast.parse\\(open\\('core/kis_api.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('core/trader.py'\\).read\\(\\)\\); ast.parse\\(open\\('ui/dashboard.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
+    ]
+  }
+}

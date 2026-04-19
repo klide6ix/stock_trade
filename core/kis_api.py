@@ -142,6 +142,7 @@ def get_cash_balance() -> dict:
     summary = output2[0] if output2 else {}
     return {
         "예수금": float(summary.get("dnca_tot_amt", "0")),
+        "주문가능금액": float(summary.get("nxdy_excc_amt", "0")),
         "총평가금액": float(summary.get("tot_evlu_amt", "0")),
         "순자산": float(summary.get("nass_amt", "0")),
     }

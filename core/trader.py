@@ -152,9 +152,9 @@ class Trader:
             return
 
         try:
-            cash = get_cash_balance()["예수금"]
+            cash = get_cash_balance()["주문가능금액"]
         except Exception as e:
-            log(f"[초기매수] 예수금 조회 실패: {e}")
+            log(f"[초기매수] 주문가능금액 조회 실패: {e}")
             return
 
         owned = set(get_holdings().keys())
@@ -164,7 +164,7 @@ class Trader:
             log("[초기매수] 실행 가능한 주문 없음 - 스킵")
             return
 
-        log(f"[초기매수] 예수금 {cash:,.0f}원 / {len(plan)}종목 주문 예정")
+        log(f"[초기매수] 주문가능금액 {cash:,.0f}원 / {len(plan)}종목 주문 예정")
         for item in plan:
             log(f"[초기매수] {item['종목명']}({item['종목코드']}) {item['수량']}주 × {item['현재가']:,.0f}원 ≈ {item['예상금액']:,.0f}원")
             self._place_buy(item["종목코드"], item["종목명"], item["수량"])
@@ -187,9 +187,9 @@ class Trader:
                 continue
 
             try:
-                cash = get_cash_balance()["예수금"]
+                cash = get_cash_balance()["주문가능금액"]
             except Exception as e:
-                log(f"[매도후재매수] 예수금 조회 실패: {e}")
+                log(f"[매도후재매수] 주문가능금액 조회 실패: {e}")
                 return
 
             price = c["현재가"]
@@ -200,7 +200,7 @@ class Trader:
             if price * qty > cash:
                 qty = int(cash // price)
             if qty <= 0:
-                log(f"[매도후재매수] 예수금 부족 ({cash:,.0f}원 < {price:,.0f}원) - 스킵")
+                log(f"[매도후재매수] 주문가능금액 부족 ({cash:,.0f}원 < {price:,.0f}원) - 스킵")
                 return
 
             log(f"[매도후재매수] 선정: {c['종목명']}({code}) {qty}주 × {price:,.0f}원 ≈ {price*qty:,.0f}원")

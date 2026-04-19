@@ -9,6 +9,7 @@ from config import STOP_LOSS_PCT, CHECK_INTERVAL
 from core.kis_api import get_holdings, get_current_price, get_volume_rank, get_cash_balance
 from core.logger import LOG_FILE
 from core.trader import is_market_open, plan_initial_buy, BUY_CANDIDATES_FILE, TRADE_HISTORY_FILE
+from core.strategy.buy.volume_momentum import VolumeMomentumBuyStrategy
 from core.strategy.sell import PEAK_PRICES_FILE
 from core.settings import load_settings, set_value as set_setting
 
@@ -118,10 +119,11 @@ def render_cash_balance() -> None:
 
     stale = balance is st.session_state.last_cash_balance and st.session_state.last_cash_balance is not None
 
-    b1, b2, b3 = st.columns(3)
-    b1.metric("💰 예수금 (주문 가능 현금)", f"{balance['예수금']:,.0f}원")
-    b2.metric("📊 총 평가금액", f"{balance['총평가금액']:,.0f}원")
-    b3.metric("🏦 순자산", f"{balance['순자산']:,.0f}원")
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("💰 예수금", f"{balance['예수금']:,.0f}원")
+    b2.metric("🛒 주문가능금액", f"{balance['주문가능금액']:,.0f}원")
+    b3.metric("📊 총 평가금액", f"{balance['총평가금액']:,.0f}원")
+    b4.metric("🏦 순자산", f"{balance['순자산']:,.0f}원")
 
     if stale:
         st.caption("⚠️ 잔액은 마지막 조회 기준입니다.")
@@ -185,9 +187,27 @@ def render_holdings(market_open: bool) -> None:
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
+def refresh_buy_candidates() -> list[dict]:
+    """매수 후보를 다시 탐색하고 파일에 저장"""
+    strategy = VolumeMomentumBuyStrategy()
+    candidates = strategy.find_candidates()
+    with open(BUY_CANDIDATES_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {"updated_at": datetime.now().isoformat(), "candidates": candidates},
+            f, ensure_ascii=False, indent=2,
+        )
+    return candidates
+
+
 def render_buy_candidates() -> None:
     """거래량 상위 20종목 중 주간 상승률 상위 5종목 표시 (trader 저장 파일 또는 세션 캐시 사용)"""
-    st.subheader("매수 후보 (시가총액 상위 100 → 거래량 상위 20 → 주간 상승률 상위 5)")
+    col_title, col_btn = st.columns([6, 1])
+    col_title.subheader("매수 후보 (시가총액 상위 100 → 거래량 상위 20 → 주간 상승률 상위 5)")
+    if col_btn.button("🔄 새로고침", key="refresh_candidates"):
+        with st.spinner("매수 후보 탐색 중..."):
+            candidates = refresh_buy_candidates()
+        st.session_state.buy_candidates = candidates
+        st.rerun()
 
     data = None
     updated_at = None
@@ -265,7 +285,7 @@ def render_buy_plan_preview() -> None:
         st.warning("예수금을 알 수 없어 미리보기를 생성할 수 없습니다.")
         return
 
-    cash = balance["예수금"]
+    cash = balance["주문가능금액"]
     try:
         owned = set(get_holdings().keys())
     except Exception:
@@ -274,14 +294,14 @@ def render_buy_plan_preview() -> None:
     plan = plan_initial_buy(candidates, cash, owned)
 
     if not plan:
-        st.info("매수 가능한 후보가 없습니다 (예수금 부족 또는 모두 보유 중).")
+        st.info("매수 가능한 후보가 없습니다 (주문가능금액 부족 또는 모두 보유 중).")
         return
 
     total = sum(p["예상금액"] for p in plan)
     slot = cash / max(1, len([c for c in candidates if c["종목코드"] not in owned]))
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("예수금", f"{cash:,.0f}원")
+    c1.metric("주문가능금액", f"{cash:,.0f}원")
     c2.metric("슬롯(종목당 배정)", f"{slot:,.0f}원")
     c3.metric("예상 총 주문액", f"{total:,.0f}원")
 
