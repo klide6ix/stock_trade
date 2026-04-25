@@ -177,39 +177,6 @@ def get_per_eps(stock_code: str) -> dict:
     }
 
 
-def get_volume_rank(top_n: int = 5) -> list[dict]:
-    """거래량 상위 종목 조회. [{rank, code, name, price, change_pct, volume}] 반환"""
-    url = f"{BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank"
-    params = {
-        "FID_COND_MRKT_DIV_CODE": "J",
-        "FID_COND_SCR_DIV_CODE": "20171",
-        "FID_INPUT_ISCD": "0000",
-        "FID_DIV_CLS_CODE": "0",
-        "FID_BLNG_CLS_CODE": "0",
-        "FID_TRGT_CLS_CODE": "111111111",
-        "FID_TRGT_EXLS_CLS_CODE": "000000",
-        "FID_INPUT_PRICE_1": "",
-        "FID_INPUT_PRICE_2": "",
-        "FID_VOL_CNT": "",
-        "FID_INPUT_DATE_1": "",
-    }
-    res = requests.get(url, headers=_headers("FHPST01710000"), params=params)
-    res.raise_for_status()
-    data = res.json()
-
-    result = []
-    for item in data.get("output", [])[:top_n]:
-        result.append({
-            "순위": int(item.get("data_rank", 0)),
-            "종목코드": item.get("mksc_shrn_iscd", ""),
-            "종목명": item.get("hts_kor_isnm", ""),
-            "현재가": float(item.get("stck_prpr", 0)),
-            "등락률(%)": float(item.get("prdy_ctrt", 0)),
-            "거래량": int(item.get("acml_vol", 0)),
-        })
-    return result
-
-
 def get_weekly_price_change(stock_code: str) -> float | None:
     """최근 1주일 종가 기준 가격 변화율(%) 반환. 실패 시 None"""
     today = datetime.now()
@@ -268,6 +235,40 @@ def get_market_cap_rank(top_n: int = 100) -> list[dict]:
             "현재가": float(item.get("stck_prpr", 0)),
             "시가총액(억)": int(item.get("stck_avls", 0)),
             "거래량": int(item.get("acml_vol", 0)),
+        })
+    return result
+
+
+def get_fluctuation_rank(top_n: int = 30) -> list[dict]:
+    """일간 등락률 상위 종목 조회 (상승률 순). [{종목코드, 종목명, 현재가, 등락률(%)}] 반환"""
+    url = f"{BASE_URL}/uapi/domestic-stock/v1/ranking/fluctuation"
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_COND_SCR_DIV_CODE": "20170",
+        "FID_INPUT_ISCD": "0000",
+        "FID_RANK_SORT_CLS_CODE": "0",
+        "FID_INPUT_CNT_1": "0",
+        "FID_PRC_CLS_CODE": "1",
+        "FID_INPUT_PRICE_1": "",
+        "FID_INPUT_PRICE_2": "",
+        "FID_VOL_CNT": "",
+        "FID_TRGT_CLS_CODE": "0",
+        "FID_TRGT_EXLS_CLS_CODE": "0",
+        "FID_DIV_CLS_CODE": "0",
+        "FID_RSFL_RATE1": "",
+        "FID_RSFL_RATE2": "",
+    }
+    res = requests.get(url, headers=_headers("FHPST01700000"), params=params)
+    res.raise_for_status()
+
+    result = []
+    for item in res.json().get("output", [])[:top_n]:
+        code = item.get("stck_shrn_iscd") or item.get("mksc_shrn_iscd", "")
+        result.append({
+            "종목코드": code,
+            "종목명": item.get("hts_kor_isnm", ""),
+            "현재가": float(item.get("stck_prpr", 0)),
+            "등락률(%)": float(item.get("prdy_ctrt", 0)),
         })
     return result
 

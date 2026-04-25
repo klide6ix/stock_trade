@@ -6,7 +6,7 @@ import streamlit as st
 from datetime import datetime
 
 from config import STOP_LOSS_PCT, CHECK_INTERVAL
-from core.kis_api import get_holdings, get_current_price, get_volume_rank, get_cash_balance
+from core.kis_api import get_holdings, get_current_price, get_cash_balance
 from core.logger import LOG_FILE
 from core.trader import is_market_open, plan_initial_buy, BUY_CANDIDATES_FILE, TRADE_HISTORY_FILE
 from core.strategy.buy.volume_momentum import VolumeMomentumBuyStrategy
@@ -28,8 +28,6 @@ if "peak_prices" not in st.session_state:
     st.session_state.peak_prices = _pp
 if "last_prices" not in st.session_state:
     st.session_state.last_prices = {}
-if "last_volume_rank" not in st.session_state:
-    st.session_state.last_volume_rank = []
 if "buy_candidates" not in st.session_state:
     st.session_state.buy_candidates = None
 if "last_cash_balance" not in st.session_state:
@@ -200,9 +198,9 @@ def refresh_buy_candidates() -> list[dict]:
 
 
 def render_buy_candidates() -> None:
-    """거래량 상위 20종목 중 주간 상승률 상위 5종목 표시 (trader 저장 파일 또는 세션 캐시 사용)"""
+    """시총 100 ∩ 일간등락률 상위 → 종합티어 상위 4 (trader 저장 파일 또는 세션 캐시 사용)"""
     col_title, col_btn = st.columns([6, 1])
-    col_title.subheader("매수 후보 (시가총액 상위 100 → 거래량 상위 20 → 주간 상승률 상위 5)")
+    col_title.subheader("매수 후보 (시총 100 ∩ 일간등락률 상위 20 → 종합티어 상위 4)")
     if col_btn.button("🔄 새로고침", key="refresh_candidates"):
         with st.spinner("매수 후보 탐색 중..."):
             candidates = refresh_buy_candidates()
@@ -323,41 +321,6 @@ def render_buy_plan_preview() -> None:
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
-def render_volume_rank() -> None:
-    st.subheader("거래량 상위 5종목")
-    stale = False
-    try:
-        rows = get_volume_rank(top_n=5)
-        if rows:
-            st.session_state.last_volume_rank = rows
-    except Exception:
-        rows = st.session_state.last_volume_rank
-        stale = bool(rows)
-
-    if not rows:
-        st.info("데이터를 불러올 수 없습니다.")
-        return
-
-    if stale:
-        st.caption("⚠️ 장 마감 기준 마지막 데이터입니다.")
-
-    df = pd.DataFrame(rows)
-    styled = (
-        df.style
-        .format({
-            "현재가": "{:,.0f}원",
-            "등락률(%)": lambda x: f"{x:+.2f}%",
-            "거래량": "{:,.0f}",
-        })
-        .map(
-            lambda x: "color: #d9534f" if isinstance(x, str) and x.startswith("+") else (
-                      "color: #0275d8" if isinstance(x, str) and x.startswith("-") else ""),
-            subset=["등락률(%)"],
-        )
-    )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-
-
 def render_trade_history() -> None:
     """trade_history.json 기반 매수/매도 이력 표시"""
     st.subheader("거래 이력")
@@ -472,8 +435,6 @@ render_buy_candidates()
 if not market_open:
     st.divider()
     render_buy_plan_preview()
-st.divider()
-render_volume_rank()
 st.divider()
 render_trade_history()
 st.divider()

@@ -16,7 +16,7 @@ if __name__ == "__main__":
     t.start()
 
     trader = Trader(
-        buy_strategy=VolumeMomentumBuyStrategy(market_cap_top_n=100, volume_top_n=20, pick_n=5),
+        buy_strategy=VolumeMomentumBuyStrategy(market_cap_top_n=100, pick_n=4),
         sell_strategy=TrailingStopSellStrategy(stop_loss_pct=STOP_LOSS_PCT),
     )
     trader.run()
