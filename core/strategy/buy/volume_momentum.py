@@ -21,6 +21,10 @@ class VolumeMomentumBuyStrategy(BuyStrategy):
         self.pool_size = pool_size
         self.pick_n = pick_n
 
+    @property
+    def display_name(self) -> str:
+        return "거래량+주간등락 (legacy)"
+
     def find_candidates(self) -> list[dict]:
         # 1단계: 시가총액 상위 종목 조회
         top_cap = get_market_cap_rank(top_n=self.market_cap_top_n)

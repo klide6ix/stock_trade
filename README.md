@@ -44,6 +44,15 @@
 - [x] 매수 후보 거래량 상위 20 사전 필터 제거 — 시가총액 상위 100 전체에 종합티어 적용
 - [x] 매수 후보 일간등락률 사전 필터 도입 (`get_fluctuation_rank`): 시총 100 ∩ 일간등락률 상위 → 풀 20개에 대해서만 weekly+PER/EPS 조회 (API 호출 200 → 약 42회)
 - [x] 일간등락률 교집합 부족 시 시총 상위로 풀 보충 (KIS 일간 상위 상승률 ≒ 중·소형주 → 시총 100 교집합이 비는 케이스 대응) + 진단 로그 추가
+- [x] 매수 전략 2종 추가: `HighProximityBuyStrategy`(52주 신고가 근접도 + PER/EPS) / `TechnicalMomentumBuyStrategy`(이평선 정배열·RSI(14)·거래량폭증·20일수익률)
+- [x] KIS API 추가: `get_quote_snapshot`(52주 고/저 + PER/EPS/PBR 일괄), `get_daily_ohlcv`(일봉 OHLCV 시계열, `inquire-daily-itemchartprice`)
+- [x] 모멘텀 전략 공통 풀 선정 헬퍼 `_pool.select_momentum_universe` 로 추출 (시총 ∩ 일간등락률 + 보충)
+- [x] `main.py` · 대시보드 매수 후보 새로고침을 `HighProximityBuyStrategy` 로 전환 (TechnicalMomentum 은 정배열·RSI 필터에서 후보 0개로 통과 종목이 없어 일단 비활성)
+- [x] `HighProximityBuyStrategy` 단순화: PER/EPS 가중 제거 → **PER ≤ 30 하한 필터 + EPS≥0** 만 유지, 정렬은 52주 신고가 근접도 단일 기준 (모멘텀 + 가치 신호 미스매치 회피)
+- [x] `TechnicalMomentumBuyStrategy` 조건 완화: 정배열 `5MA>20MA>60MA` → `5MA>20MA`, RSI 상한 75 → 80, 최소 일봉 요구 60 → 21 (필터 통과 종목 0개 문제 대응)
+- [x] 매수 후보를 전략별로 분리 표시: `Trader(view_strategies=[...])` 인자로 보조 전략 추가 가능, `BuyStrategy.display_name` property 도입, 후보 dict에 `_strategy`/`_strategy_label` 메타 필드 주입, 대시보드는 그룹별 테이블 + "매수 실행" / "view-only" 라벨 표시 (현재 primary=`HighProximity`, view=`TechnicalMomentum`)
+- [x] 대시보드 후보 테이블을 컬럼 유연 렌더링으로 변경 (`*(%)` 컬럼 자동 포맷/색상)
+- [x] `buy_candidates.json` 에 `status` 필드 도입 (`refreshing` / `ready`) — trader 시작 시·새로고침 시 즉시 갱신 마커를 써서 대시보드가 직전 세션의 stale 후보 대신 "🔄 매수 후보 탐색 중..." 안내 표시
 
 ## 다음 작업 후보
 
@@ -79,7 +88,10 @@ stock_trader/
 │   └── strategy/
 │       ├── base.py                        # BuyStrategy / SellStrategy ABC
 │       ├── buy/
-│       │   └── volume_momentum.py         # 시가총액→거래량→주간상승 매수 전략
+│       │   ├── _pool.py                   # 모멘텀 전략 공통 풀 (시총 ∩ 일간등락률 + 보충)
+│       │   ├── volume_momentum.py         # 주간등락률·PER·EPS 가중 티어
+│       │   ├── high_proximity.py          # 52주 신고가 근접도·PER·EPS 가중 티어 (현재 사용)
+│       │   └── technical_momentum.py      # 이평선 정배열·RSI 필터 + 거래량폭증·20일수익률 티어
 │       └── sell/
 │           └── trailing_stop.py           # 트레일링 스탑 매도 전략 (최고가 상태 소유)
 ├── ui/
@@ -165,7 +177,7 @@ chmod +x start.sh stop.sh
 | 장 상태          | 현재 장 운영 여부 표시                                                            |
 | 보유 종목 테이블 | 현재가, 최고가, 수익률, 최고가 대비 하락률 실시간 표시                            |
 | 행 색상          | 🟢 정상 / 🟡 주의 / 🟠 손절 임박 / 🔴 손절 실행                                   |
-| 매수 후보 목록   | 시총 100 ∩ 일간등락률 상위 20 → 종합티어 상위 4종목 (트레이더 시작 시 1회 탐색) |
+| 매수 후보 목록   | 전략별 그룹 표시 (primary = 매수 실행 / 보조 = view-only) — 트레이더 시작 시 1회 탐색 |
 | 거래 이력        | 매수/매도 시각, 체결가, 수량, 메모 (최신순) |
 | 최근 로그        | `logs/trader.log` 최근 50줄 표시                                                  |
 | 자동 새로고침    | 사이드바에서 주기 설정 (기본 60초)                                                |
@@ -200,7 +212,8 @@ IS_MOCK = False
  │           └─ SellStrategy.on_buy() 로 초기 상태 세팅
  │
  ├─ [1회] BuyStrategy.find_candidates() → data/buy_candidates.json 저장
- │     └─ VolumeMomentumBuyStrategy: 시총 100 ∩ 일간등락률 상위 → 주간등락률 + PER/EPS 조회 → EPS<0·PER≤0 제외 → 주간등락률(50%)·PER(25%)·EPS(25%) 가중 티어 상위 4
+ │     └─ HighProximityBuyStrategy: 시총 100 ∩ 일간등락률 상위 → 종목별 52주 고/저·PER·EPS 조회
+ │       → EPS<0·PER≤0·PER>30 제외 → 52주 신고가 근접도 내림차순 상위 4
  │
  └─ 10분마다 반복 (장 운영시간 내)
       └─ 보유 종목 전체 조회

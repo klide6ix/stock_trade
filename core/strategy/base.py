@@ -4,6 +4,11 @@ from abc import ABC, abstractmethod
 class BuyStrategy(ABC):
     """매수 후보 선정 전략 인터페이스"""
 
+    @property
+    def display_name(self) -> str:
+        """대시보드 그룹 헤더 등에 쓰일 한글 표시명. 기본은 클래스명."""
+        return type(self).__name__
+
     @abstractmethod
     def find_candidates(self) -> list[dict]:
         """매수 후보 종목 목록 반환.

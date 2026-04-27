@@ -9,7 +9,9 @@ from config import STOP_LOSS_PCT, CHECK_INTERVAL
 from core.kis_api import get_holdings, get_current_price, get_cash_balance
 from core.logger import LOG_FILE
 from core.trader import is_market_open, plan_initial_buy, BUY_CANDIDATES_FILE, TRADE_HISTORY_FILE
-from core.strategy.buy.volume_momentum import VolumeMomentumBuyStrategy
+from core.strategy.buy.high_proximity import HighProximityBuyStrategy
+from core.strategy.buy.technical_momentum import TechnicalMomentumBuyStrategy
+from core.trader import _tag_candidates
 from core.strategy.sell import PEAK_PRICES_FILE
 from core.settings import load_settings, set_value as set_setting
 
@@ -186,41 +188,118 @@ def render_holdings(market_open: bool) -> None:
 
 
 def refresh_buy_candidates() -> list[dict]:
-    """매수 후보를 다시 탐색하고 파일에 저장"""
-    strategy = VolumeMomentumBuyStrategy()
-    candidates = strategy.find_candidates()
+    """매수 후보를 다시 탐색하고 파일에 저장 (메인 + view 전략 모두 실행).
+
+    매수 실행에 사용되는 메인 전략 후보만 반환하며, 파일에는 모든 전략의 후보를
+    `_strategy` / `_strategy_label` 식별 필드와 함께 통합 저장한다.
+    """
+    primary = HighProximityBuyStrategy()
+    view_strategies = [TechnicalMomentumBuyStrategy()]
+    primary_name = type(primary).__name__
+
     with open(BUY_CANDIDATES_FILE, "w", encoding="utf-8") as f:
         json.dump(
-            {"updated_at": datetime.now().isoformat(), "candidates": candidates},
+            {
+                "status": "refreshing",
+                "started_at": datetime.now().isoformat(),
+                "strategy": primary_name,
+                "candidates": [],
+            },
             f, ensure_ascii=False, indent=2,
         )
-    return candidates
+
+    main_candidates = primary.find_candidates()
+    _tag_candidates(main_candidates, primary)
+    all_candidates: list[dict] = list(main_candidates)
+    for vs in view_strategies:
+        try:
+            view_results = vs.find_candidates()
+            _tag_candidates(view_results, vs)
+            all_candidates.extend(view_results)
+        except Exception:
+            continue
+
+    with open(BUY_CANDIDATES_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "status": "ready",
+                "updated_at": datetime.now().isoformat(),
+                "strategy": primary_name,
+                "primary_strategy": primary_name,
+                "candidates": all_candidates,
+            },
+            f, ensure_ascii=False, indent=2,
+        )
+    return main_candidates
+
+
+def _render_candidate_table(items: list[dict]) -> None:
+    """후보 dict 리스트를 테이블로 표시. `_strategy*` 메타 필드는 자동 숨김."""
+    df = pd.DataFrame(items)
+    df = df.drop(columns=[c for c in ("_strategy", "_strategy_label") if c in df.columns])
+    df.insert(0, "순위", range(1, len(df) + 1))
+
+    fmt: dict = {}
+    if "현재가" in df.columns:
+        fmt["현재가"] = "{:,.0f}원"
+    if "거래량" in df.columns:
+        fmt["거래량"] = "{:,.0f}"
+    pct_cols = [c for c in df.columns if c.endswith("(%)")]
+    for col in pct_cols:
+        fmt[col] = lambda x: f"{x:+.2f}%" if isinstance(x, (int, float)) else x
+
+    styled = df.style.format(fmt)
+    if pct_cols:
+        styled = styled.map(
+            lambda x: "color: #d9534f; font-weight: bold" if isinstance(x, str) and x.startswith("+") else (
+                      "color: #0275d8" if isinstance(x, str) and x.startswith("-") else ""),
+            subset=pct_cols,
+        )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 def render_buy_candidates() -> None:
-    """시총 100 ∩ 일간등락률 상위 → 종합티어 상위 4 (trader 저장 파일 또는 세션 캐시 사용)"""
+    """전략별 매수 후보를 그룹 단위로 표시. primary 그룹만 실제 매수에 사용된다."""
     col_title, col_btn = st.columns([6, 1])
-    col_title.subheader("매수 후보 (시총 100 ∩ 일간등락률 상위 20 → 종합티어 상위 4)")
+    col_title.subheader("매수 후보 (전략별)")
     if col_btn.button("🔄 새로고침", key="refresh_candidates"):
         with st.spinner("매수 후보 탐색 중..."):
             candidates = refresh_buy_candidates()
         st.session_state.buy_candidates = candidates
         st.rerun()
 
-    data = None
+    data: list[dict] = []
     updated_at = None
+    status = "ready"
+    started_at = None
+    primary_strategy = None
 
     if os.path.exists(BUY_CANDIDATES_FILE):
         try:
             with open(BUY_CANDIDATES_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            data = raw.get("candidates", [])
+            status = raw.get("status", "ready")
+            data = raw.get("candidates", []) or []
             updated_at = raw.get("updated_at")
-            st.session_state.buy_candidates = data
+            started_at = raw.get("started_at")
+            primary_strategy = raw.get("primary_strategy") or raw.get("strategy")
+            if status == "ready":
+                st.session_state.buy_candidates = data
         except Exception:
-            data = st.session_state.buy_candidates
+            data = st.session_state.buy_candidates or []
     else:
-        data = st.session_state.buy_candidates
+        data = st.session_state.buy_candidates or []
+
+    if status == "refreshing":
+        msg = "🔄 매수 후보 탐색 중..."
+        if started_at:
+            try:
+                ts = datetime.fromisoformat(started_at).strftime("%H:%M:%S")
+                msg += f" (시작 {ts})"
+            except Exception:
+                pass
+        st.info(msg)
+        return
 
     if not data:
         st.info("매수 후보 데이터가 없습니다. 트레이더 시작 후 자동으로 탐색됩니다.")
@@ -233,23 +312,26 @@ def render_buy_candidates() -> None:
         except Exception:
             pass
 
-    df = pd.DataFrame(data)
-    df.insert(0, "순위", range(1, len(df) + 1))
+    # _strategy 키로 그룹화. 첫 등장 순서를 유지해서 primary 가 위로 오도록.
+    groups: dict[str, dict] = {}
+    for c in data:
+        key = c.get("_strategy", "기타")
+        if key not in groups:
+            groups[key] = {
+                "label": c.get("_strategy_label", key),
+                "is_primary": (key == primary_strategy),
+                "items": [],
+            }
+        groups[key]["items"].append(c)
 
-    styled = (
-        df.style
-        .format({
-            "현재가": "{:,.0f}원",
-            "거래량": "{:,.0f}",
-            "주간등락률(%)": lambda x: f"{x:+.2f}%",
-        })
-        .map(
-            lambda x: "color: #d9534f; font-weight: bold" if isinstance(x, str) and x.startswith("+") else (
-                      "color: #0275d8" if isinstance(x, str) and x.startswith("-") else ""),
-            subset=["주간등락률(%)"],
-        )
-    )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    if not groups:
+        _render_candidate_table(data)
+        return
+
+    for key, info in groups.items():
+        marker = " · 매수 실행" if info["is_primary"] else " · view-only"
+        st.markdown(f"**{info['label']}**{marker}")
+        _render_candidate_table(info["items"])
 
 
 def render_buy_plan_preview() -> None:
@@ -257,12 +339,18 @@ def render_buy_plan_preview() -> None:
     st.subheader("🛒 매수 예정 미리보기 (장 마감 상태)")
     st.caption("장이 열리면 아래 계획대로 시장가 매수 주문이 실행됩니다. 슬롯 금액이 주가보다 작아도 최소 1주는 배정.")
 
-    # 후보 로드
+    # 후보 로드 — primary 전략 후보만 매수 실행 대상
     candidates = None
     if os.path.exists(BUY_CANDIDATES_FILE):
         try:
             with open(BUY_CANDIDATES_FILE, "r", encoding="utf-8") as f:
-                candidates = json.load(f).get("candidates", [])
+                raw = json.load(f)
+            all_candidates = raw.get("candidates", []) or []
+            primary_strategy = raw.get("primary_strategy") or raw.get("strategy")
+            if primary_strategy and any("_strategy" in c for c in all_candidates):
+                candidates = [c for c in all_candidates if c.get("_strategy") == primary_strategy]
+            else:
+                candidates = all_candidates
         except Exception:
             candidates = None
     if not candidates:

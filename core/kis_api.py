@@ -177,6 +177,67 @@ def get_per_eps(stock_code: str) -> dict:
     }
 
 
+def get_quote_snapshot(stock_code: str) -> dict:
+    """현재가 + 52주 고/저 + PER/EPS/PBR 일괄 조회. inquire-price 단일 호출."""
+    url = f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": stock_code,
+    }
+    res = requests.get(url, headers=_headers("FHKST01010100"), params=params)
+    res.raise_for_status()
+    output = res.json().get("output", {})
+    return {
+        "현재가": float(output.get("stck_prpr", 0)),
+        "52주최고": float(output.get("w52_hgpr", 0)),
+        "52주최저": float(output.get("w52_lwpr", 0)),
+        "per": float(output.get("per", 0)),
+        "eps": float(output.get("eps", 0)),
+        "pbr": float(output.get("pbr", 0)),
+        "전일대비등락률(%)": float(output.get("prdy_ctrt", 0)),
+    }
+
+
+def get_daily_ohlcv(stock_code: str, days: int = 60) -> list[dict]:
+    """최근 N영업일 일봉 OHLCV 시계열. 최신순 정렬 (index 0 = 가장 최근).
+
+    한 종목당 1회 호출로 이평선·RSI·거래량 폭증 등 기술 지표 산출에 사용.
+    """
+    today = datetime.now()
+    start = today - timedelta(days=int(days * 1.6) + 10)  # 영업일 보정 (주말·공휴일)
+
+    url = f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": stock_code,
+        "FID_INPUT_DATE_1": start.strftime("%Y%m%d"),
+        "FID_INPUT_DATE_2": today.strftime("%Y%m%d"),
+        "FID_PERIOD_DIV_CODE": "D",
+        "FID_ORG_ADJ_PRC": "0",
+    }
+    res = requests.get(url, headers=_headers("FHKST03010100"), params=params)
+    res.raise_for_status()
+    output = res.json().get("output2", [])
+
+    bars: list[dict] = []
+    for bar in output:
+        try:
+            close = float(bar.get("stck_clpr", 0))
+        except (TypeError, ValueError):
+            continue
+        if close == 0:
+            continue
+        bars.append({
+            "date": bar.get("stck_bsop_date"),
+            "open": float(bar.get("stck_oprc", 0) or 0),
+            "high": float(bar.get("stck_hgpr", 0) or 0),
+            "low": float(bar.get("stck_lwpr", 0) or 0),
+            "close": close,
+            "volume": int(bar.get("acml_vol", 0) or 0),
+        })
+    return bars[:days]
+
+
 def get_weekly_price_change(stock_code: str) -> float | None:
     """최근 1주일 종가 기준 가격 변화율(%) 반환. 실패 시 None"""
     today = datetime.now()

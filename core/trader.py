@@ -23,6 +23,15 @@ BUY_CANDIDATES_FILE = os.path.join(_DATA_DIR, "buy_candidates.json")
 TRADE_HISTORY_FILE = os.path.join(_DATA_DIR, "trade_history.json")
 
 
+def _tag_candidates(candidates: list[dict], strategy: BuyStrategy) -> None:
+    """후보 dict 에 view 식별용 메타 필드를 in-place 주입."""
+    name = type(strategy).__name__
+    label = strategy.display_name
+    for c in candidates:
+        c["_strategy"] = name
+        c["_strategy_label"] = label
+
+
 def plan_initial_buy(candidates: list[dict], cash: float, owned_codes: set[str]) -> list[dict]:
     """예수금을 후보 수(미보유 기준)로 균등 분할한 매수 계획 생성.
 
@@ -77,9 +86,15 @@ def is_market_open() -> bool:
 
 
 class Trader:
-    def __init__(self, buy_strategy: BuyStrategy, sell_strategy: SellStrategy) -> None:
+    def __init__(
+        self,
+        buy_strategy: BuyStrategy,
+        sell_strategy: SellStrategy,
+        view_strategies: list[BuyStrategy] | None = None,
+    ) -> None:
         self.buy_strategy = buy_strategy
         self.sell_strategy = sell_strategy
+        self.view_strategies = list(view_strategies or [])
         self._known_holdings: set[str] = set()
 
     # ── 거래 이력 ──────────────────────────────────────────────────────────────
@@ -113,22 +128,63 @@ class Trader:
     # ── 매수 후보 탐색 ─────────────────────────────────────────────────────────
 
     def scan_buy_candidates(self) -> list[dict]:
-        """BuyStrategy 로 매수 후보 탐색 후 buy_candidates.json 저장."""
-        strategy_name = type(self.buy_strategy).__name__
-        log(f"[매수후보] 탐색 시작 ({strategy_name})")
+        """매수 전략 + view 전략을 모두 실행하고 buy_candidates.json 저장.
+
+        반환값은 매수 실행에 쓰일 메인 전략의 후보만 포함. 파일에는 모든 후보를
+        통합하여 저장하고, 각 항목에 `_strategy` / `_strategy_label` 식별 필드를 주입한다.
+        탐색 시작 즉시 `status: refreshing` 마커로 덮어써서 대시보드가 stale 데이터 대신
+        '갱신 중' 상태를 표시하게 한다.
+        """
+        primary_name = type(self.buy_strategy).__name__
+        log(f"[매수후보] 탐색 시작 ({primary_name})")
+        self._write_candidates_status(primary_name)
         try:
-            candidates = self.buy_strategy.find_candidates()
+            main_candidates = self.buy_strategy.find_candidates()
+            _tag_candidates(main_candidates, self.buy_strategy)
+
+            all_candidates: list[dict] = list(main_candidates)
+            for vs in self.view_strategies:
+                vs_name = type(vs).__name__
+                log(f"[매수후보][view] 탐색 시작 ({vs_name})")
+                try:
+                    view_results = vs.find_candidates()
+                    _tag_candidates(view_results, vs)
+                    all_candidates.extend(view_results)
+                except Exception as e:
+                    log(f"[매수후보][view] {vs_name} 탐색 실패: {e}")
+
             with open(BUY_CANDIDATES_FILE, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"updated_at": datetime.now().isoformat(), "candidates": candidates},
+                    {
+                        "status": "ready",
+                        "updated_at": datetime.now().isoformat(),
+                        "strategy": primary_name,
+                        "primary_strategy": primary_name,
+                        "candidates": all_candidates,
+                    },
                     f, ensure_ascii=False, indent=2,
                 )
-            names = ", ".join(c["종목명"] for c in candidates)
-            log(f"[매수후보] 탐색 완료: {names}")
-            return candidates
+            names = ", ".join(c["종목명"] for c in main_candidates)
+            log(f"[매수후보] 탐색 완료 (매수용): {names}")
+            return main_candidates
         except Exception as e:
             log(f"[매수후보] 탐색 실패: {e}")
             return []
+
+    def _write_candidates_status(self, strategy_name: str) -> None:
+        try:
+            with open(BUY_CANDIDATES_FILE, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "status": "refreshing",
+                        "started_at": datetime.now().isoformat(),
+                        "strategy": strategy_name,
+                        "candidates": [],
+                    },
+                    f, ensure_ascii=False, indent=2,
+                )
+        except Exception as e:
+            log(f"[매수후보] 갱신 마커 저장 실패: {e}")
 
     # ── 매수 실행 ──────────────────────────────────────────────────────────────
 
