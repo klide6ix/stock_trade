@@ -61,6 +61,7 @@
 - [x] 매수 실행 전략 `HighProximityBuyStrategy` → `QualityTrendBuyStrategy` 로 교체. HighProximity·TechnicalMomentum 은 view-only 보조 전략으로 비교 표시 (`main.py` + `ui/dashboard.py` 수동 새로고침 버튼 양쪽 모두)
 - [x] 활성 매수 전략 구성을 `core/strategy/_activate.py` 로 추출 (`primary_buy_strategy()` / `view_buy_strategies()`) — `main.py`·`ui/dashboard.py` 가 동일 모듈을 import 하므로 전략 교체 시 한 곳만 수정
 - [x] 기술 지표 헬퍼(`sma`, `rsi`)를 `_indicators.py` 로 추출 (`technical_momentum`·`quality_trend` 공유)
+- [x] Python 3.14 기반 `.venv` 가상환경으로 실행 환경 통일 — `start.sh` 가 `.venv/bin/python` 으로 `main.py` 실행, 부재 시 안내 메시지 후 종료. 시스템 Python(3.9)/Homebrew Python(3.11) 혼용으로 인한 의존성 불일치 회피
 
 ## 다음 작업 후보
 
@@ -148,10 +149,17 @@ ACCOUNT_NO=계좌번호  # 예: 12345678-01
 
 ## 실행 방법
 
-### 1. 패키지 설치 (최초 1회)
+### 1. 가상환경 생성 및 패키지 설치 (최초 1회)
+
+Python 3.14 기준 `.venv` 가상환경을 사용합니다.
 
 ```bash
-pip install -r requirements.txt
+# Python 3.14 설치 (Homebrew)
+brew install python@3.14
+
+# 가상환경 생성 + 패키지 설치
+python3.14 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
 
 ### 2. 스크립트로 실행

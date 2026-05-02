@@ -17,9 +17,15 @@ if [ -n "$EXISTING" ]; then
     kill "$EXISTING" 2>/dev/null
 fi
 
+if [ ! -x ".venv/bin/python" ]; then
+    echo ".venv 가 없습니다. 먼저 가상환경을 만들어 주세요:"
+    echo "  python3.14 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+    exit 1
+fi
+
 mkdir -p logs
 echo "트레이더 시작..."
-nohup python main.py > logs/startup.log 2>&1 &
+nohup .venv/bin/python main.py > logs/startup.log 2>&1 &
 echo $! > "$PID_FILE"
 echo "실행 완료 (PID: $(cat $PID_FILE))"
 echo "대시보드: http://localhost:8501"
