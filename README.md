@@ -53,6 +53,14 @@
 - [x] 매수 후보를 전략별로 분리 표시: `Trader(view_strategies=[...])` 인자로 보조 전략 추가 가능, `BuyStrategy.display_name` property 도입, 후보 dict에 `_strategy`/`_strategy_label` 메타 필드 주입, 대시보드는 그룹별 테이블 + "매수 실행" / "view-only" 라벨 표시 (현재 primary=`HighProximity`, view=`TechnicalMomentum`)
 - [x] 대시보드 후보 테이블을 컬럼 유연 렌더링으로 변경 (`*(%)` 컬럼 자동 포맷/색상)
 - [x] `buy_candidates.json` 에 `status` 필드 도입 (`refreshing` / `ready`) — trader 시작 시·새로고침 시 즉시 갱신 마커를 써서 대시보드가 직전 세션의 stale 후보 대신 "🔄 매수 후보 탐색 중..." 안내 표시
+- [x] `HighProximityBuyStrategy` 신고가 기준 52주 → 4주(20영업일)로 단축 (`window_days` 파라미터, `get_daily_ohlcv` 일봉으로 직접 계산) — 텀이 너무 길어 모멘텀 신호가 둔해지는 문제 대응
+- [x] 매수 후보 1차 풀 사이즈 20 → 50 으로 확대 (`select_momentum_universe`·두 전략 기본값), 일간등락률 호출 `top_n` 도 풀 사이즈의 2배 자동 산정 — 후보가 신고가 종목으로만 쏠리는 다양성 부족 문제 대응
+- [x] 우량+우상향 결합 전략 `QualityTrendBuyStrategy` 추가: EPS≥0 ∧ 0<PER≤50 ∧ 0<PBR≤5 ∧ 20MA>60MA ∧ 현재가>20MA ∧ RSI(14)≤70 필터 → 4주 신고가 근접도 정렬 상위 4. 탈락 카운트(가치/추세/RSI) 로그
+  - PER 컷 30 → 50 완화: 한국시장 시총상위 100 중 반도체·2차전지·바이오 성장주 PER 30~50 다수 → 모멘텀 종목 누락 방지
+  - PBR ≤ 5 추가: PER 만으로는 EPS 일시 급감 종목이 PER 비정상 통과할 수 있어 자산 기준 거품 차단 보강
+- [x] 매수 실행 전략 `HighProximityBuyStrategy` → `QualityTrendBuyStrategy` 로 교체. HighProximity·TechnicalMomentum 은 view-only 보조 전략으로 비교 표시 (`main.py` + `ui/dashboard.py` 수동 새로고침 버튼 양쪽 모두)
+- [x] 활성 매수 전략 구성을 `core/strategy/_activate.py` 로 추출 (`primary_buy_strategy()` / `view_buy_strategies()`) — `main.py`·`ui/dashboard.py` 가 동일 모듈을 import 하므로 전략 교체 시 한 곳만 수정
+- [x] 기술 지표 헬퍼(`sma`, `rsi`)를 `_indicators.py` 로 추출 (`technical_momentum`·`quality_trend` 공유)
 
 ## 다음 작업 후보
 
@@ -87,11 +95,14 @@ stock_trader/
 │   ├── logger.py        # 로깅 유틸리티
 │   └── strategy/
 │       ├── base.py                        # BuyStrategy / SellStrategy ABC
+│       ├── _activate.py                   # 활성 매수 전략 구성 (primary / view) — main·dashboard 공유
 │       ├── buy/
 │       │   ├── _pool.py                   # 모멘텀 전략 공통 풀 (시총 ∩ 일간등락률 + 보충)
+│       │   ├── _indicators.py             # 기술 지표 헬퍼 (sma, rsi)
 │       │   ├── volume_momentum.py         # 주간등락률·PER·EPS 가중 티어
-│       │   ├── high_proximity.py          # 52주 신고가 근접도·PER·EPS 가중 티어 (현재 사용)
-│       │   └── technical_momentum.py      # 이평선 정배열·RSI 필터 + 거래량폭증·20일수익률 티어
+│       │   ├── high_proximity.py          # 4주 신고가 근접도·PER 필터 (view-only)
+│       │   ├── technical_momentum.py      # 이평선 정배열·RSI 필터 + 거래량폭증·20일수익률 티어 (view-only)
+│       │   └── quality_trend.py           # 우량(EPS/PER/PBR) + 우상향(20MA>60MA·RSI≤70) 결합 (현재 매수 실행)
 │       └── sell/
 │           └── trailing_stop.py           # 트레일링 스탑 매도 전략 (최고가 상태 소유)
 ├── ui/
@@ -212,8 +223,8 @@ IS_MOCK = False
  │           └─ SellStrategy.on_buy() 로 초기 상태 세팅
  │
  ├─ [1회] BuyStrategy.find_candidates() → data/buy_candidates.json 저장
- │     └─ HighProximityBuyStrategy: 시총 100 ∩ 일간등락률 상위 → 종목별 52주 고/저·PER·EPS 조회
- │       → EPS<0·PER≤0·PER>30 제외 → 52주 신고가 근접도 내림차순 상위 4
+ │     └─ QualityTrendBuyStrategy: 시총 100 ∩ 일간등락률 상위 50 → 종목별 PER/EPS/PBR + 80일 일봉 조회
+ │       → EPS<0·PER 0~50·PBR 0~5 + 20MA>60MA·현재가>20MA·RSI(14)≤70 필터 → 4주 신고가 근접도 내림차순 상위 4
  │
  └─ 10분마다 반복 (장 운영시간 내)
       └─ 보유 종목 전체 조회

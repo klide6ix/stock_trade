@@ -9,8 +9,7 @@ from config import STOP_LOSS_PCT, CHECK_INTERVAL
 from core.kis_api import get_holdings, get_current_price, get_cash_balance
 from core.logger import LOG_FILE
 from core.trader import is_market_open, plan_initial_buy, BUY_CANDIDATES_FILE, TRADE_HISTORY_FILE
-from core.strategy.buy.high_proximity import HighProximityBuyStrategy
-from core.strategy.buy.technical_momentum import TechnicalMomentumBuyStrategy
+from core.strategy._activate import primary_buy_strategy, view_buy_strategies
 from core.trader import _tag_candidates
 from core.strategy.sell import PEAK_PRICES_FILE
 from core.settings import load_settings, set_value as set_setting
@@ -193,8 +192,8 @@ def refresh_buy_candidates() -> list[dict]:
     매수 실행에 사용되는 메인 전략 후보만 반환하며, 파일에는 모든 전략의 후보를
     `_strategy` / `_strategy_label` 식별 필드와 함께 통합 저장한다.
     """
-    primary = HighProximityBuyStrategy()
-    view_strategies = [TechnicalMomentumBuyStrategy()]
+    primary = primary_buy_strategy()
+    view_strategies = view_buy_strategies()
     primary_name = type(primary).__name__
 
     with open(BUY_CANDIDATES_FILE, "w", encoding="utf-8") as f:

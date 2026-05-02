@@ -1,33 +1,8 @@
 from core.strategy.base import BuyStrategy
 from core.strategy.buy._pool import select_momentum_universe
+from core.strategy.buy._indicators import sma, rsi
 from core.kis_api import get_daily_ohlcv
 from core.logger import log
-
-
-def _sma(values: list[float], period: int) -> float | None:
-    """최신순 시계열에서 직전 period 개의 단순이동평균."""
-    if len(values) < period:
-        return None
-    return sum(values[:period]) / period
-
-
-def _rsi(closes: list[float], period: int = 14) -> float | None:
-    """Wilder RSI. closes 는 최신순(index 0 = 오늘)."""
-    if len(closes) < period + 1:
-        return None
-    chrono = list(reversed(closes[:period + 1]))
-    gains = 0.0
-    losses = 0.0
-    for i in range(1, len(chrono)):
-        diff = chrono[i] - chrono[i - 1]
-        if diff >= 0:
-            gains += diff
-        else:
-            losses += -diff
-    if losses == 0:
-        return 100.0
-    rs = (gains / period) / (losses / period)
-    return 100 - 100 / (1 + rs)
 
 
 class TechnicalMomentumBuyStrategy(BuyStrategy):
@@ -40,7 +15,7 @@ class TechnicalMomentumBuyStrategy(BuyStrategy):
     def __init__(
         self,
         market_cap_top_n: int = 100,
-        pool_size: int = 20,
+        pool_size: int = 50,
         pick_n: int = 4,
         rsi_max: float = 80.0,
         history_days: int = 60,
@@ -72,15 +47,15 @@ class TechnicalMomentumBuyStrategy(BuyStrategy):
             closes = [b["close"] for b in bars]
             volumes = [b["volume"] for b in bars]
 
-            ma5 = _sma(closes, 5)
-            ma20 = _sma(closes, 20)
+            ma5 = sma(closes, 5)
+            ma20 = sma(closes, 20)
             if ma5 is None or ma20 is None:
                 continue
             if not (ma5 > ma20):
                 continue
 
-            rsi = _rsi(closes, 14)
-            if rsi is None or rsi > self.rsi_max:
+            rsi_val = rsi(closes, 14)
+            if rsi_val is None or rsi_val > self.rsi_max:
                 continue
 
             today_vol = volumes[0]
@@ -101,7 +76,7 @@ class TechnicalMomentumBuyStrategy(BuyStrategy):
                 "거래량": today_vol,
                 "5MA": round(ma5, 2),
                 "20MA": round(ma20, 2),
-                "RSI(14)": round(rsi, 1),
+                "RSI(14)": round(rsi_val, 1),
                 "거래량폭증배수": round(vol_surge, 2),
                 "20일수익률(%)": round(return_20d, 2),
             })

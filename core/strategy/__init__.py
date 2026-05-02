@@ -3,6 +3,7 @@ from core.strategy.buy import (
     VolumeMomentumBuyStrategy,
     HighProximityBuyStrategy,
     TechnicalMomentumBuyStrategy,
+    QualityTrendBuyStrategy,
 )
 from core.strategy.sell import TrailingStopSellStrategy
 
@@ -12,5 +13,6 @@ __all__ = [
     "VolumeMomentumBuyStrategy",
     "HighProximityBuyStrategy",
     "TechnicalMomentumBuyStrategy",
+    "QualityTrendBuyStrategy",
     "TrailingStopSellStrategy",
 ]

@@ -4,7 +4,7 @@ from core.logger import log
 
 def select_momentum_universe(
     market_cap_top_n: int = 100,
-    pool_size: int = 20,
+    pool_size: int = 50,
 ) -> list[dict]:
     """모멘텀 전략의 공통 1차 풀.
 
@@ -14,8 +14,9 @@ def select_momentum_universe(
     top_cap = get_market_cap_rank(top_n=market_cap_top_n)
     cap_by_code = {item["종목코드"]: item for item in top_cap}
 
+    daily_top_n = max(pool_size * 2, 30)
     try:
-        daily_rank = get_fluctuation_rank(top_n=30)
+        daily_rank = get_fluctuation_rank(top_n=daily_top_n)
     except Exception as e:
         log(f"[매수후보] 일간등락률 조회 실패: {e}")
         daily_rank = []
