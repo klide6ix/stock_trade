@@ -3,6 +3,8 @@ import json
 import os
 from typing import Any
 
+from config import STOP_LOSS_PCT
+
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DATA_DIR = os.path.join(_BASE_DIR, "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
@@ -13,6 +15,7 @@ DEFAULTS: dict[str, Any] = {
     "buy_enabled": False,  # 안전을 위해 기본 비활성
     "auto_refresh": True,
     "refresh_interval": 60,
+    "stop_loss_pct": STOP_LOSS_PCT,
 }
 
 

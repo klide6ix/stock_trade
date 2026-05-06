@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime
 
-from config import STOP_LOSS_PCT, CHECK_INTERVAL
+from config import CHECK_INTERVAL
 from core.kis_api import get_holdings, get_current_price, get_cash_balance
 from core.logger import LOG_FILE
 from core.trader import is_market_open, plan_initial_buy, BUY_CANDIDATES_FILE, TRADE_HISTORY_FILE
@@ -90,14 +90,14 @@ def build_holdings_rows(market_open: bool) -> tuple[list[dict], bool]:
     return rows, any_stale
 
 
-def get_row_status(drop_pct: float | None) -> str:
+def get_row_status(drop_pct: float | None, stop_loss_pct: float) -> str:
     if drop_pct is None:
         return "❓"
-    if drop_pct >= STOP_LOSS_PCT:
+    if drop_pct >= stop_loss_pct:
         return "🔴 손절 실행"
-    if drop_pct >= STOP_LOSS_PCT * 0.8:
+    if drop_pct >= stop_loss_pct * 0.8:
         return "🟠 손절 임박"
-    if drop_pct >= STOP_LOSS_PCT * 0.5:
+    if drop_pct >= stop_loss_pct * 0.5:
         return "🟡 주의"
     return "🟢 정상"
 
@@ -128,7 +128,7 @@ def render_cash_balance() -> None:
         st.caption("⚠️ 잔액은 마지막 조회 기준입니다.")
 
 
-def render_header(market_open: bool) -> None:
+def render_header(market_open: bool, stop_loss_pct: float) -> None:
     st.title("📈 트레이더 대시보드")
     render_cash_balance()
     st.divider()
@@ -137,12 +137,12 @@ def render_header(market_open: bool) -> None:
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("장 상태", "🟢 운영 중" if market_open else "🔴 마감")
-    c2.metric("손절 기준", f"{STOP_LOSS_PCT}%")
+    c2.metric("손절 기준", f"{stop_loss_pct}%")
     c3.metric("확인 주기", f"{CHECK_INTERVAL // 60}분")
     c4.metric("마지막 갱신", datetime.now().strftime("%H:%M:%S"))
 
 
-def render_holdings(market_open: bool) -> None:
+def render_holdings(market_open: bool, stop_loss_pct: float) -> None:
     st.subheader("보유 종목")
     try:
         rows, any_stale = build_holdings_rows(market_open)
@@ -158,17 +158,17 @@ def render_holdings(market_open: bool) -> None:
         st.caption("⚠️ 일부 가격은 마지막 조회 시점 기준입니다.")
 
     df = pd.DataFrame(rows)
-    df["상태"] = df["최고가 대비 하락(%)"].apply(get_row_status)
+    df["상태"] = df["최고가 대비 하락(%)"].apply(lambda d: get_row_status(d, stop_loss_pct))
 
     def color_row(row):
         drop = row["최고가 대비 하락(%)"]
         if drop is None:
             return [""] * len(row)
-        if drop >= STOP_LOSS_PCT:
+        if drop >= stop_loss_pct:
             return ["background-color: #ffcccc"] * len(row)
-        if drop >= STOP_LOSS_PCT * 0.8:
+        if drop >= stop_loss_pct * 0.8:
             return ["background-color: #ffe4b2"] * len(row)
-        if drop >= STOP_LOSS_PCT * 0.5:
+        if drop >= stop_loss_pct * 0.5:
             return ["background-color: #fffacd"] * len(row)
         return [""] * len(row)
 
@@ -472,7 +472,7 @@ def render_log() -> None:
         st.info("로그 파일이 없습니다. `python main.py`를 실행하면 로그가 표시됩니다.")
 
 
-def render_sidebar() -> tuple[bool, int]:
+def render_sidebar() -> tuple[bool, int, float]:
     with st.sidebar:
         st.header("설정")
 
@@ -488,6 +488,17 @@ def render_sidebar() -> tuple[bool, int]:
             st.success("매수 ON")
         else:
             st.warning("매수 OFF")
+
+        st.divider()
+        stop_loss_pct = st.number_input(
+            "손절 기준 (%)",
+            min_value=1.0, max_value=50.0,
+            value=float(settings.get("stop_loss_pct", 10.0)),
+            step=0.5,
+            help="최고가 대비 이 비율 이상 하락하면 시장가 매도. 다음 확인 주기부터 반영됩니다.",
+        )
+        if stop_loss_pct != settings.get("stop_loss_pct", 10.0):
+            set_setting("stop_loss_pct", stop_loss_pct)
 
         st.divider()
         auto_refresh = st.toggle(
@@ -506,17 +517,17 @@ def render_sidebar() -> tuple[bool, int]:
             set_setting("refresh_interval", interval)
         if st.button("지금 새로고침", use_container_width=True):
             st.rerun()
-    return auto_refresh, interval
+    return auto_refresh, interval, stop_loss_pct
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 
 market_open = is_market_open()
-auto_refresh, refresh_interval = render_sidebar()
+auto_refresh, refresh_interval, stop_loss_pct = render_sidebar()
 
-render_header(market_open)
+render_header(market_open, stop_loss_pct)
 st.divider()
-render_holdings(market_open)
+render_holdings(market_open, stop_loss_pct)
 st.divider()
 render_buy_candidates()
 if not market_open:

@@ -343,6 +343,7 @@ class Trader:
         did_initial_buy = is_market_open()
 
         while True:
+            self._sync_sell_settings()
             if is_market_open():
                 if not did_initial_buy:
                     self.execute_initial_buy(candidates)
@@ -355,3 +356,11 @@ class Trader:
                 log("장 운영 시간 외 - 대기 중")
 
             time.sleep(CHECK_INTERVAL)
+
+    def _sync_sell_settings(self) -> None:
+        """매도 전략의 사용자 설정값을 settings.json 에서 다시 읽어 반영."""
+        if hasattr(self.sell_strategy, "stop_loss_pct"):
+            new_pct = float(get_setting("stop_loss_pct"))
+            if new_pct != self.sell_strategy.stop_loss_pct:
+                log(f"[설정] 손절 기준 변경: {self.sell_strategy.stop_loss_pct}% → {new_pct}%")
+                self.sell_strategy.stop_loss_pct = new_pct
