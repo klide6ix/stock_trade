@@ -63,12 +63,23 @@
 - [x] 기술 지표 헬퍼(`sma`, `rsi`)를 `_indicators.py` 로 추출 (`technical_momentum`·`quality_trend` 공유)
 - [x] Python 3.14 기반 `.venv` 가상환경으로 실행 환경 통일 — `start.sh` 가 `.venv/bin/python` 으로 `main.py` 실행, 부재 시 안내 메시지 후 종료. 시스템 Python(3.9)/Homebrew Python(3.11) 혼용으로 인한 의존성 불일치 회피
 - [x] 손절 기준(`stop_loss_pct`) 옵션화 — 대시보드 사이드바 number_input(1.0~50.0%, step 0.5)으로 변경 가능, `data/settings.json` 영속화. 기본값은 `config.STOP_LOSS_PCT`(10%) 사용. 트레이더는 매 확인 주기 시작 시 settings 재읽기 → `TrailingStopSellStrategy.stop_loss_pct` 갱신(변경 시 로그)
+- [x] 매수 전략 3종 추가: `GoldenCrossBuyStrategy`(5MA가 최근 N일 내 20MA 상향 돌파, 교차 후 일수 오름차순) / `LowPerBuyStrategy`(시총 100 ∩ EPS≥0·PER≤per_max·PBR≤pbr_max → PER 오름차순) / `OversoldReboundBuyStrategy`(직전 RSI≤30 + 오늘 종가>직전 종가 + RSI 회복)
+- [x] 매도 전략 2종 추가: `RsiSellStrategy`(RSI(14)≥`rsi_max` 시 매도, 과열 회피) / `MaDeadCrossSellStrategy`(5MA<20MA 시 매도, 데드크로스). 매 주기 `observe()` 에서 일봉 조회 → 캐시; 영속화 없음. `SellStrategy.display_name` 도입(사이드바·헤더 라벨용)
+- [x] 전략 레지스트리 구조 도입 (`_activate.py`의 `BUY_STRATEGY_FACTORIES` / `SELL_STRATEGY_FACTORIES`) — 키→팩토리 dict, 옵션 헬퍼(`buy_strategy_options`/`sell_strategy_options`), 클래스→키 역인덱스(`sell_strategy_key_of`)
+- [x] view 매수 전략을 사이드바 multiselect 로 사용자 선택 가능 (`data/settings.json::view_buy_strategies`, primary 키는 자동 제외). 트레이더는 `scan_buy_candidates()` 시작 시 매번 settings 재읽기
+- [x] 매도 전략을 사이드바 selectbox 로 변경 가능 (`data/settings.json::sell_strategy`) — 트레이더 `_sync_sell_settings()` 가 키 변경 감지 시 새 인스턴스로 교체 + `load()` + 보유 종목으로 `on_buy()` priming. 헤더 metric `손절 기준 → 매도 전략`(전략 `display_name` 표시), 트레일링 스탑 외 선택 시 손절 기준 입력 숨김
+- [x] 활성 매수 전략(primary)도 사이드바 selectbox 로 변경 가능 (`data/settings.json::primary_buy_strategy`) — `view_buy_strategy_options()` 가 현재 primary 키를 자동 제외해 multiselect 와 중복 표시 방지. 트레이더 `scan_buy_candidates()` 시작 시 primary·view 모두 settings 재읽기 → 변경 즉시 다음 스캔/재매수에 반영. 헤더 metric 에 "매수 전략" 추가 (5컬럼)
+- [x] 사이드바 widget 영속화 race condition 수정: 모든 widget(toggle/selectbox/multiselect/number_input/slider) 에 명시적 `key=` 부여 + `on_change` 콜백으로 사용자 변경 시점에만 `set_setting()` 호출. auto-refresh rerun 마다 widget default 가 settings.json 을 덮어쓰던 문제 해결. session_state 1회 시드(`_init_sidebar_state`) 후 widget 자체가 상태를 유지하도록 변경
+- [x] 팩토리 함수의 `or DEFAULT` 패턴이 빈 리스트(`[]`)를 default 로 오해석하던 버그 수정 — `_activate.py::primary_buy_key`/`view_buy_strategies`/`primary_sell_strategy` 와 `trader._sync_sell_settings` 모두 `isinstance` 기반 명시적 검증으로 전환. 빈 view 리스트도 사용자 의도대로 보존되며, 알 수 없는 키는 default 로 일관 fallback
+- [x] `stop.sh` 가 main.py PID 만 종료하고 streamlit 자식 프로세스를 orphan 으로 남기던 문제 수정 — `pgrep -f` 로 streamlit/main.py 잔존 인스턴스를 SIGTERM 후 1초 grace period 거쳐 SIGKILL. 좀비 누적으로 인한 settings.json 동시 쓰기 race 재발 방지
+- [x] 동시 보유 종목 한도(`max_holdings`) 도입 (기본 5, 1~20) — 사이드바 number_input 으로 변경 가능, `data/settings.json` 영속화. `plan_initial_buy(max_holdings)` 인자가 잔여 슬롯(`max_holdings - len(owned)`) 만큼만 상위 후보 선택. 매도 후 재매수도 한도 미만일 때만 실행 (`execute_post_sell_buy`), 잔고 반영 지연 대비해 방금 매도한 종목은 보유 카운트에서 제외. 매수 예정 미리보기에 "보유/한도" metric 추가
 
 ## 다음 작업 후보
 
 - [ ] 매도 발생 시 알림 (Telegram / 카카오톡 등)
 - [ ] 확인 주기를 대시보드에서 실시간 변경
-- [ ] 추가 전략 구현 (예: RSI / 이동평균 기반 매도, 시가총액 외 다른 매수 기준)
+- [ ] 추가 매도 전략 (트레일링 스탑 + RSI/이평선 OR 결합 Composite)
+- [ ] 매도 전략별 임계값(예: RSI `rsi_max`, 이평선 short/long)도 사이드바에서 변경 가능하게
 
 ---
 
@@ -97,16 +108,21 @@ stock_trader/
 │   ├── logger.py        # 로깅 유틸리티
 │   └── strategy/
 │       ├── base.py                        # BuyStrategy / SellStrategy ABC
-│       ├── _activate.py                   # 활성 매수 전략 구성 (primary / view) — main·dashboard 공유
+│       ├── _activate.py                   # 전략 레지스트리 + 활성 전략 팩토리 (settings.json 반영)
 │       ├── buy/
 │       │   ├── _pool.py                   # 모멘텀 전략 공통 풀 (시총 ∩ 일간등락률 + 보충)
 │       │   ├── _indicators.py             # 기술 지표 헬퍼 (sma, rsi)
-│       │   ├── volume_momentum.py         # 주간등락률·PER·EPS 가중 티어
-│       │   ├── high_proximity.py          # 4주 신고가 근접도·PER 필터 (view-only)
-│       │   ├── technical_momentum.py      # 이평선 정배열·RSI 필터 + 거래량폭증·20일수익률 티어 (view-only)
-│       │   └── quality_trend.py           # 우량(EPS/PER/PBR) + 우상향(20MA>60MA·RSI≤70) 결합 (현재 매수 실행)
+│       │   ├── volume_momentum.py         # 주간등락률·PER·EPS 가중 티어 (legacy)
+│       │   ├── high_proximity.py          # 4주 신고가 근접도·PER 필터
+│       │   ├── technical_momentum.py      # 이평선 정배열·RSI 필터 + 거래량폭증·20일수익률 티어
+│       │   ├── quality_trend.py           # 우량(EPS/PER/PBR) + 우상향(20MA>60MA·RSI≤70) — 현재 매수 실행
+│       │   ├── golden_cross.py            # 5MA가 최근 N일 내 20MA 상향 돌파
+│       │   ├── low_per.py                 # 시총 100 ∩ 저PER 가치주 (PER 오름차순)
+│       │   └── oversold_rebound.py        # 직전 RSI≤30 + 오늘 종가 반등 + RSI 회복
 │       └── sell/
-│           └── trailing_stop.py           # 트레일링 스탑 매도 전략 (최고가 상태 소유)
+│           ├── trailing_stop.py           # 트레일링 스탑 — 최고가 대비 N% 하락 시 매도 (peak 영속화)
+│           ├── rsi_overbought.py          # RSI(14) ≥ rsi_max 시 매도
+│           └── ma_dead_cross.py           # 단기MA < 장기MA 시 매도 (데드크로스)
 ├── ui/
 │   └── dashboard.py     # Streamlit 대시보드 UI
 ├── logs/
@@ -197,7 +213,9 @@ chmod +x start.sh stop.sh
 | 장 상태          | 현재 장 운영 여부 표시                                                            |
 | 보유 종목 테이블 | 현재가, 최고가, 수익률, 최고가 대비 하락률 실시간 표시                            |
 | 행 색상          | 🟢 정상 / 🟡 주의 / 🟠 손절 임박 / 🔴 손절 실행                                   |
-| 매수 후보 목록   | 전략별 그룹 표시 (primary = 매수 실행 / 보조 = view-only) — 트레이더 시작 시 1회 탐색 |
+| 매수 후보 목록   | 전략별 그룹 표시 (primary = 매수 실행 / 보조 = view-only, 사이드바 multiselect 로 선택) |
+| 매수 전략 선택   | 사이드바 selectbox: 활성 매수 전략(primary) 변경 가능 — 다음 스캔부터 즉시 반영             |
+| 매도 전략 선택   | 사이드바 selectbox: 트레일링 스탑 / RSI 과열 / 이평선 데드크로스 (실시간 교체)            |
 | 거래 이력        | 매수/매도 시각, 체결가, 수량, 메모 (최신순) |
 | 최근 로그        | `logs/trader.log` 최근 50줄 표시                                                  |
 | 자동 새로고침    | 사이드바에서 주기 설정 (기본 60초)                                                |

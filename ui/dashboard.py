@@ -9,7 +9,17 @@ from config import CHECK_INTERVAL
 from core.kis_api import get_holdings, get_current_price, get_cash_balance
 from core.logger import LOG_FILE
 from core.trader import is_market_open, plan_initial_buy, BUY_CANDIDATES_FILE, TRADE_HISTORY_FILE
-from core.strategy._activate import primary_buy_strategy, view_buy_strategies
+from core.strategy._activate import (
+    primary_buy_strategy,
+    view_buy_strategies,
+    primary_sell_strategy,
+    buy_strategy_options,
+    view_buy_strategy_options,
+    sell_strategy_options,
+    DEFAULT_PRIMARY_BUY_KEY,
+    DEFAULT_VIEW_BUY_KEYS,
+    DEFAULT_SELL_KEY,
+)
 from core.trader import _tag_candidates
 from core.strategy.sell import PEAK_PRICES_FILE
 from core.settings import load_settings, set_value as set_setting
@@ -128,18 +138,19 @@ def render_cash_balance() -> None:
         st.caption("⚠️ 잔액은 마지막 조회 기준입니다.")
 
 
-def render_header(market_open: bool, stop_loss_pct: float) -> None:
+def render_header(market_open: bool, buy_strategy_label: str, sell_strategy_label: str) -> None:
     st.title("📈 트레이더 대시보드")
     render_cash_balance()
     st.divider()
     if not market_open:
         st.info("⏸ 장 운영 시간 외입니다. 보유 종목과 마지막 가격 기준으로 표시합니다.")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("장 상태", "🟢 운영 중" if market_open else "🔴 마감")
-    c2.metric("손절 기준", f"{stop_loss_pct}%")
-    c3.metric("확인 주기", f"{CHECK_INTERVAL // 60}분")
-    c4.metric("마지막 갱신", datetime.now().strftime("%H:%M:%S"))
+    c2.metric("매수 전략", buy_strategy_label)
+    c3.metric("매도 전략", sell_strategy_label)
+    c4.metric("확인 주기", f"{CHECK_INTERVAL // 60}분")
+    c5.metric("마지막 갱신", datetime.now().strftime("%H:%M:%S"))
 
 
 def render_holdings(market_open: bool, stop_loss_pct: float) -> None:
@@ -376,19 +387,32 @@ def render_buy_plan_preview() -> None:
     except Exception:
         owned = set()
 
-    plan = plan_initial_buy(candidates, cash, owned)
+    # 사이드바와 동일한 한도 적용 (settings.json 값을 사용)
+    raw_max = load_settings().get("max_holdings", 5)
+    try:
+        max_holdings = int(raw_max)
+    except (TypeError, ValueError):
+        max_holdings = 5
+    if max_holdings < 1:
+        max_holdings = 1
+
+    plan = plan_initial_buy(candidates, cash, owned, max_holdings=max_holdings)
 
     if not plan:
-        st.info("매수 가능한 후보가 없습니다 (주문가능금액 부족 또는 모두 보유 중).")
+        if len(owned) >= max_holdings:
+            st.info(f"보유 {len(owned)}종 ≥ 한도 {max_holdings}종 — 매수 슬롯 없음.")
+        else:
+            st.info("매수 가능한 후보가 없습니다 (주문가능금액 부족 또는 모두 보유 중).")
         return
 
     total = sum(p["예상금액"] for p in plan)
-    slot = cash / max(1, len([c for c in candidates if c["종목코드"] not in owned]))
+    slot = cash / len(plan)
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("주문가능금액", f"{cash:,.0f}원")
     c2.metric("슬롯(종목당 배정)", f"{slot:,.0f}원")
     c3.metric("예상 총 주문액", f"{total:,.0f}원")
+    c4.metric("보유/한도", f"{len(owned)} / {max_holdings}")
 
     rows = [{
         "순위": i + 1,
@@ -472,60 +496,208 @@ def render_log() -> None:
         st.info("로그 파일이 없습니다. `python main.py`를 실행하면 로그가 표시됩니다.")
 
 
-def render_sidebar() -> tuple[bool, int, float]:
+def _init_sidebar_state(settings: dict) -> None:
+    """settings.json 의 값을 session_state 로 1회 시드.
+
+    Streamlit widget 은 `key=` 가 부여되면 session_state 의 값을 우선 사용한다.
+    여기서 한 번만 시드하고, 이후 widget 변경은 on_change 콜백이 settings 로 영속화한다.
+    매 rerun 마다 settings 를 다시 읽지 않아 auto-refresh race condition 을 회피한다.
+    """
+    if st.session_state.get("_sidebar_initialized"):
+        return
+
+    all_buy_options = buy_strategy_options()
+    all_buy_keys = [k for k, _ in all_buy_options]
+    sell_options = sell_strategy_options()
+    sell_keys = [k for k, _ in sell_options]
+
+    primary_key = settings.get("primary_buy_strategy", DEFAULT_PRIMARY_BUY_KEY)
+    if primary_key not in all_buy_keys:
+        primary_key = DEFAULT_PRIMARY_BUY_KEY
+
+    sell_key = settings.get("sell_strategy", DEFAULT_SELL_KEY)
+    if sell_key not in sell_keys:
+        sell_key = DEFAULT_SELL_KEY
+
+    raw_view_keys = settings.get("view_buy_strategies", DEFAULT_VIEW_BUY_KEYS)
+    if not isinstance(raw_view_keys, list):
+        raw_view_keys = DEFAULT_VIEW_BUY_KEYS
+    # primary 와 겹치거나 알 수 없는 키는 제외
+    view_keys = [k for k in raw_view_keys if k != primary_key and k in all_buy_keys]
+
+    raw_max = settings.get("max_holdings", 5)
+    try:
+        max_holdings_val = int(raw_max)
+    except (TypeError, ValueError):
+        max_holdings_val = 5
+    if max_holdings_val < 1:
+        max_holdings_val = 1
+
+    st.session_state.buy_enabled_toggle = bool(settings.get("buy_enabled", False))
+    st.session_state.primary_buy_select = primary_key
+    st.session_state.view_buy_multiselect = view_keys
+    st.session_state.sell_strategy_select = sell_key
+    st.session_state.stop_loss_input = float(settings.get("stop_loss_pct", 10.0))
+    st.session_state.max_holdings_input = max_holdings_val
+    st.session_state.auto_refresh_toggle = bool(settings.get("auto_refresh", True))
+    st.session_state.refresh_interval_slider = int(settings.get("refresh_interval", 60))
+    st.session_state._sidebar_initialized = True
+
+
+def _on_buy_enabled_change() -> None:
+    set_setting("buy_enabled", bool(st.session_state.buy_enabled_toggle))
+
+
+def _on_primary_buy_change() -> None:
+    new_primary = st.session_state.primary_buy_select
+    set_setting("primary_buy_strategy", new_primary)
+    # primary 가 view 목록에 들어있으면 view 에서도 제거 (UI · 영속화 양쪽 동기화)
+    current_view = list(st.session_state.get("view_buy_multiselect", []))
+    if new_primary in current_view:
+        current_view = [k for k in current_view if k != new_primary]
+        st.session_state.view_buy_multiselect = current_view
+        set_setting("view_buy_strategies", current_view)
+
+
+def _on_view_buy_change() -> None:
+    set_setting("view_buy_strategies", list(st.session_state.view_buy_multiselect))
+
+
+def _on_sell_strategy_change() -> None:
+    set_setting("sell_strategy", st.session_state.sell_strategy_select)
+
+
+def _on_stop_loss_change() -> None:
+    set_setting("stop_loss_pct", float(st.session_state.stop_loss_input))
+
+
+def _on_max_holdings_change() -> None:
+    set_setting("max_holdings", int(st.session_state.max_holdings_input))
+
+
+def _on_auto_refresh_change() -> None:
+    set_setting("auto_refresh", bool(st.session_state.auto_refresh_toggle))
+
+
+def _on_refresh_interval_change() -> None:
+    set_setting("refresh_interval", int(st.session_state.refresh_interval_slider))
+
+
+def render_sidebar() -> tuple[bool, int, str, str, float]:
+    """사이드바 렌더. (auto_refresh, interval, buy_strategy_label, sell_strategy_label, stop_loss_pct) 반환.
+
+    영속화는 widget 의 `on_change` 콜백에서만 수행 — auto-refresh rerun 시 default 가
+    덮어쓰는 race 를 방지한다. 모든 widget 에 `key=` 를 부여해 session_state 가
+    widget 상태를 안정적으로 유지하도록 한다.
+    """
+    settings = load_settings()
+    _init_sidebar_state(settings)
+
+    all_buy_options = buy_strategy_options()
+    all_buy_keys = [k for k, _ in all_buy_options]
+    all_buy_label_by_key = {k: l for k, l in all_buy_options}
+    sell_options = sell_strategy_options()
+    sell_keys_list = [k for k, _ in sell_options]
+    sell_label_by_key = {k: l for k, l in sell_options}
+
     with st.sidebar:
         st.header("설정")
 
-        settings = load_settings()
-        buy_enabled = st.toggle(
+        st.toggle(
             "🛒 매수 활성화",
-            value=settings.get("buy_enabled", False),
+            key="buy_enabled_toggle",
+            on_change=_on_buy_enabled_change,
             help="끄면 트레이더가 초기 매수 및 매도 후 재매수를 실행하지 않습니다. 매도는 계속 동작.",
         )
-        if buy_enabled != settings.get("buy_enabled", False):
-            set_setting("buy_enabled", buy_enabled)
-        if buy_enabled:
+        if st.session_state.buy_enabled_toggle:
             st.success("매수 ON")
         else:
             st.warning("매수 OFF")
 
-        st.divider()
-        stop_loss_pct = st.number_input(
-            "손절 기준 (%)",
-            min_value=1.0, max_value=50.0,
-            value=float(settings.get("stop_loss_pct", 10.0)),
-            step=0.5,
-            help="최고가 대비 이 비율 이상 하락하면 시장가 매도. 다음 확인 주기부터 반영됩니다.",
+        st.number_input(
+            "최대 보유 종목 수",
+            min_value=1, max_value=20,
+            step=1,
+            key="max_holdings_input",
+            on_change=_on_max_holdings_change,
+            help="이 수를 초과하지 않도록 매수 시점에 슬롯을 제한합니다. 매도 후 재매수도 한도 미만일 때만 실행.",
         )
-        if stop_loss_pct != settings.get("stop_loss_pct", 10.0):
-            set_setting("stop_loss_pct", stop_loss_pct)
 
         st.divider()
-        auto_refresh = st.toggle(
-            "자동 새로고침",
-            value=settings.get("auto_refresh", True),
+        st.subheader("📊 매수 전략")
+
+        # 활성 매수 전략 (primary) — 실제 매수 실행에 사용
+        st.selectbox(
+            "활성 매수 전략 (실제 매수 실행)",
+            options=all_buy_keys,
+            format_func=lambda k: all_buy_label_by_key.get(k, k),
+            key="primary_buy_select",
+            on_change=_on_primary_buy_change,
         )
-        interval = st.slider(
+        current_primary_key = st.session_state.primary_buy_select
+
+        # 보조 매수 전략 (view) — primary 키는 후보에서 자동 제외
+        view_option_keys = [k for k in all_buy_keys if k != current_primary_key]
+        st.multiselect(
+            "보조 매수 전략 (대시보드 비교용)",
+            options=view_option_keys,
+            format_func=lambda k: all_buy_label_by_key.get(k, k),
+            key="view_buy_multiselect",
+            on_change=_on_view_buy_change,
+        )
+
+        st.divider()
+        st.subheader("🛡 매도 전략")
+        st.selectbox(
+            "활성 매도 전략",
+            options=sell_keys_list,
+            format_func=lambda k: sell_label_by_key.get(k, k),
+            key="sell_strategy_select",
+            on_change=_on_sell_strategy_change,
+        )
+        current_sell_key = st.session_state.sell_strategy_select
+
+        if current_sell_key == "trailing_stop":
+            st.number_input(
+                "손절 기준 (%)",
+                min_value=1.0, max_value=50.0,
+                step=0.5,
+                key="stop_loss_input",
+                on_change=_on_stop_loss_change,
+                help="최고가 대비 이 비율 이상 하락하면 시장가 매도. 다음 확인 주기부터 반영됩니다.",
+            )
+        else:
+            st.caption("ℹ️ 보유 종목 테이블의 '최고가/하락률' 컬럼은 참고용으로만 표시됩니다.")
+
+        st.divider()
+        st.toggle("자동 새로고침", key="auto_refresh_toggle", on_change=_on_auto_refresh_change)
+        st.slider(
             "새로고침 주기 (초)",
             min_value=10, max_value=600,
-            value=int(settings.get("refresh_interval", 60)),
             step=10,
+            key="refresh_interval_slider",
+            on_change=_on_refresh_interval_change,
         )
-        if auto_refresh != settings.get("auto_refresh", True):
-            set_setting("auto_refresh", auto_refresh)
-        if interval != settings.get("refresh_interval", 60):
-            set_setting("refresh_interval", interval)
         if st.button("지금 새로고침", use_container_width=True):
             st.rerun()
-    return auto_refresh, interval, stop_loss_pct
+
+    buy_label = all_buy_label_by_key.get(current_primary_key, current_primary_key)
+    sell_label = sell_label_by_key.get(current_sell_key, current_sell_key)
+    return (
+        bool(st.session_state.auto_refresh_toggle),
+        int(st.session_state.refresh_interval_slider),
+        buy_label,
+        sell_label,
+        float(st.session_state.stop_loss_input),
+    )
 
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 
 market_open = is_market_open()
-auto_refresh, refresh_interval, stop_loss_pct = render_sidebar()
+auto_refresh, refresh_interval, buy_label, sell_label, stop_loss_pct = render_sidebar()
 
-render_header(market_open, stop_loss_pct)
+render_header(market_open, buy_label, sell_label)
 st.divider()
 render_holdings(market_open, stop_loss_pct)
 st.divider()

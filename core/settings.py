@@ -16,6 +16,10 @@ DEFAULTS: dict[str, Any] = {
     "auto_refresh": True,
     "refresh_interval": 60,
     "stop_loss_pct": STOP_LOSS_PCT,
+    "primary_buy_strategy": "quality_trend",
+    "view_buy_strategies": ["high_proximity", "technical_momentum"],
+    "sell_strategy": "trailing_stop",
+    "max_holdings": 5,  # 동시 보유 종목 상한 — 초과 시 매수 스킵
 }
 
 

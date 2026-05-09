@@ -26,6 +26,11 @@ class SellStrategy(ABC):
     트레이더는 범용 훅(observe/on_buy/should_sell)만 호출한다.
     """
 
+    @property
+    def display_name(self) -> str:
+        """대시보드 selectbox 등에 쓰일 한글 표시명. 기본은 클래스명."""
+        return type(self).__name__
+
     @abstractmethod
     def should_sell(self, code: str, current_price: float) -> tuple[bool, str]:
         """매도 조건 판단.

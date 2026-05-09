@@ -21,6 +21,10 @@ class TrailingStopSellStrategy(SellStrategy):
         self.stop_loss_pct = stop_loss_pct
         self.peak_prices: dict[str, float] = {}
 
+    @property
+    def display_name(self) -> str:
+        return f"트레일링 스탑 (-{self.stop_loss_pct:.1f}%)"
+
     # ── 내부 상태 ─────────────────────────────────────────────────────────────
 
     def _update_peak(self, code: str, price: float) -> bool:

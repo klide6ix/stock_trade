@@ -32,11 +32,34 @@ def _tag_candidates(candidates: list[dict], strategy: BuyStrategy) -> None:
         c["_strategy_label"] = label
 
 
-def plan_initial_buy(candidates: list[dict], cash: float, owned_codes: set[str]) -> list[dict]:
+def _safe_max_holdings(default: int = 5) -> int:
+    """settings.json 의 `max_holdings` 를 정수로 안전하게 읽어 반환.
+
+    음수/0/잘못된 타입은 모두 default 로 fallback (사이드바 number_input 의 min=1
+    가드를 우회한 비정상 값에 대비). 매수 차단 의도가 명확한 0 을 허용하지 않는 이유는
+    `buy_enabled` 토글이 이미 그 역할을 담당하기 때문.
+    """
+    raw = get_setting("max_holdings")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 1 else default
+
+
+def plan_initial_buy(
+    candidates: list[dict],
+    cash: float,
+    owned_codes: set[str],
+    max_holdings: int = 5,
+) -> list[dict]:
     """예수금을 후보 수(미보유 기준)로 균등 분할한 매수 계획 생성.
 
     슬롯 금액이 주가보다 작아도 최소 1주를 배정하고, 누적 예산을 초과하지 않도록
     순서대로 잔여 예수금을 차감한다. 보유 중인 종목은 제외.
+
+    `max_holdings` 한도를 초과하지 않도록, 잔여 슬롯(`max_holdings - len(owned)`) 만큼만
+    상위 후보를 선택. 잔여 슬롯이 0 이하면 빈 계획 반환.
 
     Returns:
         [{"종목코드", "종목명", "현재가", "수량", "예상금액"}] — 실제 주문 가능한 항목만
@@ -44,7 +67,11 @@ def plan_initial_buy(candidates: list[dict], cash: float, owned_codes: set[str])
     if not candidates or cash <= 0:
         return []
 
-    targets = [c for c in candidates if c["종목코드"] not in owned_codes]
+    remaining_slots = max_holdings - len(owned_codes)
+    if remaining_slots <= 0:
+        return []
+
+    targets = [c for c in candidates if c["종목코드"] not in owned_codes][:remaining_slots]
     if not targets:
         return []
 
@@ -92,10 +119,13 @@ class Trader:
         sell_strategy: SellStrategy,
         view_strategies: list[BuyStrategy] | None = None,
     ) -> None:
+        from core.strategy._activate import sell_strategy_key_of
+
         self.buy_strategy = buy_strategy
         self.sell_strategy = sell_strategy
         self.view_strategies = list(view_strategies or [])
         self._known_holdings: set[str] = set()
+        self._sell_strategy_key: str = sell_strategy_key_of(sell_strategy)
 
     # ── 거래 이력 ──────────────────────────────────────────────────────────────
 
@@ -134,7 +164,16 @@ class Trader:
         통합하여 저장하고, 각 항목에 `_strategy` / `_strategy_label` 식별 필드를 주입한다.
         탐색 시작 즉시 `status: refreshing` 마커로 덮어써서 대시보드가 stale 데이터 대신
         '갱신 중' 상태를 표시하게 한다.
+
+        primary · view 전략 모두 매 호출마다 settings.json 에서 다시 읽어,
+        사용자가 사이드바에서 변경한 선택을 즉시 반영한다.
         """
+        from core.strategy._activate import (
+            primary_buy_strategy as _load_primary_strategy,
+            view_buy_strategies as _load_view_strategies,
+        )
+
+        self.buy_strategy = _load_primary_strategy()
         primary_name = type(self.buy_strategy).__name__
         log(f"[매수후보] 탐색 시작 ({primary_name})")
         self._write_candidates_status(primary_name)
@@ -142,6 +181,7 @@ class Trader:
             main_candidates = self.buy_strategy.find_candidates()
             _tag_candidates(main_candidates, self.buy_strategy)
 
+            self.view_strategies = _load_view_strategies()
             all_candidates: list[dict] = list(main_candidates)
             for vs in self.view_strategies:
                 vs_name = type(vs).__name__
@@ -199,7 +239,10 @@ class Trader:
             return False
 
     def execute_initial_buy(self, candidates: list[dict]) -> None:
-        """예수금을 후보 수만큼 균등 분할하여 각 후보를 시장가 매수."""
+        """예수금을 후보 수만큼 균등 분할하여 각 후보를 시장가 매수.
+
+        `max_holdings` 한도를 초과하지 않도록 잔여 슬롯만큼만 상위 후보 선택.
+        """
         if not candidates:
             return
 
@@ -214,32 +257,53 @@ class Trader:
             return
 
         owned = set(get_holdings().keys())
-        plan = plan_initial_buy(candidates, cash, owned)
+        max_holdings = _safe_max_holdings()
+        plan = plan_initial_buy(candidates, cash, owned, max_holdings=max_holdings)
 
         if not plan:
-            log("[초기매수] 실행 가능한 주문 없음 - 스킵")
+            if len(owned) >= max_holdings:
+                log(f"[초기매수] 보유 {len(owned)}종 ≥ 한도 {max_holdings}종 - 스킵")
+            else:
+                log("[초기매수] 실행 가능한 주문 없음 - 스킵")
             return
 
-        log(f"[초기매수] 주문가능금액 {cash:,.0f}원 / {len(plan)}종목 주문 예정")
+        log(
+            f"[초기매수] 주문가능금액 {cash:,.0f}원 / {len(plan)}종목 주문 예정 "
+            f"(보유 {len(owned)} → 매수 후 {len(owned) + len(plan)} / 한도 {max_holdings})"
+        )
         for item in plan:
             log(f"[초기매수] {item['종목명']}({item['종목코드']}) {item['수량']}주 × {item['현재가']:,.0f}원 ≈ {item['예상금액']:,.0f}원")
             self._place_buy(item["종목코드"], item["종목명"], item["수량"])
 
     def execute_post_sell_buy(self, sold_code: str) -> None:
-        """매도 발생 시 후보 재탐색 후 미보유 최상위 1종목을 남은 예수금으로 매수."""
+        """매도 발생 시 후보 재탐색 후 미보유 최상위 1종목을 남은 예수금으로 매수.
+
+        보유 한도(`max_holdings`)를 초과하지 않을 때만 재매수. KIS 잔고 반영 지연을
+        감안해 방금 매도한 `sold_code` 는 보유 카운트에서 제외해 비교한다.
+        """
         if not get_setting("buy_enabled"):
             log(f"[매도후재매수] 매수 옵션 OFF - 스킵 ({sold_code} 매도 후)")
             return
 
-        log(f"[매도후재매수] {sold_code} 매도 감지 - 후보 재탐색")
+        holdings = get_holdings()
+        max_holdings = _safe_max_holdings()
+        # 잔고 반영 지연 가능성 — 방금 매도한 종목은 보유 수에서 빼고 판단
+        effective_owned = {k for k in holdings.keys() if k != sold_code}
+        if len(effective_owned) >= max_holdings:
+            log(f"[매도후재매수] 보유(매도제외) {len(effective_owned)}종 ≥ 한도 {max_holdings}종 - 스킵")
+            return
+
+        log(
+            f"[매도후재매수] {sold_code} 매도 감지 - 후보 재탐색 "
+            f"(보유(매도제외) {len(effective_owned)} / 한도 {max_holdings})"
+        )
         candidates = self.scan_buy_candidates()
         if not candidates:
             return
 
-        holdings = get_holdings()
         for c in candidates:
             code = c["종목코드"]
-            if code == sold_code or code in holdings:
+            if code == sold_code or code in effective_owned:
                 continue
 
             try:
@@ -358,7 +422,32 @@ class Trader:
             time.sleep(CHECK_INTERVAL)
 
     def _sync_sell_settings(self) -> None:
-        """매도 전략의 사용자 설정값을 settings.json 에서 다시 읽어 반영."""
+        """매도 전략의 사용자 설정값을 settings.json 에서 다시 읽어 반영.
+
+        - `sell_strategy` 키가 변경되면 새 인스턴스로 교체 후 보유 종목으로 priming.
+        - 트레일링 스탑의 `stop_loss_pct` 같은 단일 파라미터 변경은 in-place 갱신.
+        """
+        from core.strategy._activate import (
+            DEFAULT_SELL_KEY,
+            build_sell_strategy,
+        )
+
+        desired_key = get_setting("sell_strategy")
+        if not isinstance(desired_key, str) or not desired_key:
+            desired_key = DEFAULT_SELL_KEY
+        if desired_key != self._sell_strategy_key:
+            log(f"[설정] 매도 전략 변경: {self._sell_strategy_key} → {desired_key}")
+            new_strategy = build_sell_strategy(desired_key)
+            new_strategy.load()
+            try:
+                for code, info in get_holdings().items():
+                    if info["avg_price"] > 0:
+                        new_strategy.on_buy(code, info["avg_price"])
+            except Exception as e:
+                log(f"[설정] 매도 전략 priming 실패: {e}")
+            self.sell_strategy = new_strategy
+            self._sell_strategy_key = desired_key
+
         if hasattr(self.sell_strategy, "stop_loss_pct"):
             new_pct = float(get_setting("stop_loss_pct"))
             if new_pct != self.sell_strategy.stop_loss_pct:

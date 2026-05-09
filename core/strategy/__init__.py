@@ -4,8 +4,15 @@ from core.strategy.buy import (
     HighProximityBuyStrategy,
     TechnicalMomentumBuyStrategy,
     QualityTrendBuyStrategy,
+    GoldenCrossBuyStrategy,
+    LowPerBuyStrategy,
+    OversoldReboundBuyStrategy,
 )
-from core.strategy.sell import TrailingStopSellStrategy
+from core.strategy.sell import (
+    TrailingStopSellStrategy,
+    RsiSellStrategy,
+    MaDeadCrossSellStrategy,
+)
 
 __all__ = [
     "BuyStrategy",
@@ -14,5 +21,10 @@ __all__ = [
     "HighProximityBuyStrategy",
     "TechnicalMomentumBuyStrategy",
     "QualityTrendBuyStrategy",
+    "GoldenCrossBuyStrategy",
+    "LowPerBuyStrategy",
+    "OversoldReboundBuyStrategy",
     "TrailingStopSellStrategy",
+    "RsiSellStrategy",
+    "MaDeadCrossSellStrategy",
 ]
