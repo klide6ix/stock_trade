@@ -9,7 +9,7 @@ class TechnicalMomentumBuyStrategy(BuyStrategy):
     """일봉 시계열 기반 모멘텀 매수 전략.
 
     필터: 5MA > 20MA (단기 추세 우상향) + RSI(14) <= rsi_max (과매수 제외).
-    종합티어 = 거래량 폭증 배수(50%) + 20일 수익률(50%) 가중 순위.
+    시그널점수 = 100 × (1 - rank합(거래량폭증 50% + 20일수익률 50%) / (N-1)).
     """
 
     def __init__(
@@ -74,6 +74,7 @@ class TechnicalMomentumBuyStrategy(BuyStrategy):
                 "종목명": item["종목명"],
                 "현재가": closes[0],
                 "거래량": today_vol,
+                "시그널점수": 0.0,  # 아래에서 rank 계산 후 채움
                 "5MA": round(ma5, 2),
                 "20MA": round(ma20, 2),
                 "RSI(14)": round(rsi_val, 1),
@@ -87,13 +88,12 @@ class TechnicalMomentumBuyStrategy(BuyStrategy):
         rank_vol = {c["종목코드"]: i for i, c in enumerate(by_vol)}
         rank_ret = {c["종목코드"]: i for i, c in enumerate(by_ret)}
 
+        max_rank = max(len(candidates) - 1, 1)
         for c in candidates:
             code = c["종목코드"]
-            c["종합티어"] = round(
-                rank_vol[code] * 0.5 + rank_ret[code] * 0.5,
-                2,
-            )
+            rank_sum = rank_vol[code] * 0.5 + rank_ret[code] * 0.5
+            c["시그널점수"] = round(100.0 * (1.0 - rank_sum / max_rank), 1)
 
-        candidates.sort(key=lambda x: x["종합티어"])
+        candidates.sort(key=lambda x: x["시그널점수"], reverse=True)
         log(f"[매수후보][technical] 5MA>20MA + RSI≤{self.rsi_max} 통과 {len(candidates)}개 / 풀 {len(pool)}")
         return candidates[:self.pick_n]

@@ -67,11 +67,11 @@ class HighProximityBuyStrategy(BuyStrategy):
                 "종목명": item["종목명"],
                 "현재가": current,
                 "거래량": item["거래량"],
+                "시그널점수": round(proximity * 100, 1),
                 f"{weeks}주신고가근접도": round(proximity, 3),
                 "PER": per,
             })
 
-        weeks = max(1, round(self.window_days / 5))
-        candidates.sort(key=lambda x: x[f"{weeks}주신고가근접도"], reverse=True)
+        candidates.sort(key=lambda x: x["시그널점수"], reverse=True)
         log(f"[매수후보][high_proximity] {weeks}주·PER≤{self.per_max} 통과 {len(candidates)}개 / 풀 {len(pool)}")
         return candidates[:self.pick_n]

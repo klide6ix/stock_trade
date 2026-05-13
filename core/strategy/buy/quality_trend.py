@@ -96,6 +96,7 @@ class QualityTrendBuyStrategy(BuyStrategy):
                 "종목명": item["종목명"],
                 "현재가": current,
                 "거래량": item["거래량"],
+                "시그널점수": round(proximity * 100, 1),
                 f"{weeks}주신고가근접도": round(proximity, 3),
                 "20MA": round(ma20, 2),
                 "60MA": round(ma60, 2),
@@ -104,8 +105,7 @@ class QualityTrendBuyStrategy(BuyStrategy):
                 "PBR": pbr,
             })
 
-        weeks = max(1, round(self.window_days / 5))
-        filtered.sort(key=lambda x: x[f"{weeks}주신고가근접도"], reverse=True)
+        filtered.sort(key=lambda x: x["시그널점수"], reverse=True)
         log(
             f"[매수후보][quality_trend] PER≤{self.per_max}·PBR≤{self.pbr_max}·20MA>60MA·현재가>20MA·RSI≤{self.rsi_max} "
             f"통과 {len(filtered)}개 / 풀 {len(pool)} (탈락 가치 {drop_value} · 추세 {drop_trend} · RSI {drop_rsi})"

@@ -254,6 +254,8 @@ def _render_candidate_table(items: list[dict]) -> None:
         fmt["현재가"] = "{:,.0f}원"
     if "거래량" in df.columns:
         fmt["거래량"] = "{:,.0f}"
+    if "시그널점수" in df.columns:
+        fmt["시그널점수"] = "{:.1f}"
     pct_cols = [c for c in df.columns if c.endswith("(%)")]
     for col in pct_cols:
         fmt[col] = lambda x: f"{x:+.2f}%" if isinstance(x, (int, float)) else x
@@ -264,6 +266,10 @@ def _render_candidate_table(items: list[dict]) -> None:
             lambda x: "color: #d9534f; font-weight: bold" if isinstance(x, str) and x.startswith("+") else (
                       "color: #0275d8" if isinstance(x, str) and x.startswith("-") else ""),
             subset=pct_cols,
+        )
+    if "시그널점수" in df.columns:
+        styled = styled.background_gradient(
+            cmap="Greens", subset=["시그널점수"], vmin=0, vmax=100,
         )
     st.dataframe(styled, use_container_width=True, hide_index=True)
 

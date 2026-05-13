@@ -78,12 +78,13 @@ class VolumeMomentumBuyStrategy(BuyStrategy):
                 "종목명": item["종목명"],
                 "현재가": item["현재가"],
                 "거래량": item["거래량"],
+                "시그널점수": 0.0,  # 아래에서 rank 계산 후 채움
                 "주간등락률(%)": round(weekly_change, 2),
                 "PER": per,
                 "EPS": eps,
             })
 
-        # 4단계: 가중 순위 합산 (주간등락률 50%, PER 25%, EPS 25%)
+        # 4단계: 가중 순위 합산 (주간등락률 50%, PER 25%, EPS 25%) → 시그널점수 0~100
         by_per = sorted(candidates, key=lambda x: x["PER"])
         by_eps = sorted(candidates, key=lambda x: x["EPS"], reverse=True)
         by_weekly = sorted(candidates, key=lambda x: x["주간등락률(%)"], reverse=True)
@@ -92,14 +93,15 @@ class VolumeMomentumBuyStrategy(BuyStrategy):
         rank_eps = {c["종목코드"]: i for i, c in enumerate(by_eps)}
         rank_weekly = {c["종목코드"]: i for i, c in enumerate(by_weekly)}
 
+        max_rank = max(len(candidates) - 1, 1)
         for c in candidates:
             code = c["종목코드"]
-            c["종합티어"] = round(
+            rank_sum = (
                 rank_weekly[code] * 0.5
                 + rank_per[code] * 0.25
-                + rank_eps[code] * 0.25,
-                2,
+                + rank_eps[code] * 0.25
             )
+            c["시그널점수"] = round(100.0 * (1.0 - rank_sum / max_rank), 1)
 
-        candidates.sort(key=lambda x: x["종합티어"])
+        candidates.sort(key=lambda x: x["시그널점수"], reverse=True)
         return candidates[:self.pick_n]

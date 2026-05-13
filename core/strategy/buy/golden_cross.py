@@ -66,17 +66,19 @@ class GoldenCrossBuyStrategy(BuyStrategy):
                 drop_no_cross += 1
                 continue
 
+            score = 100.0 * (1.0 - (days_since_cross - 1) / self.max_days_after_cross)
             candidates.append({
                 "종목코드": code,
                 "종목명": item["종목명"],
                 "현재가": closes[0],
                 "거래량": item["거래량"],
+                "시그널점수": round(score, 1),
                 "5MA": round(ma5, 2),
                 "20MA": round(ma20, 2),
                 "교차후일수": days_since_cross,
             })
 
-        candidates.sort(key=lambda x: x["교차후일수"])
+        candidates.sort(key=lambda x: x["시그널점수"], reverse=True)
         log(
             f"[매수후보][golden_cross] 5MA>20MA + 최근 {self.max_days_after_cross}일 내 교차 통과 "
             f"{len(candidates)}개 / 풀 {len(pool)} (탈락 비교차 {drop_no_cross})"

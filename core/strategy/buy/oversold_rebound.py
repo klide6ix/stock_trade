@@ -62,17 +62,19 @@ class OversoldReboundBuyStrategy(BuyStrategy):
                 drop_no_rebound += 1
                 continue
 
+            score = 100.0 * (1.0 - prev_rsi / self.rsi_oversold) if self.rsi_oversold > 0 else 0.0
             candidates.append({
                 "종목코드": code,
                 "종목명": item["종목명"],
                 "현재가": closes[0],
                 "거래량": item["거래량"],
+                "시그널점수": round(max(0.0, score), 1),
                 "직전RSI(14)": round(prev_rsi, 1),
                 "오늘RSI(14)": round(today_rsi, 1),
                 "반등률(%)": round((closes[0] - closes[1]) / closes[1] * 100, 2),
             })
 
-        candidates.sort(key=lambda x: x["직전RSI(14)"])
+        candidates.sort(key=lambda x: x["시그널점수"], reverse=True)
         log(
             f"[매수후보][oversold_rebound] 직전RSI≤{self.rsi_oversold} + 반등 통과 "
             f"{len(candidates)}개 / 풀 {len(pool)} (탈락 비과매도 {drop_not_oversold} · 미반등 {drop_no_rebound})"

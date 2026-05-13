@@ -73,6 +73,7 @@
 - [x] 팩토리 함수의 `or DEFAULT` 패턴이 빈 리스트(`[]`)를 default 로 오해석하던 버그 수정 — `_activate.py::primary_buy_key`/`view_buy_strategies`/`primary_sell_strategy` 와 `trader._sync_sell_settings` 모두 `isinstance` 기반 명시적 검증으로 전환. 빈 view 리스트도 사용자 의도대로 보존되며, 알 수 없는 키는 default 로 일관 fallback
 - [x] `stop.sh` 가 main.py PID 만 종료하고 streamlit 자식 프로세스를 orphan 으로 남기던 문제 수정 — `pgrep -f` 로 streamlit/main.py 잔존 인스턴스를 SIGTERM 후 1초 grace period 거쳐 SIGKILL. 좀비 누적으로 인한 settings.json 동시 쓰기 race 재발 방지
 - [x] 동시 보유 종목 한도(`max_holdings`) 도입 (기본 5, 1~20) — 사이드바 number_input 으로 변경 가능, `data/settings.json` 영속화. `plan_initial_buy(max_holdings)` 인자가 잔여 슬롯(`max_holdings - len(owned)`) 만큼만 상위 후보 선택. 매도 후 재매수도 한도 미만일 때만 실행 (`execute_post_sell_buy`), 잔고 반영 지연 대비해 방금 매도한 종목은 보유 카운트에서 제외. 매수 예정 미리보기에 "보유/한도" metric 추가
+- [x] 매수 후보 전략 전체에 통일 `시그널점수` 컬럼 도입 (0~100, 100=최상위) — 단일 기준 전략은 정렬 기준의 절대 척도 기반 정규화(`HighProximity`/`QualityTrend` proximity×100, `LowPer` 1-PER/per_max, `GoldenCross` 1-(교차일수-1)/max_days, `OversoldRebound` 1-직전RSI/rsi_oversold), 다중 기준 (`TechnicalMomentum`/`VolumeMomentum`)은 기존 `종합티어`(낮을수록 상위) 를 `100×(1-가중rank합/(N-1))` 로 역변환·교체. 대시보드 후보 테이블에 시그널점수 그라데이션(Greens) 배경 적용
 
 ## 다음 작업 후보
 

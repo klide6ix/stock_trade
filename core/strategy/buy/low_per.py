@@ -55,12 +55,13 @@ class LowPerBuyStrategy(BuyStrategy):
                 "종목명": item["종목명"],
                 "현재가": current,
                 "거래량": item["거래량"],
+                "시그널점수": round(max(0.0, 100.0 * (1.0 - per / self.per_max)), 1),
                 "PER": per,
                 "PBR": pbr,
                 "EPS": eps,
             })
 
-        candidates.sort(key=lambda x: x["PER"])
+        candidates.sort(key=lambda x: x["시그널점수"], reverse=True)
         log(
             f"[매수후보][low_per] PER≤{self.per_max}·PBR≤{self.pbr_max}·EPS≥0 통과 "
             f"{len(candidates)}개 / 스캔 {len(scan)} (탈락 가치 {drop_value})"
