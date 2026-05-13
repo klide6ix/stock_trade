@@ -200,6 +200,7 @@ class Trader:
                         "updated_at": datetime.now().isoformat(),
                         "strategy": primary_name,
                         "primary_strategy": primary_name,
+                        "primary_strategy_label": self.buy_strategy.display_name,
                         "candidates": all_candidates,
                     },
                     f, ensure_ascii=False, indent=2,

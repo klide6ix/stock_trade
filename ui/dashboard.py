@@ -236,6 +236,7 @@ def refresh_buy_candidates() -> list[dict]:
                 "updated_at": datetime.now().isoformat(),
                 "strategy": primary_name,
                 "primary_strategy": primary_name,
+                "primary_strategy_label": primary.display_name,
                 "candidates": all_candidates,
             },
             f, ensure_ascii=False, indent=2,
@@ -243,11 +244,30 @@ def refresh_buy_candidates() -> list[dict]:
     return main_candidates
 
 
+def _signal_score_bg(value) -> str:
+    """0~100 시그널점수를 흰색→짙은 녹색 그라데이션 CSS 로 변환 (matplotlib 의존 회피).
+
+    matplotlib `Greens` cmap 을 흉내내어 (247,252,245) → (0,68,27) 선형 보간.
+    50 이상은 가독성을 위해 글자색을 흰색으로 전환.
+    """
+    if not isinstance(value, (int, float)):
+        return ""
+    t = max(0.0, min(1.0, float(value) / 100.0))
+    r = round(247 + (0 - 247) * t)
+    g = round(252 + (68 - 252) * t)
+    b = round(245 + (27 - 245) * t)
+    fg = "color: white" if t >= 0.5 else ""
+    return f"background-color: rgb({r},{g},{b}); {fg}".rstrip("; ")
+
+
 def _render_candidate_table(items: list[dict]) -> None:
     """후보 dict 리스트를 테이블로 표시. `_strategy*` 메타 필드는 자동 숨김."""
     df = pd.DataFrame(items)
     df = df.drop(columns=[c for c in ("_strategy", "_strategy_label") if c in df.columns])
     df.insert(0, "순위", range(1, len(df) + 1))
+    if "시그널점수" in df.columns:
+        cols = ["순위", "시그널점수"] + [c for c in df.columns if c not in ("순위", "시그널점수")]
+        df = df[cols]
 
     fmt: dict = {}
     if "현재가" in df.columns:
@@ -268,9 +288,7 @@ def _render_candidate_table(items: list[dict]) -> None:
             subset=pct_cols,
         )
     if "시그널점수" in df.columns:
-        styled = styled.background_gradient(
-            cmap="Greens", subset=["시그널점수"], vmin=0, vmax=100,
-        )
+        styled = styled.map(_signal_score_bg, subset=["시그널점수"])
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
@@ -289,6 +307,7 @@ def render_buy_candidates() -> None:
     status = "ready"
     started_at = None
     primary_strategy = None
+    primary_strategy_label = None
 
     if os.path.exists(BUY_CANDIDATES_FILE):
         try:
@@ -299,6 +318,7 @@ def render_buy_candidates() -> None:
             updated_at = raw.get("updated_at")
             started_at = raw.get("started_at")
             primary_strategy = raw.get("primary_strategy") or raw.get("strategy")
+            primary_strategy_label = raw.get("primary_strategy_label")
             if status == "ready":
                 st.session_state.buy_candidates = data
         except Exception:
@@ -330,6 +350,13 @@ def render_buy_candidates() -> None:
 
     # _strategy 키로 그룹화. 첫 등장 순서를 유지해서 primary 가 위로 오도록.
     groups: dict[str, dict] = {}
+    # primary 전략이 0개를 반환해도 빈 그룹으로 먼저 등록 — 사용자에게 활성 상태/조건 미충족을 명시.
+    if primary_strategy:
+        groups[primary_strategy] = {
+            "label": primary_strategy_label or primary_strategy,
+            "is_primary": True,
+            "items": [],
+        }
     for c in data:
         key = c.get("_strategy", "기타")
         if key not in groups:
@@ -347,7 +374,10 @@ def render_buy_candidates() -> None:
     for key, info in groups.items():
         marker = " · 매수 실행" if info["is_primary"] else " · view-only"
         st.markdown(f"**{info['label']}**{marker}")
-        _render_candidate_table(info["items"])
+        if info["items"]:
+            _render_candidate_table(info["items"])
+        else:
+            st.caption("⚠️ 조건 통과 종목 없음 — 현재 시장 상황에서 이 전략의 필터를 통과한 종목이 없습니다.")
 
 
 def render_buy_plan_preview() -> None:
@@ -355,8 +385,11 @@ def render_buy_plan_preview() -> None:
     st.subheader("🛒 매수 예정 미리보기 (장 마감 상태)")
     st.caption("장이 열리면 아래 계획대로 시장가 매수 주문이 실행됩니다. 슬롯 금액이 주가보다 작아도 최소 1주는 배정.")
 
-    # 후보 로드 — primary 전략 후보만 매수 실행 대상
-    candidates = None
+    # 후보 로드 — primary 전략 후보만 매수 실행 대상.
+    # JSON 을 정상 로드한 경우, primary 필터 결과가 비어 있더라도 절대 view-only 후보로
+    # fallback 하지 않는다 (view-only 후보가 실제 매수 계획에 새어 들어가는 것을 차단).
+    candidates: list[dict] | None = None
+    json_loaded = False
     if os.path.exists(BUY_CANDIDATES_FILE):
         try:
             with open(BUY_CANDIDATES_FILE, "r", encoding="utf-8") as f:
@@ -367,13 +400,19 @@ def render_buy_plan_preview() -> None:
                 candidates = [c for c in all_candidates if c.get("_strategy") == primary_strategy]
             else:
                 candidates = all_candidates
+            json_loaded = True
         except Exception:
             candidates = None
-    if not candidates:
+
+    # JSON 로드 자체가 실패한 경우에만 세션 캐시로 fallback
+    if not json_loaded and not candidates:
         candidates = st.session_state.buy_candidates
 
     if not candidates:
-        st.info("매수 후보 데이터가 없습니다.")
+        if json_loaded:
+            st.info("primary 매수 전략의 조건 통과 종목이 없어 매수 계획을 생성할 수 없습니다.")
+        else:
+            st.info("매수 후보 데이터가 없습니다.")
         return
 
     # 예수금 (캐시 허용)

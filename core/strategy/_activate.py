@@ -31,7 +31,7 @@ BUY_STRATEGY_FACTORIES: dict[str, Callable[[], BuyStrategy]] = {
     "quality_trend": lambda: QualityTrendBuyStrategy(market_cap_top_n=100, pick_n=4),
     "high_proximity": lambda: HighProximityBuyStrategy(market_cap_top_n=100, pick_n=4),
     "technical_momentum": lambda: TechnicalMomentumBuyStrategy(market_cap_top_n=100, pick_n=4),
-    "golden_cross": lambda: GoldenCrossBuyStrategy(market_cap_top_n=100, pick_n=4),
+    "golden_cross": lambda: GoldenCrossBuyStrategy(market_cap_top_n=100, pool_size=100, pick_n=4),
     "low_per": lambda: LowPerBuyStrategy(market_cap_top_n=100, pick_n=4),
     "oversold_rebound": lambda: OversoldReboundBuyStrategy(market_cap_top_n=100, pick_n=4),
     "volume_momentum": lambda: VolumeMomentumBuyStrategy(market_cap_top_n=100, pick_n=4),

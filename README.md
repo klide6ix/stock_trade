@@ -74,6 +74,11 @@
 - [x] `stop.sh` 가 main.py PID 만 종료하고 streamlit 자식 프로세스를 orphan 으로 남기던 문제 수정 — `pgrep -f` 로 streamlit/main.py 잔존 인스턴스를 SIGTERM 후 1초 grace period 거쳐 SIGKILL. 좀비 누적으로 인한 settings.json 동시 쓰기 race 재발 방지
 - [x] 동시 보유 종목 한도(`max_holdings`) 도입 (기본 5, 1~20) — 사이드바 number_input 으로 변경 가능, `data/settings.json` 영속화. `plan_initial_buy(max_holdings)` 인자가 잔여 슬롯(`max_holdings - len(owned)`) 만큼만 상위 후보 선택. 매도 후 재매수도 한도 미만일 때만 실행 (`execute_post_sell_buy`), 잔고 반영 지연 대비해 방금 매도한 종목은 보유 카운트에서 제외. 매수 예정 미리보기에 "보유/한도" metric 추가
 - [x] 매수 후보 전략 전체에 통일 `시그널점수` 컬럼 도입 (0~100, 100=최상위) — 단일 기준 전략은 정렬 기준의 절대 척도 기반 정규화(`HighProximity`/`QualityTrend` proximity×100, `LowPer` 1-PER/per_max, `GoldenCross` 1-(교차일수-1)/max_days, `OversoldRebound` 1-직전RSI/rsi_oversold), 다중 기준 (`TechnicalMomentum`/`VolumeMomentum`)은 기존 `종합티어`(낮을수록 상위) 를 `100×(1-가중rank합/(N-1))` 로 역변환·교체. 대시보드 후보 테이블에 시그널점수 그라데이션(Greens) 배경 적용
+- [x] 시그널점수 그라데이션을 matplotlib 비의존 방식으로 전환 — `Styler.background_gradient(cmap="Greens")` 가 matplotlib import 오류를 내던 문제 해결. `_signal_score_bg` 헬퍼가 0~100 값을 (247,252,245)→(0,68,27) 선형 보간한 inline CSS 로 변환, `Styler.map()` 으로 적용. 50 이상은 글자색 흰색으로 가독성 보강
+- [x] 후보 테이블 컬럼 순서 고정: `순위` 바로 옆에 `시그널점수` 위치 (전략별 컬럼 셋이 달라도 일관 비교 가능)
+- [x] primary 매수 전략이 0개 후보를 반환할 때도 대시보드에 그룹 표시 — 빈 placeholder ("⚠️ 조건 통과 종목 없음") 노출로 "전략이 활성화돼 있으나 시장 조건이 맞지 않음" 을 명시. `buy_candidates.json` 에 `primary_strategy_label` 추가 저장 (trader/대시보드 새로고침 양쪽). 직전까지는 primary 가 0개면 그룹 자체가 사라져 사용자가 "선택은 했는데 안 보인다" 로 오해할 여지가 있었음
+- [x] `GoldenCrossBuyStrategy` 풀 사이즈 50 → 100 으로 확대 (`_activate.py` 팩토리에서 `pool_size=100`) — 시총 100 ∩ 일간등락률 상위로 추린 풀 30 내에서 골든크로스 조건 통과 종목이 0개로 떨어지던 문제 대응. `get_daily_ohlcv` 호출 회수는 약 3배(30→100)로 증가
+- [x] 매수 예정 미리보기 버그 수정 — primary 전략 후보가 0개일 때 view-only 후보로 fallback 되어 실제 매수 계획에 새어 들어가던 문제. `render_buy_plan_preview` 가 `json_loaded` 플래그를 두어 JSON 자체 로드 실패 시에만 세션 캐시로 fallback 하고, 정상 로드 후 primary 필터 결과가 비면 "조건 통과 종목 없음" 안내 표시
 
 ## 다음 작업 후보
 
