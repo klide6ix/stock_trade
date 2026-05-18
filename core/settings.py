@@ -20,6 +20,7 @@ DEFAULTS: dict[str, Any] = {
     "view_buy_strategies": ["high_proximity", "technical_momentum"],
     "sell_strategy": "trailing_stop",
     "max_holdings": 5,  # 동시 보유 종목 상한 — 초과 시 매수 스킵
+    "auto_sell_enabled_codes": [],  # 자동 매도 활성화 종목 코드 (체크된 종목만 매도 실행, 미체크는 조건 충족해도 보류)
 }
 
 

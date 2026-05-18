@@ -155,6 +155,10 @@ def render_header(market_open: bool, buy_strategy_label: str, sell_strategy_labe
 
 def render_holdings(market_open: bool, stop_loss_pct: float) -> None:
     st.subheader("보유 종목")
+    st.caption(
+        "✅ **자동매도** 컬럼을 체크한 종목만 매도 조건 충족 시 실제 매도가 실행됩니다. "
+        "미체크 종목은 조건이 충족되어도 보류됩니다."
+    )
     try:
         rows, any_stale = build_holdings_rows(market_open)
     except Exception as e:
@@ -168,33 +172,44 @@ def render_holdings(market_open: bool, stop_loss_pct: float) -> None:
     if any_stale:
         st.caption("⚠️ 일부 가격은 마지막 조회 시점 기준입니다.")
 
+    enabled_codes = set(load_settings().get("auto_sell_enabled_codes", []) or [])
+
     df = pd.DataFrame(rows)
     df["상태"] = df["최고가 대비 하락(%)"].apply(lambda d: get_row_status(d, stop_loss_pct))
+    df.insert(0, "자동매도", df["종목코드"].apply(lambda c: c in enabled_codes))
 
-    def color_row(row):
-        drop = row["최고가 대비 하락(%)"]
-        if drop is None:
-            return [""] * len(row)
-        if drop >= stop_loss_pct:
-            return ["background-color: #ffcccc"] * len(row)
-        if drop >= stop_loss_pct * 0.8:
-            return ["background-color: #ffe4b2"] * len(row)
-        if drop >= stop_loss_pct * 0.5:
-            return ["background-color: #fffacd"] * len(row)
-        return [""] * len(row)
-
-    styled = (
-        df.style
-        .apply(color_row, axis=1)
-        .format({
-            "평균단가": "{:,.0f}원",
-            "현재가": "{:,.0f}원",
-            "최고가": "{:,.0f}원",
-            "수익률(%)": lambda x: f"{x:+.2f}%" if x is not None else "-",
-            "최고가 대비 하락(%)": lambda x: f"{x:.2f}%" if x is not None else "-",
-        })
+    locked_cols = [c for c in df.columns if c != "자동매도"]
+    edited = st.data_editor(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        key="holdings_editor",
+        disabled=locked_cols,
+        column_config={
+            "자동매도": st.column_config.CheckboxColumn(
+                "자동매도",
+                help="체크된 종목만 매도 조건 충족 시 실제 시장가 매도가 실행됩니다.",
+                default=False,
+            ),
+            "평균단가": st.column_config.NumberColumn("평균단가", format="%,d원"),
+            "현재가": st.column_config.NumberColumn("현재가", format="%,d원"),
+            "최고가": st.column_config.NumberColumn("최고가", format="%,d원"),
+            "수익률(%)": st.column_config.NumberColumn("수익률(%)", format="%+.2f%%"),
+            "최고가 대비 하락(%)": st.column_config.NumberColumn("최고가 대비 하락(%)", format="%.2f%%"),
+        },
     )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    # 편집 결과를 settings 에 동기화 — auto-refresh 와 무관하게 매 rerun 마다 비교.
+    # 사용자가 체크박스를 누르면 returned df 가 바뀌어 settings 갱신 → 다음 rerun 의 입력 df 도
+    # settings 기반으로 일치하게 빌드되므로 무한 set_setting 호출은 발생하지 않는다.
+    try:
+        new_enabled = {
+            str(row["종목코드"]) for _, row in edited.iterrows() if bool(row["자동매도"])
+        }
+    except Exception:
+        new_enabled = enabled_codes
+    if new_enabled != enabled_codes:
+        set_setting("auto_sell_enabled_codes", sorted(new_enabled))
 
 
 def refresh_buy_candidates() -> list[dict]:

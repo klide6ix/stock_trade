@@ -371,11 +371,21 @@ class Trader:
 
             should_sell, reason = self.sell_strategy.should_sell(code, price)
             if should_sell:
+                # 자동매도 활성화 종목인지 매번 settings 재읽기 — 대시보드에서 토글한 결과 즉시 반영.
+                raw_enabled = get_setting("auto_sell_enabled_codes")
+                enabled_codes = set(raw_enabled) if isinstance(raw_enabled, list) else set()
+                if code not in enabled_codes:
+                    log(f"[{name}({code})] 매도 조건 충족 ({reason}) — 자동매도 OFF 로 매도 보류")
+                    continue
                 log(f"[{name}({code})] ★ 매도 조건 충족 ({reason}) → 매도 주문 실행")
                 try:
                     result = sell_market_order(code, qty)
                     log(f"[{name}({code})] 매도 완료: {result}")
                     self.log_trade("sell", code, name, price, qty, reason=reason)
+                    # 매도 성공 시 enabled 리스트에서 제거 — 재매수 시 기본 OFF 로 다시 시작.
+                    if code in enabled_codes:
+                        from core.settings import set_value as _set_setting
+                        _set_setting("auto_sell_enabled_codes", sorted(enabled_codes - {code}))
                     self.execute_post_sell_buy(code)
                 except Exception as e:
                     log(f"[{name}({code})] 매도 실패: {e}")
