@@ -1,9 +1,9 @@
 import json
 import os
-import time
 import pandas as pd
 import streamlit as st
 from datetime import datetime
+from streamlit_autorefresh import st_autorefresh
 
 from config import CHECK_INTERVAL
 from core.kis_api import get_holdings, get_current_price, get_cash_balance
@@ -153,6 +153,40 @@ def render_header(market_open: bool, buy_strategy_label: str, sell_strategy_labe
     c5.metric("마지막 갱신", datetime.now().strftime("%H:%M:%S"))
 
 
+def _on_holdings_editor_change() -> None:
+    """사용자가 자동매도 체크박스를 토글했을 때 즉시 settings 에 반영.
+
+    data_editor 의 returned df 가 아닌 `session_state.holdings_editor.edited_rows` 를
+    콜백 안에서 직접 읽어 settings 에 저장한다. 콜백은 data_editor 의 merge 로직보다
+    앞서 실행되므로, input df 와 충돌하는 편집이 폐기되는 버그의 영향을 받지 않는다.
+    """
+    state = st.session_state.get("holdings_editor") or {}
+    edits = state.get("edited_rows") or {}
+    if not edits:
+        return
+    codes_by_idx = st.session_state.get("_holdings_codes_by_idx") or []
+    enabled = set(load_settings().get("auto_sell_enabled_codes", []) or [])
+    changed = False
+    for idx, edit in edits.items():
+        try:
+            i = int(idx)
+        except (TypeError, ValueError):
+            continue
+        if "자동매도" not in edit or not (0 <= i < len(codes_by_idx)):
+            continue
+        code = codes_by_idx[i]
+        if edit["자동매도"]:
+            if code not in enabled:
+                enabled.add(code)
+                changed = True
+        else:
+            if code in enabled:
+                enabled.discard(code)
+                changed = True
+    if changed:
+        set_setting("auto_sell_enabled_codes", sorted(enabled))
+
+
 def render_holdings(market_open: bool, stop_loss_pct: float) -> None:
     st.subheader("보유 종목")
     st.caption(
@@ -174,16 +208,24 @@ def render_holdings(market_open: bool, stop_loss_pct: float) -> None:
 
     enabled_codes = set(load_settings().get("auto_sell_enabled_codes", []) or [])
 
+    # data_editor 의 returned df 에 의존하면, `edited_rows` 가 input df 와 충돌할 때
+    # Streamlit 이 일부 편집을 잘못 폐기하면서 사용자의 체크가 무시되는 버그가 있다.
+    # on_change 콜백 안에서 `session_state.edited_rows` 를 직접 읽어 settings 에 즉시 반영하면,
+    # data_editor 의 merge 로직과 무관하게 사용자의 클릭이 손실 없이 처리된다.
+    # 콜백에서 row index → 종목코드 매핑이 필요하므로 widget 렌더 전에 session_state 에 저장.
+    st.session_state["_holdings_codes_by_idx"] = [r["종목코드"] for r in rows]
+
     df = pd.DataFrame(rows)
     df["상태"] = df["최고가 대비 하락(%)"].apply(lambda d: get_row_status(d, stop_loss_pct))
     df.insert(0, "자동매도", df["종목코드"].apply(lambda c: c in enabled_codes))
 
     locked_cols = [c for c in df.columns if c != "자동매도"]
-    edited = st.data_editor(
+    st.data_editor(
         df,
         use_container_width=True,
         hide_index=True,
         key="holdings_editor",
+        on_change=_on_holdings_editor_change,
         disabled=locked_cols,
         column_config={
             "자동매도": st.column_config.CheckboxColumn(
@@ -198,18 +240,6 @@ def render_holdings(market_open: bool, stop_loss_pct: float) -> None:
             "최고가 대비 하락(%)": st.column_config.NumberColumn("최고가 대비 하락(%)", format="%.2f%%"),
         },
     )
-
-    # 편집 결과를 settings 에 동기화 — auto-refresh 와 무관하게 매 rerun 마다 비교.
-    # 사용자가 체크박스를 누르면 returned df 가 바뀌어 settings 갱신 → 다음 rerun 의 입력 df 도
-    # settings 기반으로 일치하게 빌드되므로 무한 set_setting 호출은 발생하지 않는다.
-    try:
-        new_enabled = {
-            str(row["종목코드"]) for _, row in edited.iterrows() if bool(row["자동매도"])
-        }
-    except Exception:
-        new_enabled = enabled_codes
-    if new_enabled != enabled_codes:
-        set_setting("auto_sell_enabled_codes", sorted(new_enabled))
 
 
 def refresh_buy_candidates() -> list[dict]:
@@ -771,5 +801,6 @@ st.divider()
 render_log()
 
 if auto_refresh:
-    time.sleep(refresh_interval)
-    st.rerun()
+    # JS 기반 비블로킹 자동 새로고침. `time.sleep` 으로 스크립트를 잠재우면 그 사이 발생한
+    # 위젯 인터랙션이 큐잉만 되고 즉시 처리되지 않아 체크박스 클릭이 반영되지 않는 문제가 있었다.
+    st_autorefresh(interval=refresh_interval * 1000, key="_auto_refresh_tick")
