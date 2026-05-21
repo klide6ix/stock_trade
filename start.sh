@@ -23,6 +23,9 @@ if [ ! -x ".venv/bin/python" ]; then
     exit 1
 fi
 
+echo "의존성 동기화 중..."
+.venv/bin/pip install -q -r requirements.txt
+
 mkdir -p logs
 echo "트레이더 시작..."
 nohup .venv/bin/python main.py > logs/startup.log 2>&1 &
