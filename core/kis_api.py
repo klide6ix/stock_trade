@@ -269,13 +269,27 @@ def get_weekly_price_change(stock_code: str) -> float | None:
     return (latest - oldest) / oldest * 100
 
 
-def get_market_cap_rank(top_n: int = 100) -> list[dict]:
-    """시가총액 상위 종목 조회. [{종목코드, 종목명, 현재가, 시가총액(억), 거래량}] 반환"""
+# KIS ranking API 의 시장 구분 코드 (`FID_INPUT_ISCD`).
+# "0000": KRX 전체, "0001": KOSPI 만, "1001": KOSDAQ 만, "2001": KOSPI200 (지수 구성종목)
+_MARKET_ISCD = {
+    "all": "0000",
+    "kospi": "0001",
+    "kosdaq": "1001",
+    "kospi200": "2001",
+}
+
+
+def get_market_cap_rank(top_n: int = 100, market: str = "all") -> list[dict]:
+    """시가총액 상위 종목 조회. [{종목코드, 종목명, 현재가, 시가총액(억), 거래량}] 반환.
+
+    Args:
+        market: 시장 구분 ("all" | "kospi" | "kosdaq"). default "all" (KRX 전체).
+    """
     url = f"{BASE_URL}/uapi/domestic-stock/v1/ranking/market-cap"
     params = {
         "FID_COND_MRKT_DIV_CODE": "J",
         "FID_COND_SCR_DIV_CODE": "20174",
-        "FID_INPUT_ISCD": "0000",
+        "FID_INPUT_ISCD": _MARKET_ISCD.get(market, "0000"),
         "FID_DIV_CLS_CODE": "0",
         "FID_BLNG_CLS_CODE": "0",
         "FID_TRGT_CLS_CODE": "111111111",
@@ -300,13 +314,57 @@ def get_market_cap_rank(top_n: int = 100) -> list[dict]:
     return result
 
 
-def get_fluctuation_rank(top_n: int = 30) -> list[dict]:
-    """일간 등락률 상위 종목 조회 (상승률 순). [{종목코드, 종목명, 현재가, 등락률(%)}] 반환"""
+def get_volume_rank(top_n: int = 30, market: str = "all") -> list[dict]:
+    """거래량 상위 종목 조회 (당일 누적 거래량 순). 단일 호출.
+
+    Args:
+        market: 시장 구분 ("all" | "kospi" | "kosdaq"). default "all" (KRX 전체).
+            KIS 거래량 ranking 은 "주식 수 거래량" 기준이라 KOSDAQ 저가 소형주가 상위를 채운다.
+            KOSPI 대형주를 보고 싶으면 market="kospi" 권장.
+
+    [{종목코드, 종목명, 현재가, 등락률(%), 거래량, 순위}] 반환 — 순위는 응답 순서(1부터).
+    """
+    url = f"{BASE_URL}/uapi/domestic-stock/v1/quotations/volume-rank"
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_COND_SCR_DIV_CODE": "20171",
+        "FID_INPUT_ISCD": _MARKET_ISCD.get(market, "0000"),
+        "FID_DIV_CLS_CODE": "0",
+        "FID_BLNG_CLS_CODE": "0",
+        "FID_TRGT_CLS_CODE": "111111111",
+        "FID_TRGT_EXLS_CLS_CODE": "000000",
+        "FID_INPUT_PRICE_1": "",
+        "FID_INPUT_PRICE_2": "",
+        "FID_VOL_CNT": "",
+        "FID_INPUT_DATE_1": "",
+    }
+    res = requests.get(url, headers=_headers("FHPST01710000"), params=params)
+    res.raise_for_status()
+
+    result = []
+    for idx, item in enumerate(res.json().get("output", [])[:top_n], start=1):
+        result.append({
+            "순위": int(item.get("data_rank", idx) or idx),
+            "종목코드": item.get("mksc_shrn_iscd", ""),
+            "종목명": item.get("hts_kor_isnm", ""),
+            "현재가": float(item.get("stck_prpr", 0) or 0),
+            "등락률(%)": float(item.get("prdy_ctrt", 0) or 0),
+            "거래량": int(item.get("acml_vol", 0) or 0),
+        })
+    return result
+
+
+def get_fluctuation_rank(top_n: int = 30, market: str = "all") -> list[dict]:
+    """일간 등락률 상위 종목 조회 (상승률 순). [{종목코드, 종목명, 현재가, 등락률(%)}] 반환.
+
+    Args:
+        market: 시장 구분 ("all" | "kospi" | "kosdaq"). default "all" (KRX 전체).
+    """
     url = f"{BASE_URL}/uapi/domestic-stock/v1/ranking/fluctuation"
     params = {
         "FID_COND_MRKT_DIV_CODE": "J",
         "FID_COND_SCR_DIV_CODE": "20170",
-        "FID_INPUT_ISCD": "0000",
+        "FID_INPUT_ISCD": _MARKET_ISCD.get(market, "0000"),
         "FID_RANK_SORT_CLS_CODE": "0",
         "FID_INPUT_CNT_1": "0",
         "FID_PRC_CLS_CODE": "1",

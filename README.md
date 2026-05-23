@@ -81,10 +81,20 @@
 - [x] 매수 예정 미리보기 버그 수정 — primary 전략 후보가 0개일 때 view-only 후보로 fallback 되어 실제 매수 계획에 새어 들어가던 문제. `render_buy_plan_preview` 가 `json_loaded` 플래그를 두어 JSON 자체 로드 실패 시에만 세션 캐시로 fallback 하고, 정상 로드 후 primary 필터 결과가 비면 "조건 통과 종목 없음" 안내 표시
 - [x] **종목별 자동매도 토글** 도입 — 보유 종목 테이블을 `st.data_editor` 로 전환해 "자동매도" 체크박스 컬럼 추가 (다른 컬럼은 disabled). 체크된 종목만 매도 조건 충족 시 실제 시장가 매도가 실행되고, 미체크 종목은 조건이 충족돼도 로그만 남기고 보류 (`[name(code)] 매도 조건 충족 (reason) — 자동매도 OFF 로 매도 보류`). `data/settings.json::auto_sell_enabled_codes` (기본 `[]` — 신규 매수 종목은 OFF 시작) 에 영속화, 트레이더가 매 매도 판단 시점에 settings 재읽기. 매도 성공 시 해당 코드를 enabled 리스트에서 자동 제거 → 재매수 시 다시 OFF 기본값으로 시작. 기존 행 색상 스타일(🟡주의/🟠임박/🔴손절)은 data_editor 제약으로 제거, "상태" 컬럼 이모지로 대체
 - [x] 자동매도 체크박스 실시간 반영 버그 수정 — 두 가지 원인을 함께 해결: (1) `st.data_editor` 의 `edited_rows` 누적·재해석으로 settings 기반 input df 와 충돌하는 편집이 잘못 폐기되던 문제 → `on_change` 콜백 안에서 `session_state.holdings_editor.edited_rows` 를 직접 읽어 즉시 settings 에 반영, returned df 의존 제거. (2) auto-refresh 의 `time.sleep(refresh_interval) + st.rerun()` 이 Python 스크립트를 잠재워 그 사이 발생한 위젯 클릭이 큐잉만 되고 처리되지 않던 문제 → `streamlit-autorefresh` 의 `st_autorefresh()` 로 교체(JS 기반 비블로킹 새로고침). 의존성 `streamlit-autorefresh` 를 `requirements.txt` 에 추가
+- [x] **단기 매매 (단타) 골격 추가** — 보유 종목 테이블 아래에 단일 종목 추적용 별도 테이블 도입 (단일 행 `st.data_editor` + 통합 "자동매매" 체크박스). `core/short_term.py::ShortTermStrategy` 가 `find_target()` / `should_buy()` / `should_sell()` 3개 메서드로 종목 선정 · 매수 · 매도 트리거를 통합 관리하는 stub 클래스로 추가 (조건은 모두 비어있어 실주문 미발생). 영속화는 `settings.json::short_term_trade` 단일 dict (`code` / `name` / `selected_at` / `auto_enabled`). 대시보드 "🔄 종목 선정" 버튼으로 `find_target()` 호출 → 결과를 settings 에 저장. 트레이더 메인 루프가 매 주기 `check_short_term()` 호출 — 자동매매 ON + 종목 지정 시 보유 여부에 따라 매수/매도 분기, 매도 후 슬롯 자동 비움. `auto_sell_enabled_codes` 와는 독립된 단타 전용 슬롯이므로 일반 매도 흐름과 간섭 없음
+- [x] **단타 종목 선정 로직 구현** — 코스피200 근사(시가총액 상위 200) 풀에서 **N일(default 5) 연속 종가 상승** 통과 종목 중 **N영업일 누적 상승률 최대** 종목 1개 자동 선정. KIS API 에 코스피200 직접 조회가 없어 시총 상위 200 으로 근사 (시총 200 ≒ 코스피200 + 일부 코스닥 대형주). 호출 수: 시총 1 + 일봉 N+1개 × 200종목 ≈ 약 201회/일단위 1회. 호출 최적화 옵션 `prefilter_positive` (default OFF) 추가 — 일간 등락률 양수 종목으로 사전 필터링 시 일봉 호출 절감 가능하나 KIS ranking API 응답 한도로 누락 위험. `select_kospi200_universe()` 헬퍼로 분리해 추후 다른 단타 전략에서도 재사용 가능
+- [x] **단타 매수·매도 트리거 + 수량 정책 구현** — 매수: 종목 선정 자체가 신호 (`should_buy` 항상 True), 주문가능금액의 `SHORT_TERM_BUDGET_RATIO=50%` 로 시장가 매수 (남은 50%는 일반 매수와 자금 경합 회피용). 매도: 매수 평균가 대비 `stop_loss_pct=5%` 이상 하락 시 전량 시장가 매도. **일단위 초기화** — `selected_at` 의 날짜가 오늘과 다르면 트레이더가 `needs_reselection()` 으로 감지해 자동 재선정. **같은 날 재매수 방지** — 매도 시 `sold=True` 플래그 마크, 다음 날 재선정 시 리셋. 대시보드 단타 테이블에 선정사유·매도 완료 안내 표시
+- [x] 단타 default 값 조정: `pool_top_n` 200 → **100** (스캔 시간 약 10초 → 약 5초로 단축, 코스피200 의 시총 상위 절반에 집중), 매수 예산을 비율 기반(`SHORT_TERM_BUDGET_RATIO=0.5`) → 고정 상한액(`SHORT_TERM_BUDGET_MAX=3,000,000원`)으로 교체 — 주문가능금액과 300만원 중 작은 쪽으로 매수. 단발성 단타 특성상 비율보다 절대 상한이 자금 관리에 명확
+- [x] **단타 선정 로직을 ranking 결합으로 교체** — 이전 "N일 연속 상승" 조건은 시총 상위에서 통과 종목이 0개로 떨어지는 경우가 잦아 폐기. 새 방식: 시총 상위 100 풀 ∩ KIS 등락률 ranking(양봉만) ∩ KIS 거래량 ranking → 두 ranking 모두 등장 종목에 대해 `등락률순위 + 거래량순위` 합산이 작을수록 상위(=양쪽에서 동시에 상위인 종목 선호). 최상위 1종목 선정. **호출 수 약 101회/일 → 3회/일로 절감** (시총 + 등락률 + 거래량, 일봉 조회 완전 제거). [core/kis_api.py](core/kis_api.py) 에 `get_volume_rank()` 복구(`quotations/volume-rank`, tr_id `FHPST01710000`). `ShortTermStrategy` 인자 정리: `consecutive_days`/`prefilter_positive` 제거, `ranking_fetch_n` 추가 (각 ranking API top_n 상한, default 100). 선정사유 포맷도 `"등락률 N위 · 거래량 M위 · +X.XX%"` 로 변경
+- [x] 단타 후보 0개 버그 수정 — KIS 시총 API 응답이 30개로 한도 + 거래량 ranking 이 "주식 수 거래량" 기준이라 KOSPI 시총 상위 대형주가 KOSDAQ 저가 소형주에 밀려 시총 ∩ ranking 교집합이 0개로 떨어지던 문제. **시총 풀 fallback 도입** — 시총 풀 ∩ ranking 교집합이 있으면 그것을 우선 사용(코스피200), 없으면 두 ranking 의 시장 전체 교집합으로 fallback. 선정사유 끝에 `· 코스피200` 또는 `· 시장전체` 명시해 사용자가 어느 풀에서 선정됐는지 확인 가능. 종목명/현재가는 두 ranking 응답에서 추출하므로 시총 풀 밖 종목도 정상 표시
+- [x] 단타 ranking 시장 구분을 KOSPI 로 한정 — KIS ranking 3종(`get_market_cap_rank`/`get_volume_rank`/`get_fluctuation_rank`)에 `market` 인자 추가 (`"all"`/`"kospi"`/`"kosdaq"` → `FID_INPUT_ISCD` 매핑: 0000/0001/1001). 다른 전략 영향 없도록 default 는 `"all"` 유지(backward compat), `ShortTermStrategy.find_target` 만 세 ranking 모두 `market="kospi"` 호출. KOSDAQ 저가 소형주가 거래량/등락률 상위를 채우는 문제를 ranking 응답 단계에서 차단. fallback 라벨도 `KOSPI 시총상위` / `KOSPI` 로 변경해 의미 명확화
+- [x] 단타 ranking 을 **KOSPI200 지수 구성종목 한정**으로 더 좁힘 — `_MARKET_ISCD` 에 `"kospi200": "2001"` 추가, ranking 3종이 모두 `FID_INPUT_ISCD=2001` 응답을 정상 반환하는 것을 실 KIS 호출로 검증 완료. `select_kospi200_universe()` default 도 `market="kospi200"` 으로 갱신해 함수명과 의미 일치. 실 검증 결과: 이전 "양봉등락률∩풀 0 / 거래량∩풀 1 / 교집합 0" → "시총 30 / 양봉등락률 30 / 거래량 30 / 시총교집합 2" 로 후보 안정 확보 (한화오션 등 KOSPI200 종목 선정). fallback 라벨 `KOSPI200 시총상위` / `KOSPI200` 로 갱신
+- [x] **단타 매도 후 실시간 재선정 + 독립 자금 풀** — 기존 `sold` 플래그 폐기, 매도 직후 즉시 `find_target(exclude_codes={매도종목})` 호출해 다음 단타 종목 선정 (같은 사이클에서 매도→재선정, 매수는 다음 사이클). 직전 매도 종목은 후보에서 제외해 매도 즉시 같은 종목 재진입 차단. **단타 자금 풀 독립 추적** — `short_term_trade.last_realized_amount` 에 직전 매도 회수 금액(체결가×수량) 저장, 다음 매수 예산은 `min(last_realized_amount, SHORT_TERM_BUDGET_MAX, 주문가능금액)`. 이익(330만 회수)은 상한(300만)으로 캡되어 일반 자금으로 풀려나가고, 손실(250만 회수)은 단타 풀에서 그대로 흡수 — **일반 자금에서 손실분을 보충하지 않음**. `target_to_settings(..., last_realized_amount=...)` 시그니처 변경, `find_target(exclude_codes=...)` 인자 추가. 대시보드에도 "다음 진입 예산 상한" caption 표시
 
 ## 다음 작업 후보
 
-- [ ] 단기간 매매 전략 구성 (intraday/단타 — 분봉 기반 진입·청산 룰, 짧은 보유주기 매수/매도 전략 페어)
+- [ ] 단타 파라미터 (`consecutive_days`, `stop_loss_pct`, `pool_top_n`, `prefilter_positive`, `SHORT_TERM_BUDGET_RATIO`) 사이드바 노출 + `settings.json` 영속화
+- [ ] 단타 호출 수 분석 후 사전 필터 (`prefilter_positive`) 의 누락 위험 vs 절감 효과 측정 → default 결정
 - [ ] 매도 발생 시 알림 (Telegram / 카카오톡 등)
 - [ ] 확인 주기를 대시보드에서 실시간 변경
 - [ ] 추가 매도 전략 (트레일링 스탑 + RSI/이평선 OR 결합 Composite)
@@ -113,8 +123,9 @@ stock_trader/
 ├── stop.sh              # 종료 스크립트
 ├── core/
 │   ├── kis_api.py       # KIS API 호출 (인증, 잔고조회, 현재가, 매도주문, 매수후보 탐색)
-│   ├── trader.py        # Trader 클래스 (전략 주입, 매도/매수 루프 실행)
+│   ├── trader.py        # Trader 클래스 (전략 주입, 매도/매수 루프 실행, 단타 처리)
 │   ├── logger.py        # 로깅 유틸리티
+│   ├── short_term.py    # 단기 매매 (단타) 전략 stub — find_target/should_buy/should_sell
 │   └── strategy/
 │       ├── base.py                        # BuyStrategy / SellStrategy ABC
 │       ├── _activate.py                   # 전략 레지스트리 + 활성 전략 팩토리 (settings.json 반영)

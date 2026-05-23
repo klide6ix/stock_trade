@@ -12,7 +12,13 @@ from core.kis_api import (
     get_cash_balance,
 )
 from core.logger import log
-from core.settings import get as get_setting
+from core.settings import get as get_setting, set_value as set_setting
+from core.short_term import (
+    ShortTermStrategy,
+    is_target_set,
+    needs_reselection,
+    target_to_settings,
+)
 from core.strategy.base import BuyStrategy, SellStrategy
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -118,12 +124,14 @@ class Trader:
         buy_strategy: BuyStrategy,
         sell_strategy: SellStrategy,
         view_strategies: list[BuyStrategy] | None = None,
+        short_term_strategy: ShortTermStrategy | None = None,
     ) -> None:
         from core.strategy._activate import sell_strategy_key_of
 
         self.buy_strategy = buy_strategy
         self.sell_strategy = sell_strategy
         self.view_strategies = list(view_strategies or [])
+        self.short_term_strategy = short_term_strategy or ShortTermStrategy()
         self._known_holdings: set[str] = set()
         self._sell_strategy_key: str = sell_strategy_key_of(sell_strategy)
 
@@ -330,6 +338,148 @@ class Trader:
 
         log("[매도후재매수] 미보유 후보 없음 - 스킵")
 
+    # ── 단타 처리 ──────────────────────────────────────────────────────────────
+
+    # 단타 매수 1회 최대 사용 금액 (원). 주문가능금액이 이보다 많아도 이 금액으로 상한 제한.
+    # 단타는 단발 진입 + 빠른 청산이므로 고정 상한으로 운용해 일반 매수와 자금 경합을 줄인다.
+    SHORT_TERM_BUDGET_MAX = 3_000_000
+
+    def check_short_term(self) -> None:
+        """단기 매매 (단타) 대상 종목에 대해 매수/매도 조건 점검 + 매도 후 실시간 재선정.
+
+        흐름:
+          1. 슬롯이 비었거나 selected_at 날짜 ≠ 오늘 → `find_target()` 으로 일단위 재선정.
+             `last_realized_amount` 는 보존 (단타 자금 풀이 일반 자금으로 손실 보충 받지 않도록).
+          2. auto_enabled OFF 이면 종료.
+          3. 보유 중 + should_sell True → 전량 시장가 매도 →
+             회수 금액(`체결가 × 수량`)을 `last_realized_amount` 로 기록 →
+             **즉시 `find_target(exclude_codes={매도종목})` 으로 재선정** (같은 종목 재진입 방지).
+          4. 미보유 + should_buy True → 매수.
+             예산 = min(직전 `last_realized_amount` (없으면 `SHORT_TERM_BUDGET_MAX`),
+                       `SHORT_TERM_BUDGET_MAX`, 주문가능금액).
+
+        예산 정책의 의도: 단타 자금 풀을 독립 추적해 일반 매수와 자금 경합 차단.
+        이익 발생 시 BUDGET_MAX 로 캡(=초과분은 일반 자금으로 풀어줌), 손실 시 단타 풀에서 흡수.
+        """
+        slot = get_setting("short_term_trade")
+        if not isinstance(slot, dict):
+            return
+
+        auto_enabled = bool(slot.get("auto_enabled", False))
+        last_realized = slot.get("last_realized_amount")
+
+        if needs_reselection(slot):
+            log("[단타] 일단위 재선정 트리거 (슬롯 비어있거나 다른 날짜)")
+            target = self.short_term_strategy.find_target()
+            new_slot = target_to_settings(
+                target,
+                auto_enabled=auto_enabled,
+                last_realized_amount=last_realized,
+            )
+            set_setting("short_term_trade", new_slot)
+            if target is None:
+                log("[단타] 조건 통과 종목 없음 - 다음 사이클 재시도")
+                return
+            log(
+                f"[단타] 종목 선정 완료: {new_slot['name']}({new_slot['code']}) - "
+                f"{new_slot.get('selection_reason', '')}"
+            )
+            slot = new_slot
+
+        if not auto_enabled:
+            return
+
+        code = slot["code"]
+        name = slot.get("name") or code
+
+        try:
+            current_price = get_current_price(code)
+        except Exception as e:
+            log(f"[단타][{name}({code})] 가격 조회 실패: {e}")
+            return
+
+        holdings = get_holdings()
+        held = holdings.get(code)
+
+        if held:
+            avg_price = held.get("avg_price")
+            should_sell, reason = self.short_term_strategy.should_sell(slot, current_price, avg_price)
+            if should_sell:
+                qty = held["qty"]
+                log(f"[단타][{name}({code})] ★ 매도 조건 충족 ({reason}) → {qty}주 시장가 매도")
+                try:
+                    sell_market_order(code, qty)
+                    self.log_trade("sell", code, name, current_price, qty, reason=f"[단타] {reason}")
+
+                    # 매도 회수 금액 (체결가 × 수량) — 다음 매수 예산 상한으로 사용.
+                    realized = float(current_price) * int(qty)
+                    log(
+                        f"[단타][{name}({code})] 매도 회수 ≈ {realized:,.0f}원 → "
+                        f"다음 진입 예산 = min({realized:,.0f}, 상한 {self.SHORT_TERM_BUDGET_MAX:,.0f}, 주문가능)"
+                    )
+
+                    # 실시간 재선정 — 직전 매도 종목 제외해 즉시 회전 방지.
+                    new_target = self.short_term_strategy.find_target(exclude_codes={code})
+                    new_slot = target_to_settings(
+                        new_target,
+                        auto_enabled=auto_enabled,
+                        last_realized_amount=realized,
+                    )
+                    set_setting("short_term_trade", new_slot)
+                    if new_target is None:
+                        log("[단타] 매도 후 재선정 결과 없음 - 다음 사이클 재시도")
+                    else:
+                        log(
+                            f"[단타] 매도 후 실시간 재선정 완료: "
+                            f"{new_slot['name']}({new_slot['code']}) - "
+                            f"{new_slot.get('selection_reason', '')}"
+                        )
+                except Exception as e:
+                    log(f"[단타][{name}({code})] 매도 실패: {e}")
+            return
+
+        # 미보유 — 매수 진행
+        should_buy, reason = self.short_term_strategy.should_buy(slot, current_price)
+        if not should_buy:
+            return
+
+        try:
+            cash = get_cash_balance()["주문가능금액"]
+        except Exception as e:
+            log(f"[단타][{name}({code})] 주문가능금액 조회 실패: {e}")
+            return
+
+        # 예산: 직전 매도 회수 금액(없으면 BUDGET_MAX) 과 상한, 주문가능금액 셋 중 최솟값.
+        # 사용자 요구: 손실분은 단타 풀이 흡수, 일반 자금에서 끌어오지 않음.
+        if isinstance(last_realized, (int, float)) and last_realized > 0:
+            base_budget = float(last_realized)
+        else:
+            base_budget = float(self.SHORT_TERM_BUDGET_MAX)
+        budget = min(base_budget, float(self.SHORT_TERM_BUDGET_MAX), float(cash))
+
+        if budget < current_price:
+            log(
+                f"[단타][{name}({code})] 예산 부족 "
+                f"(예산 {budget:,.0f}원 = min(직전회수 {base_budget:,.0f}, 상한 {self.SHORT_TERM_BUDGET_MAX:,.0f}, 주문가능 {cash:,.0f}) "
+                f"< 현재가 {current_price:,.0f}원) - 스킵"
+            )
+            return
+
+        qty = int(budget // current_price)
+        if qty <= 0:
+            return
+
+        log(
+            f"[단타][{name}({code})] ★ 매수 조건 충족 ({reason}) → "
+            f"{qty}주 × {current_price:,.0f}원 ≈ {qty*current_price:,.0f}원 "
+            f"(예산 {budget:,.0f}원 = min(직전회수 {base_budget:,.0f}, 상한 {self.SHORT_TERM_BUDGET_MAX:,.0f}, 주문가능 {cash:,.0f}))"
+        )
+        try:
+            buy_market_order(code, qty)
+            self.log_trade("buy", code, name, current_price, qty, reason=f"[단타] {reason}")
+        except Exception as e:
+            log(f"[단타][{name}({code})] 매수 실패: {e}")
+
     # ── 매도 체크 ──────────────────────────────────────────────────────────────
 
     def check_and_sell(self) -> None:
@@ -427,6 +577,10 @@ class Trader:
                     self.check_and_sell()
                 except Exception as e:
                     log(f"오류 발생: {e}")
+                try:
+                    self.check_short_term()
+                except Exception as e:
+                    log(f"[단타] 처리 중 오류: {e}")
             else:
                 log("장 운영 시간 외 - 대기 중")
 

@@ -21,6 +21,17 @@ DEFAULTS: dict[str, Any] = {
     "sell_strategy": "trailing_stop",
     "max_holdings": 5,  # 동시 보유 종목 상한 — 초과 시 매수 스킵
     "auto_sell_enabled_codes": [],  # 자동 매도 활성화 종목 코드 (체크된 종목만 매도 실행, 미체크는 조건 충족해도 보류)
+    # 단기 매매 (단타) — 단일 종목 자동 매수/매도. ShortTermStrategy 가 자동 선정.
+    # 매도 발생 시 즉시 재선정(실시간 회전)하되, 다음 매수 예산은 직전 회수 금액으로 캡해
+    # 단타 자금 풀이 일반 자금으로 손실을 보충받지 않도록 한다.
+    "short_term_trade": {
+        "code": None,
+        "name": None,
+        "selected_at": None,            # ISO 시각 — 날짜 부분이 오늘과 다르면 재선정 트리거
+        "selection_reason": None,       # 선정 사유 (예: "등락률 N위 · 거래량 M위 ...")
+        "auto_enabled": False,          # 자동매매 ON/OFF (매수·매도 모두 제어)
+        "last_realized_amount": None,   # 직전 매도 회수 금액(체결가×수량). 다음 매수 예산 상한으로 사용.
+    },
 }
 
 

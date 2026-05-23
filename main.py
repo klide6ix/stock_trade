@@ -2,6 +2,7 @@ import subprocess
 import sys
 import threading
 
+from core.short_term import ShortTermStrategy
 from core.trader import Trader
 from core.strategy._activate import (
     primary_buy_strategy,
@@ -22,5 +23,6 @@ if __name__ == "__main__":
         buy_strategy=primary_buy_strategy(),
         sell_strategy=primary_sell_strategy(),
         view_strategies=view_buy_strategies(),
+        short_term_strategy=ShortTermStrategy(),
     )
     trader.run()
