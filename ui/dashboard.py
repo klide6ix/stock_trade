@@ -288,14 +288,15 @@ def render_short_term(market_open: bool) -> None:
 
     from core.trader import Trader as _Trader
     budget_max = _Trader.SHORT_TERM_BUDGET_MAX
-    st.caption(
-        f"**등락률 순위 + 거래량 순위가 모두 상위**인 종목 1개를 자동 선정합니다 (rank 합산이 작을수록 우선). "
-        f"KOSPI200 시총 상위 {strategy.pool_top_n} 풀 우선, 풀 안에 후보가 없으면 KOSPI200 전체에서 fallback. "
-        f"✅ **자동매매** 체크 시 선정 종목을 시장가 매수하고 매수가 대비 **{strategy.stop_loss_pct}% 하락** 시 전량 매도, "
-        f"매도 즉시 다음 단타 종목을 실시간 재선정합니다 (직전 매도 종목은 제외). "
-        f"매수 예산은 **min(직전 매도 회수 금액, 상한 {budget_max:,.0f}원, 주문가능금액)** — "
-        f"이익은 상한으로 캡되고 손실은 단타 자금 풀에서 흡수합니다 (일반 자금 보충 X)."
-    )
+    with st.expander("ℹ️ 단타 매매 동작 안내", expanded=False):
+        st.markdown(
+            f"**등락률 순위 + 거래량 순위가 모두 상위**인 종목 1개를 자동 선정합니다 (rank 합산이 작을수록 우선).\n\n"
+            f"- 풀: KOSPI200 시총 상위 {strategy.pool_top_n} 우선, 풀 안에 후보가 없으면 KOSPI200 전체에서 fallback.\n"
+            f"- 자동매매 체크 시 선정 종목을 시장가 매수하고 매수가 대비 **{strategy.stop_loss_pct}% 하락** 시 전량 매도.\n"
+            f"- 매도 즉시 다음 단타 종목을 실시간 재선정 (직전 매도 종목은 제외).\n"
+            f"- 매수 예산: **min(직전 매도 회수 금액, 상한 {budget_max:,.0f}원, 주문가능금액)** "
+            f"— 이익은 상한으로 캡, 손실은 단타 자금 풀에서 흡수 (일반 자금 보충 X)."
+        )
 
     slot = load_settings().get("short_term_trade")
     if not isinstance(slot, dict) or not is_target_set(slot):
