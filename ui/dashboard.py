@@ -8,7 +8,15 @@ from streamlit_autorefresh import st_autorefresh
 from config import CHECK_INTERVAL
 from core.kis_api import get_holdings, get_current_price, get_cash_balance
 from core.logger import LOG_FILE
-from core.short_term import ShortTermStrategy, is_target_set, target_to_settings
+from core.short_term import (
+    SHORT_TERM_CANDIDATE_COUNT,
+    ShortTermStrategy,
+    candidates_to_settings,
+    clear_pending,
+    has_pending,
+    request_switch,
+    target_to_settings,
+)
 from core.trader import is_market_open, plan_initial_buy, BUY_CANDIDATES_FILE, TRADE_HISTORY_FILE
 from core.strategy._activate import (
     primary_buy_strategy,
@@ -243,75 +251,208 @@ def render_holdings(market_open: bool, stop_loss_pct: float) -> None:
     )
 
 
-def _on_short_term_editor_change() -> None:
-    """단타 테이블 자동매매 체크박스 토글 시 settings 즉시 반영.
-
-    보유 종목 테이블과 동일 패턴 — returned df 대신 `session_state.short_term_editor.edited_rows` 를
-    콜백에서 직접 읽어 settings 에 저장. 단타 슬롯은 단일 행이므로 idx=0 만 처리.
-    """
-    state = st.session_state.get("short_term_editor") or {}
-    edits = state.get("edited_rows") or {}
-    if not edits:
-        return
-    edit = edits.get(0) or edits.get("0")
-    if not edit or "자동매매" not in edit:
-        return
+def _on_short_term_auto_change() -> None:
+    """단타 자동매매 토글 → settings 즉시 반영."""
     slot = load_settings().get("short_term_trade") or {}
     if not isinstance(slot, dict):
         slot = {}
-    new_slot = {**slot, "auto_enabled": bool(edit["자동매매"])}
-    set_setting("short_term_trade", new_slot)
+    set_setting(
+        "short_term_trade",
+        {**slot, "auto_enabled": bool(st.session_state.short_term_auto_toggle)},
+    )
+
+
+def _on_short_term_select_change() -> None:
+    """단타 매매 종목 콤보 선택 변경 → 활성 슬롯 갱신.
+
+    - 선택이 현재 활성 종목과 같으면: 예약된 교체가 있으면 취소.
+    - 활성 종목을 보유(매수 상태) 중이면: 즉시 갈아타지 않고 교체 예약(`request_switch`) —
+      트레이더가 이전 보유 전량 매도 후 전환.
+    - 미보유면: 활성 슬롯을 즉시 새 후보로 갱신 (예산 풀 이월).
+    """
+    chosen = st.session_state.get("short_term_select")
+    settings = load_settings()
+    slot = settings.get("short_term_trade") or {}
+    if not isinstance(slot, dict):
+        slot = {}
+    items = (settings.get("short_term_candidates") or {}).get("items") or []
+    active_code = slot.get("code")
+
+    if not chosen:
+        return
+    if chosen == active_code:
+        if has_pending(slot):
+            set_setting("short_term_trade", clear_pending(slot))
+        return
+
+    item = next((c for c in items if c.get("종목코드") == chosen), None)
+    if item is None:
+        return
+
+    try:
+        held = bool(active_code) and active_code in get_holdings()
+    except Exception:
+        held = False
+
+    if held:
+        set_setting("short_term_trade", request_switch(slot, item))
+    else:
+        set_setting(
+            "short_term_trade",
+            target_to_settings(
+                item,
+                auto_enabled=bool(slot.get("auto_enabled", False)),
+                last_realized_amount=slot.get("last_realized_amount"),
+            ),
+        )
 
 
 def render_short_term(market_open: bool) -> None:
-    """단기 매매 (단타) 단일 종목 테이블. 자동매매 ON 시 트레이더가 조건에 따라 매수/매도.
+    """단기 매매 (단타) — 상위 N종 후보 중 콤보 박스로 1종을 골라 자동매매.
 
-    종목 선정은 코스피200 근사 풀에서 N일 연속 상승 누적 상승률 최대 종목 1개를 일단위로 결정.
-    트레이더는 selected_at 의 날짜가 오늘이 아니면 자동 재선정하므로, 수동 버튼은 강제 재선정용.
+    후보 목록은 코스피200 근사 풀에서 등락률+거래량 ranking 결합 상위 N종을 일단위로 선정.
+    트레이더는 후보의 selected_at 날짜가 오늘이 아니면 자동 재선정하며, 수동 버튼은 강제 재선정용.
     """
     strategy = ShortTermStrategy()
 
     col_title, col_btn = st.columns([6, 1])
     col_title.subheader(f"🎯 단기 매매 (단타) — {strategy.display_name}")
-    if col_btn.button("🔄 종목 선정", key="refresh_short_term"):
+    if col_btn.button("🔄 후보 선정", key="refresh_short_term"):
         with st.spinner("등락률·거래량 ranking 조회 중... (API 3회, 즉시 완료)"):
-            target = strategy.find_target()
+            items = strategy.find_targets(n=SHORT_TERM_CANDIDATE_COUNT)
+        set_setting("short_term_candidates", candidates_to_settings(items))
+        # 활성 슬롯이 미보유면 #1 종목으로 갱신 (보유 중이면 유지 — 보호)
         slot = load_settings().get("short_term_trade") or {}
-        auto_enabled = bool(slot.get("auto_enabled", False)) if isinstance(slot, dict) else False
-        new_slot = target_to_settings(target, auto_enabled=auto_enabled)
-        set_setting("short_term_trade", new_slot)
-        if target is None:
-            st.warning("두 ranking 모두 등장한 종목이 시총 풀 안에 없습니다.")
+        if not isinstance(slot, dict):
+            slot = {}
+        active_code = slot.get("code")
+        try:
+            held = bool(active_code) and active_code in get_holdings()
+        except Exception:
+            held = False
+        if items and not held:
+            set_setting(
+                "short_term_trade",
+                target_to_settings(
+                    items[0],
+                    auto_enabled=bool(slot.get("auto_enabled", False)),
+                    last_realized_amount=slot.get("last_realized_amount"),
+                ),
+            )
+        if items:
+            st.success(f"단타 후보 {len(items)}종 선정 완료.")
         else:
-            st.success(f"단타 종목 선정: {target.get('종목명')} ({target.get('종목코드')}) — {target.get('선정사유', '')}")
+            st.warning("두 ranking 모두 등장한 종목이 시총 풀 안에 없습니다.")
         st.rerun()
 
-    from core.trader import Trader as _Trader
+    from core.trader import (
+        Trader as _Trader,
+        short_term_buy_delay_min,
+        short_term_buy_start_label,
+    )
     budget_max = _Trader.SHORT_TERM_BUDGET_MAX
+    buy_delay = short_term_buy_delay_min()
+    buy_start = short_term_buy_start_label()
     with st.expander("ℹ️ 단타 매매 동작 안내", expanded=False):
         st.markdown(
-            f"**등락률 순위 + 거래량 순위가 모두 상위**인 종목 1개를 자동 선정합니다 (rank 합산이 작을수록 우선).\n\n"
+            f"**등락률 순위 + 거래량 순위가 모두 상위**인 종목 최대 {SHORT_TERM_CANDIDATE_COUNT}종을 후보로 선정합니다 (rank 합산이 작을수록 우선).\n\n"
             f"- 풀: KOSPI200 시총 상위 {strategy.pool_top_n} 우선, 풀 안에 후보가 없으면 KOSPI200 전체에서 fallback.\n"
-            f"- 자동매매 체크 시 선정 종목을 시장가 매수하고 매수가 대비 **{strategy.stop_loss_pct}% 하락** 시 전량 매도.\n"
-            f"- 매도 즉시 다음 단타 종목을 실시간 재선정 (직전 매도 종목은 제외).\n"
+            f"- **콤보 박스로 후보 중 1종을 선택**하고 '자동매매'를 켜면 그 종목을 시장가 매수하고 매수가 대비 **{strategy.stop_loss_pct}% 하락** 시 전량 매도.\n"
+            f"- **개장 직후 변동성 회피**: 후보 선정은 9시부터 하되, 실제 매수는 "
+            f"**{buy_start} 이후**(개장 후 {buy_delay}분) 시작. 지연 시간은 사이드바에서 조절 가능.\n"
+            f"- 매도 즉시 다음 후보로 활성 종목을 자동 지정 (직전 매도 종목 제외).\n"
+            f"- 후보는 매일 자동 재선정되며, **보유 중인 종목은 유지**하고 미보유(빈) 슬롯만 새 후보 #1로 갱신.\n"
+            f"- 보유 중 콤보로 다른 종목을 고르면 **이전 보유를 전량 매도 후 전환**합니다.\n"
             f"- 매수 예산: **min(직전 매도 회수 금액, 상한 {budget_max:,.0f}원, 주문가능금액)** "
             f"— 이익은 상한으로 캡, 손실은 단타 자금 풀에서 흡수 (일반 자금 보충 X)."
         )
 
-    slot = load_settings().get("short_term_trade")
-    if not isinstance(slot, dict) or not is_target_set(slot):
-        st.info("선정된 단타 종목이 없습니다. 위의 '🔄 종목 선정' 버튼을 눌러 직접 선정하거나, 트레이더가 다음 주기에 자동 선정합니다.")
+    settings = load_settings()
+    slot = settings.get("short_term_trade") or {}
+    if not isinstance(slot, dict):
+        slot = {}
+    container = settings.get("short_term_candidates") or {}
+    items = container.get("items") or []
+
+    if not items:
+        st.info("단타 후보가 없습니다. 위의 '🔄 후보 선정' 버튼을 누르거나, 트레이더가 다음 주기에 자동 선정합니다.")
         return
 
-    code = slot["code"]
-    name = slot.get("name") or code
+    # ── 후보 테이블 (읽기 전용, 상위 N종) ──
+    cand_df = pd.DataFrame([
+        {
+            "순위": i,
+            "종목명": c.get("종목명", ""),
+            "종목코드": c.get("종목코드", ""),
+            "현재가": c.get("현재가", 0) or 0,
+            "등락률(%)": c.get("등락률(%)"),
+            "거래량": c.get("거래량", 0) or 0,
+            "선정사유": c.get("선정사유", ""),
+        }
+        for i, c in enumerate(items, start=1)
+    ])
+    st.dataframe(
+        cand_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "현재가": st.column_config.NumberColumn("현재가", format="%,d원"),
+            "등락률(%)": st.column_config.NumberColumn("등락률(%)", format="%+.2f%%"),
+            "거래량": st.column_config.NumberColumn("거래량", format="%,d"),
+        },
+    )
 
-    price, stale = fetch_price(code, market_open)
-    profit_pct: float | None = None
+    # ── 콤보 박스(매매 종목 선택) + 자동매매 토글 ──
+    active_code = slot.get("code")
+    options = [c.get("종목코드") for c in items if c.get("종목코드")]
+    label_map = {c.get("종목코드"): (c.get("종목명") or c.get("종목코드")) for c in items}
+    # 보유/활성 종목이 후보 목록 밖이어도 선택지에 포함 (보유 포지션 추적 유지)
+    if active_code and active_code not in options:
+        options = [active_code] + options
+        label_map.setdefault(active_code, slot.get("name") or active_code)
+
+    # session_state 선택값이 현재 옵션에 없으면 활성 종목(없으면 #1)으로 보정 (stale 값 에러 방지)
+    if st.session_state.get("short_term_select") not in options:
+        st.session_state.short_term_select = (
+            active_code if active_code in options else (options[0] if options else None)
+        )
+    # 자동매매 토글 1회 시드 — 이후엔 widget 이 상태 유지, on_change 가 영속화
+    if "short_term_auto_toggle" not in st.session_state:
+        st.session_state.short_term_auto_toggle = bool(slot.get("auto_enabled", False))
+
+    col_sel, col_auto = st.columns([3, 1])
+    with col_sel:
+        st.selectbox(
+            "매매 종목 선택",
+            options=options,
+            format_func=lambda c: f"{label_map.get(c, c)} ({c})",
+            key="short_term_select",
+            on_change=_on_short_term_select_change,
+            help="후보 중 실제 자동매매할 1종을 선택합니다. 보유 중 다른 종목으로 바꾸면 이전 보유를 전량 매도 후 전환합니다.",
+        )
+    with col_auto:
+        st.toggle(
+            "자동매매",
+            key="short_term_auto_toggle",
+            on_change=_on_short_term_auto_change,
+            help="켜면 선택 종목을 매수/매도 조건 충족 시 시장가로 자동 실행합니다.",
+        )
+
+    # 교체 예약 안내 (보유 중 콤보로 다른 종목을 골랐을 때)
+    _render_short_term_pending(slot)
+
+    # ── 활성 종목 상태 ──
+    if not active_code:
+        st.caption("선택된 매매 종목이 없습니다. 콤보 박스에서 후보를 선택하세요.")
+        return
+
+    name = slot.get("name") or active_code
+    price, stale = fetch_price(active_code, market_open)
     holding_qty = 0
     avg_price = None
+    profit_pct: float | None = None
     try:
-        held = get_holdings().get(code)
+        held = get_holdings().get(active_code)
         if held:
             holding_qty = held.get("qty", 0)
             avg_price = held.get("avg_price")
@@ -320,31 +461,16 @@ def render_short_term(market_open: bool) -> None:
     except Exception:
         pass
 
-    selected_at = slot.get("selected_at")
-    selected_display = ""
-    if selected_at:
-        try:
-            selected_display = datetime.fromisoformat(selected_at).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            selected_display = str(selected_at)
-
-    row = {
-        "자동매매": bool(slot.get("auto_enabled", False)),
-        "종목명": name,
-        "종목코드": code,
-        "현재가": price or 0,
-        "보유수량": holding_qty,
-        "평균단가": avg_price or 0,
-        "수익률(%)": round(profit_pct, 2) if profit_pct is not None else None,
-        "선정사유": slot.get("selection_reason") or "",
-        "선정시각": selected_display,
-    }
-    df = pd.DataFrame([row])
-
     if stale:
         st.caption("⚠️ 가격은 마지막 조회 시점 기준입니다.")
 
-    # 다음 진입 예산 표시 — 직전 매도 회수 금액이 있으면 그것이 상한, 없으면 BUDGET_MAX.
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("매매 종목", name)
+    m2.metric("현재가", f"{(price or 0):,.0f}원")
+    m3.metric("보유수량", f"{holding_qty:,}주")
+    m4.metric("수익률", f"{profit_pct:+.2f}%" if profit_pct is not None else "—")
+
+    # 다음 진입 예산 상한 — 직전 매도 회수 금액이 있으면 그것이 상한, 없으면 BUDGET_MAX.
     last_realized = slot.get("last_realized_amount")
     if isinstance(last_realized, (int, float)) and last_realized > 0:
         next_budget_cap = min(float(last_realized), float(budget_max))
@@ -355,26 +481,25 @@ def render_short_term(market_open: bool) -> None:
     else:
         st.caption(f"💰 다음 진입 예산 상한: **{budget_max:,.0f}원** (첫 진입 또는 매도 이력 없음)")
 
-    locked_cols = [c for c in df.columns if c != "자동매매"]
-    st.data_editor(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        key="short_term_editor",
-        on_change=_on_short_term_editor_change,
-        disabled=locked_cols,
-        column_config={
-            "자동매매": st.column_config.CheckboxColumn(
-                "자동매매",
-                help="체크 시 매수/매도 조건 충족 때 시장가로 자동 실행됩니다.",
-                default=False,
-            ),
-            "현재가": st.column_config.NumberColumn("현재가", format="%,d원"),
-            "평균단가": st.column_config.NumberColumn("평균단가", format="%,d원"),
-            "보유수량": st.column_config.NumberColumn("보유수량", format="%,d주"),
-            "수익률(%)": st.column_config.NumberColumn("수익률(%)", format="%+.2f%%"),
-        },
+
+def _render_short_term_pending(slot: dict) -> None:
+    """교체 예약(pending) 안내 — 보유 중 콤보로 다른 종목을 골랐을 때.
+
+    트레이더가 다음 주기에 이전 보유를 전량 매도한 뒤 예약 종목으로 전환한다.
+    """
+    if not (has_pending(slot) and slot.get("pending_action") == "switch"):
+        return
+    pending = slot["pending_target"]
+    p_name = pending.get("종목명") or pending.get("종목코드")
+    p_code = pending.get("종목코드")
+    st.warning(
+        f"🔁 **교체 예약됨** → {p_name} ({p_code}). "
+        "다음 트레이더 주기에 이전 보유 종목을 전량 매도하고 전환합니다 "
+        "(장 시간 외라면 개장 후 진행)."
     )
+    if st.button("교체 취소 (이전 종목 유지)", key="st_cancel_switch"):
+        set_setting("short_term_trade", clear_pending(slot))
+        st.rerun()
 
 
 def refresh_buy_candidates() -> list[dict]:
@@ -758,12 +883,21 @@ def _init_sidebar_state(settings: dict) -> None:
     if max_holdings_val < 1:
         max_holdings_val = 1
 
+    raw_delay = settings.get("short_term_buy_delay_min", 10)
+    try:
+        buy_delay_val = int(raw_delay)
+    except (TypeError, ValueError):
+        buy_delay_val = 10
+    if buy_delay_val < 0:
+        buy_delay_val = 0
+
     st.session_state.buy_enabled_toggle = bool(settings.get("buy_enabled", False))
     st.session_state.primary_buy_select = primary_key
     st.session_state.view_buy_multiselect = view_keys
     st.session_state.sell_strategy_select = sell_key
     st.session_state.stop_loss_input = float(settings.get("stop_loss_pct", 10.0))
     st.session_state.max_holdings_input = max_holdings_val
+    st.session_state.short_term_buy_delay_input = buy_delay_val
     st.session_state.auto_refresh_toggle = bool(settings.get("auto_refresh", True))
     st.session_state.refresh_interval_slider = int(settings.get("refresh_interval", 60))
     st.session_state._sidebar_initialized = True
@@ -798,6 +932,10 @@ def _on_stop_loss_change() -> None:
 
 def _on_max_holdings_change() -> None:
     set_setting("max_holdings", int(st.session_state.max_holdings_input))
+
+
+def _on_short_term_buy_delay_change() -> None:
+    set_setting("short_term_buy_delay_min", int(st.session_state.short_term_buy_delay_input))
 
 
 def _on_auto_refresh_change() -> None:
@@ -893,6 +1031,17 @@ def render_sidebar() -> tuple[bool, int, str, str, float]:
             )
         else:
             st.caption("ℹ️ 보유 종목 테이블의 '최고가/하락률' 컬럼은 참고용으로만 표시됩니다.")
+
+        st.divider()
+        st.subheader("🎯 단기 매매 (단타)")
+        st.number_input(
+            "개장 후 매수 지연 (분)",
+            min_value=0, max_value=60,
+            step=1,
+            key="short_term_buy_delay_input",
+            on_change=_on_short_term_buy_delay_change,
+            help="개장(09:00) 후 이 시간이 지나야 단타 실매수를 시작합니다. 종목 탐색·선정은 9시부터 진행. 0=개장 즉시 매수.",
+        )
 
         st.divider()
         st.toggle("자동 새로고침", key="auto_refresh_toggle", on_change=_on_auto_refresh_change)

@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from config import CHECK_INTERVAL
 from core.kis_api import (
@@ -14,9 +14,11 @@ from core.kis_api import (
 from core.logger import log
 from core.settings import get as get_setting, set_value as set_setting
 from core.short_term import (
+    SHORT_TERM_CANDIDATE_COUNT,
     ShortTermStrategy,
-    is_target_set,
-    needs_reselection,
+    candidates_need_refresh,
+    candidates_to_settings,
+    has_pending,
     target_to_settings,
 )
 from core.strategy.base import BuyStrategy, SellStrategy
@@ -116,6 +118,45 @@ def is_market_open() -> bool:
         return False
     t = now.time()
     return datetime.strptime("09:00", "%H:%M").time() <= t <= datetime.strptime("15:30", "%H:%M").time()
+
+
+# 단타 실매수 지연 (분) 기본값 — 개장(09:00) 후 이 시간이 지나야 실제 시장가 매수를 시작한다.
+# 종목 탐색/선정은 9시부터 수행하되 매수만 미룬다. 실제 적용값은 settings.json 에서 조절 가능.
+SHORT_TERM_BUY_DELAY_MIN = 10
+
+
+def short_term_buy_delay_min() -> int:
+    """settings.json 의 `short_term_buy_delay_min` 을 정수(분)로 안전하게 반환.
+
+    잘못된 타입/음수는 기본값 `SHORT_TERM_BUY_DELAY_MIN` 으로 fallback. 0 이면 개장 즉시 매수 허용.
+    """
+    raw = get_setting("short_term_buy_delay_min")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return SHORT_TERM_BUY_DELAY_MIN
+    return value if value >= 0 else SHORT_TERM_BUY_DELAY_MIN
+
+
+def short_term_buy_start_label(now: datetime | None = None) -> str:
+    """단타 실매수 시작 시각 라벨 (예: '09:10') — 개장(09:00) + 설정 지연."""
+    now = now or datetime.now()
+    start = now.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(
+        minutes=short_term_buy_delay_min()
+    )
+    return start.strftime("%H:%M")
+
+
+def short_term_buy_window_open(now: datetime | None = None) -> bool:
+    """단타 실매수 허용 시간 여부 — 개장(09:00) 후 설정 지연(분) 경과 시 True.
+
+    개장 직후에는 등락률·거래량 ranking 이 출렁여 '진짜 오르는 종목' 판별이 어렵다.
+    따라서 종목 탐색·선정은 9시부터 진행하되, 실제 매수는 지연 시간 이후로 미뤄
+    시초가 변동성에 휩쓸려 잘못된 종목을 잡는 것을 줄인다. 지연은 사이드바에서 조절 가능.
+    """
+    now = now or datetime.now()
+    open_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    return now >= open_time + timedelta(minutes=short_term_buy_delay_min())
 
 
 class Trader:
@@ -345,16 +386,19 @@ class Trader:
     SHORT_TERM_BUDGET_MAX = 3_000_000
 
     def check_short_term(self) -> None:
-        """단기 매매 (단타) 대상 종목에 대해 매수/매도 조건 점검 + 매도 후 실시간 재선정.
+        """단기 매매 (단타) — 후보 목록 일단위 갱신 + 활성 종목 매수/매도/교체 처리.
 
         흐름:
-          1. 슬롯이 비었거나 selected_at 날짜 ≠ 오늘 → `find_target()` 으로 일단위 재선정.
-             `last_realized_amount` 는 보존 (단타 자금 풀이 일반 자금으로 손실 보충 받지 않도록).
+          0. 후보 목록 일단위 재선정 (selected_at 날짜 ≠ 오늘 또는 비어있음):
+             `find_targets()` 으로 상위 N종 후보를 새로 뽑아 저장. 활성 종목을 **보유 중**이면
+             유지(보호), **미보유**면 새 후보 #1 종목을 활성으로 자동 지정 (빈 슬롯만 갱신).
+          1. `pending_action == "switch"` (콤보로 보유 중 다른 종목 선택) → 이전 보유 전량 매도 후
+             대기 후보(pending_target)로 전환.
           2. auto_enabled OFF 이면 종료.
-          3. 보유 중 + should_sell True → 전량 시장가 매도 →
+          3. 활성 종목 보유 중 + should_sell True → 전량 시장가 매도 →
              회수 금액(`체결가 × 수량`)을 `last_realized_amount` 로 기록 →
-             **즉시 `find_target(exclude_codes={매도종목})` 으로 재선정** (같은 종목 재진입 방지).
-          4. 미보유 + should_buy True → 매수.
+             **즉시 `find_target(exclude_codes={매도종목})` 으로 다음 활성 종목 자동 지정**.
+          4. 미보유 + should_buy True → 매수 (개장 후 지연 시간 경과 후).
              예산 = min(직전 `last_realized_amount` (없으면 `SHORT_TERM_BUDGET_MAX`),
                        `SHORT_TERM_BUDGET_MAX`, 주문가능금액).
 
@@ -365,31 +409,29 @@ class Trader:
         if not isinstance(slot, dict):
             return
 
+        try:
+            holdings = get_holdings()
+        except Exception as e:
+            log(f"[단타] 보유 종목 조회 실패: {e}")
+            return
+
+        # 0. 후보 목록 일단위 갱신 + 활성 슬롯 처리 (보유 유지 / 미보유 갱신)
+        slot = self._short_term_refresh_candidates(slot, holdings)
+
         auto_enabled = bool(slot.get("auto_enabled", False))
         last_realized = slot.get("last_realized_amount")
 
-        if needs_reselection(slot):
-            log("[단타] 일단위 재선정 트리거 (슬롯 비어있거나 다른 날짜)")
-            target = self.short_term_strategy.find_target()
-            new_slot = target_to_settings(
-                target,
-                auto_enabled=auto_enabled,
-                last_realized_amount=last_realized,
-            )
-            set_setting("short_term_trade", new_slot)
-            if target is None:
-                log("[단타] 조건 통과 종목 없음 - 다음 사이클 재시도")
-                return
-            log(
-                f"[단타] 종목 선정 완료: {new_slot['name']}({new_slot['code']}) - "
-                f"{new_slot.get('selection_reason', '')}"
-            )
-            slot = new_slot
+        # 1. 사용자 '교체' 예약 처리 — 이전 보유 전량 매도 후 대기 후보로 전환
+        if slot.get("pending_action") == "switch" and has_pending(slot):
+            self._short_term_switch(slot, holdings, auto_enabled)
+            return
 
         if not auto_enabled:
             return
 
-        code = slot["code"]
+        code = slot.get("code")
+        if not code:
+            return
         name = slot.get("name") or code
 
         try:
@@ -398,7 +440,6 @@ class Trader:
             log(f"[단타][{name}({code})] 가격 조회 실패: {e}")
             return
 
-        holdings = get_holdings()
         held = holdings.get(code)
 
         if held:
@@ -443,6 +484,14 @@ class Trader:
         if not should_buy:
             return
 
+        # 개장 직후 변동성 회피 — 지연 시간 이전에는 선정만 유지하고 실매수는 보류.
+        if not short_term_buy_window_open():
+            log(
+                f"[단타][{name}({code})] 개장 후 {short_term_buy_delay_min()}분 대기 — "
+                f"실매수 보류 ({short_term_buy_start_label()} 이후 매수 시작)"
+            )
+            return
+
         try:
             cash = get_cash_balance()["주문가능금액"]
         except Exception as e:
@@ -479,6 +528,98 @@ class Trader:
             self.log_trade("buy", code, name, current_price, qty, reason=f"[단타] {reason}")
         except Exception as e:
             log(f"[단타][{name}({code})] 매수 실패: {e}")
+
+    def _short_term_refresh_candidates(self, slot: dict, holdings: dict) -> dict:
+        """단타 후보 목록 일단위 갱신 + 활성 슬롯 처리.
+
+        후보 목록(`short_term_candidates`)의 selected_at 날짜가 오늘과 다르면(또는 비어있으면)
+        `find_targets()` 으로 상위 N종을 새로 뽑아 저장한다.
+
+        활성 슬롯은 사용자 결정(콤보 선택)대로:
+          - 활성 종목 **보유 중** → 유지 (보호 — 새 후보가 와도 갈아타지 않음).
+          - **미보유**(빈 슬롯/매도됨) → 새 후보 #1 종목을 활성으로 자동 지정.
+
+        Returns:
+            이후 로직에서 사용할 (갱신됐을 수 있는) 활성 슬롯 dict.
+        """
+        container = get_setting("short_term_candidates")
+        if not candidates_need_refresh(container):
+            return slot
+
+        items = self.short_term_strategy.find_targets(n=SHORT_TERM_CANDIDATE_COUNT)
+        set_setting("short_term_candidates", candidates_to_settings(items))
+        if not items:
+            log("[단타] 후보 재선정 — 조건 통과 종목 없음 (다음 주기 재시도)")
+            return slot
+
+        names = ", ".join(f"{c['종목명']}({c['종목코드']})" for c in items)
+        log(f"[단타] 후보 {len(items)}종 재선정: {names}")
+
+        active_code = slot.get("code")
+        held_active = bool(active_code) and active_code in holdings
+        if held_active:
+            log(f"[단타] 활성 종목 {active_code} 보유 중 — 유지 (후보 목록만 갱신)")
+            return slot
+
+        # 미보유 — 새 후보 #1 을 활성으로 자동 지정 (예산 풀은 이월)
+        new_slot = target_to_settings(
+            items[0],
+            auto_enabled=bool(slot.get("auto_enabled", False)),
+            last_realized_amount=slot.get("last_realized_amount"),
+        )
+        set_setting("short_term_trade", new_slot)
+        log(
+            f"[단타] 활성 종목 자동 지정(미보유 슬롯): "
+            f"{new_slot['name']}({new_slot['code']}) - {new_slot.get('selection_reason', '')}"
+        )
+        return new_slot
+
+    def _short_term_switch(self, slot: dict, holdings: dict, auto_enabled: bool) -> None:
+        """사용자 '교체' 선택 처리 — 이전 보유 종목 전량 매도 후 대기 후보로 전환.
+
+        이전 종목을 보유 중이면 시장가로 전량 매도하고 회수 금액을 다음 매수 예산 상한으로
+        이월한다. 장 시간 외에는 매도가 불가능하므로 다음 개장 후 사이클에서 재시도한다
+        (`pending_action` 유지). 매도가 필요 없으면(미보유) 즉시 전환한다.
+        """
+        pending = slot.get("pending_target")
+        active_code = slot.get("code")
+        active_name = slot.get("name") or active_code
+        realized = slot.get("last_realized_amount")  # 매도 없으면 직전 값 이월
+
+        held = holdings.get(active_code) if active_code else None
+        if held:
+            if not is_market_open():
+                log("[단타] 교체 예약됨 — 장 시간 외, 개장 후 이전 보유 매도 진행")
+                return
+            qty = held["qty"]
+            try:
+                price = get_current_price(active_code)
+            except Exception as e:
+                log(f"[단타] 교체용 가격 조회 실패 ({active_name}): {e}")
+                return
+            log(f"[단타] 교체 — 이전 보유 {active_name}({active_code}) {qty}주 전량 시장가 매도")
+            try:
+                sell_market_order(active_code, qty)
+                self.log_trade(
+                    "sell", active_code, active_name, price, qty,
+                    reason="[단타] 사용자 교체 — 이전 종목 전량 매도",
+                )
+                realized = float(price) * int(qty)
+                log(f"[단타] 교체 매도 회수 ≈ {realized:,.0f}원 → 새 종목 매수 예산 상한으로 이월")
+            except Exception as e:
+                log(f"[단타] 교체 매도 실패 ({active_name}): {e}")
+                return
+
+        new_slot = target_to_settings(
+            pending,
+            auto_enabled=auto_enabled,
+            last_realized_amount=realized,
+        )
+        set_setting("short_term_trade", new_slot)
+        log(
+            f"[단타] 교체 완료 → 새 종목: {new_slot['name']}({new_slot['code']}) - "
+            f"{new_slot.get('selection_reason', '')}"
+        )
 
     # ── 매도 체크 ──────────────────────────────────────────────────────────────
 
