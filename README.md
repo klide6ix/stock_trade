@@ -180,11 +180,23 @@ stock_trader/
 
 ### 3. `.env` 파일 설정
 
+실전·모의투자 키를 **분리**해서 넣습니다. `config.py` 의 `IS_MOCK` 값에 따라 알맞은 키 세트가 자동 선택되므로, 한 번 넣어두면 전환 시 키를 바꿔치기할 필요가 없습니다.
+
 ```
-APP_KEY=발급받은_앱키
-APP_SECRET=발급받은_앱시크릿
-ACCOUNT_NO=계좌번호  # 예: 12345678-01
+# 실전투자 (IS_MOCK=False 일 때 사용)
+APP_KEY=실전_앱키
+APP_SECRET=실전_앱시크릿
+ACCOUNT_NO=실전_계좌번호       # 예: 12345678-01
+
+# 모의투자 (IS_MOCK=True 일 때 사용 — 한국투자증권이 모의투자용으로 별도 발급)
+MOCK_APP_KEY=모의_앱키
+MOCK_APP_SECRET=모의_앱시크릿
+MOCK_ACCOUNT_NO=모의_계좌번호
 ```
+
+> 모의투자는 **실전과 다른 별도 APP Key/Secret/계좌번호**가 필요합니다 (실전 키로 모의 서버 접속 불가).
+> `MOCK_*` 가 없으면 단일 키(`APP_KEY` …)로 fallback 하지만, 모의 서버에는 모의 키만 인증되므로 권장하지 않습니다.
+> **실전 모드는 절대 `MOCK_*` 를 읽지 않으므로**, 모의 키가 실거래에 새어 들어갈 위험은 없습니다.
 
 ---
 
@@ -248,7 +260,7 @@ chmod +x start.sh stop.sh
 
 ## 테스트 → 실전 전환
 
-[config.py](config.py) 에서 한 줄만 변경:
+[config.py](config.py) 에서 한 줄만 변경 후 재시작(`./stop.sh && ./start.sh`):
 
 ```python
 # 모의투자
@@ -257,6 +269,14 @@ IS_MOCK = True
 # 실전투자로 전환 시
 IS_MOCK = False
 ```
+
+전환 시 자동으로 처리되는 것:
+- KIS API 서버 (모의 `openapivts:29443` ↔ 실전 `openapi:9443`) 및 거래 tr_id (`VT...` ↔ `TT...`)
+- 인증 키 세트 (`MOCK_APP_KEY ...` ↔ `APP_KEY ...`)
+- 토큰 캐시 파일 (`data/.kis_token_mock.json` ↔ `.kis_token_real.json` — 서로 안 섞임)
+
+**현재 모드 확인**: 대시보드 상단에 `🟢 모의투자(MOCK)` / `🔴 실전투자(LIVE)` 배지가 상시 표시되고,
+브라우저 탭 제목(`트레이더 [모의]`/`[실전]`)과 `logs/trader.log` 시작 로그(`트레이더 시작 [모의투자]`)에도 찍힙니다.
 
 > 반드시 모의투자로 먼저 테스트 후 실전 전환할 것
 

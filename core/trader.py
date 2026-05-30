@@ -3,7 +3,7 @@ import os
 import time
 from datetime import datetime, timedelta
 
-from config import CHECK_INTERVAL
+from config import CHECK_INTERVAL, MODE_LABEL
 from core.kis_api import (
     get_holdings,
     get_current_price,
@@ -684,7 +684,7 @@ class Trader:
     # ── 메인 루프 ──────────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        log(f"트레이더 시작 | 매수전략: {type(self.buy_strategy).__name__} | 매도전략: {type(self.sell_strategy).__name__} | 확인 주기: {CHECK_INTERVAL // 60}분")
+        log(f"트레이더 시작 [{MODE_LABEL}] | 매수전략: {type(self.buy_strategy).__name__} | 매도전략: {type(self.sell_strategy).__name__} | 확인 주기: {CHECK_INTERVAL // 60}분")
 
         self.sell_strategy.load()
 

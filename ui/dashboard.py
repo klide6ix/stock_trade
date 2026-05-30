@@ -5,7 +5,7 @@ import streamlit as st
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 
-from config import CHECK_INTERVAL
+from config import CHECK_INTERVAL, IS_MOCK, MODE_LABEL
 from core.kis_api import get_holdings, get_current_price, get_cash_balance
 from core.logger import LOG_FILE
 from core.short_term import (
@@ -33,7 +33,11 @@ from core.trader import _tag_candidates
 from core.strategy.sell import PEAK_PRICES_FILE
 from core.settings import load_settings, set_value as set_setting
 
-st.set_page_config(page_title="트레이더", page_icon="📈", layout="wide")
+st.set_page_config(
+    page_title=f"트레이더 [{'모의' if IS_MOCK else '실전'}]",
+    page_icon="📈",
+    layout="wide",
+)
 
 # ── 세션 상태 초기화 ───────────────────────────────────────────────────────────
 if "peak_prices" not in st.session_state:
@@ -149,6 +153,11 @@ def render_cash_balance() -> None:
 
 def render_header(market_open: bool, buy_strategy_label: str, sell_strategy_label: str) -> None:
     st.title("📈 트레이더 대시보드")
+    # 모드 배지 — 실전은 오발주 방지를 위해 눈에 띄게(에러색) 상시 표시, 모의는 안내색.
+    if IS_MOCK:
+        st.success("🟢 **모의투자(MOCK)** — 가상 계좌입니다. 실제 주문·체결이 일어나지 않습니다.")
+    else:
+        st.error("🔴 **실전투자(LIVE)** — 실제 계좌·실제 자금으로 주문이 체결됩니다.")
     render_cash_balance()
     st.divider()
     if not market_open:
