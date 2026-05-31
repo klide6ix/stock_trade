@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import requests
 from datetime import datetime, timedelta
 from config import APP_KEY, APP_SECRET, ACCOUNT_NO, BASE_URL, IS_MOCK
@@ -93,6 +94,87 @@ def _headers(tr_id):
     }
 
 
+# KIS REST 호출 공용 설정.
+_MAX_ATTEMPTS = 3       # 최초 1회 + 재시도 2회
+_RETRY_BACKOFF = 1.0    # 재시도 간 대기 기준(초). attempt 회차에 비례해 증가.
+_REQUEST_TIMEOUT = 10   # 응답 대기 한도(초). 무한 대기 방지.
+
+
+class KisApiError(RuntimeError):
+    """KIS API 호출 실패. 서버가 반환한 status·msg_cd·msg1 본문을 메시지에 포함한다."""
+
+
+def _request(method: str, url: str, tr_id: str, *, params=None, json_body=None) -> dict:
+    """KIS REST 호출 공용 헬퍼. 파싱된 JSON(dict)을 반환한다.
+
+    설계 의도:
+      - 일시적 5xx / 네트워크 오류는 지수 backoff 로 최대 _MAX_ATTEMPTS 회 재시도한다.
+        KIS 모의투자 서버는 실전보다 불안정해 잔고·주문 API 에서 간헐적으로
+        500 Internal Server Error 를 반환하므로, 재시도가 사실상 필수다.
+      - 4xx 등 비일시적 오류나 재시도 소진 시에는, KIS 가 응답 본문에 담아 보내는
+        msg_cd/msg1 을 폐기하지 않고 로그·예외 메시지에 그대로 노출한다.
+        (requests 의 raise_for_status() 는 URL 만 보여주고 본문을 버려 원인 파악이 어렵다.)
+      - **HTTP 200 이어도 본문 rt_cd != "0" 이면 논리적 실패**다 (예: 주문 거부
+        "모의투자 영업일이 아닙니다", 초당 거래건수 초과 등). HTTP 상태만 보면 거부된
+        주문이 '성공' 으로 처리돼 거래 이력에 유령 체결이 기록되므로, rt_cd 도 검증한다.
+        초당 거래건수 초과(EGW00201)는 일시적 제한이라 backoff 후 재시도한다.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            res = requests.request(
+                method, url,
+                headers=_headers(tr_id),
+                params=params,
+                json=json_body,
+                timeout=_REQUEST_TIMEOUT,
+            )
+        except requests.RequestException as e:
+            # 연결 끊김·타임아웃 등 네트워크 계층 오류 — 일시적일 수 있어 재시도.
+            last_exc = e
+            if attempt < _MAX_ATTEMPTS:
+                wait = _RETRY_BACKOFF * attempt
+                log(f"[API] 네트워크 오류 ({tr_id}), {wait:.0f}s 후 재시도 {attempt}/{_MAX_ATTEMPTS - 1}: {e}")
+                time.sleep(wait)
+                continue
+            raise KisApiError(f"[API] 네트워크 오류 ({tr_id}) {url}: {e}") from e
+
+        # 5xx 는 서버 측 일시 장애로 보고 재시도. (마지막 회차면 아래 오류 처리로 진행)
+        if res.status_code >= 500 and attempt < _MAX_ATTEMPTS:
+            wait = _RETRY_BACKOFF * attempt
+            log(f"[API] {res.status_code} 서버 오류 ({tr_id}), {wait:.0f}s 후 재시도 {attempt}/{_MAX_ATTEMPTS - 1}")
+            time.sleep(wait)
+            continue
+
+        if not res.ok:
+            body = res.text[:500]
+            msg = f"[API] {res.status_code} 응답 ({tr_id}) {url}\n응답본문: {body}"
+            log(msg)
+            raise KisApiError(msg)
+
+        data = res.json()
+
+        # HTTP 200 이어도 rt_cd != "0" 이면 논리적 실패 — KIS 는 거부도 200 으로 보낸다.
+        rt_cd = data.get("rt_cd")
+        if rt_cd is not None and rt_cd != "0":
+            msg_cd = data.get("msg_cd", "")
+            msg1 = (data.get("msg1") or "").strip()
+            # 초당 거래건수 초과(EGW00201)는 일시적 제한 — backoff 후 재시도.
+            if msg_cd == "EGW00201" and attempt < _MAX_ATTEMPTS:
+                wait = _RETRY_BACKOFF * attempt
+                log(f"[API] 호출 한도 초과 ({tr_id}) {msg1} — {wait:.0f}s 후 재시도 {attempt}/{_MAX_ATTEMPTS - 1}")
+                time.sleep(wait)
+                continue
+            msg = f"[API] 거래 실패 ({tr_id}) rt_cd={rt_cd} msg_cd={msg_cd}: {msg1}"
+            log(msg)
+            raise KisApiError(msg)
+
+        return data
+
+    # 루프는 위에서 모두 return/raise 로 빠져나가므로 정상적으로는 도달하지 않는다(방어용).
+    raise KisApiError(f"[API] 재시도 모두 실패 ({tr_id}) {url}") from last_exc
+
+
 def _inquire_balance():
     """잔고조회 API 호출. (output1, output2) 원본 반환"""
     url = f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
@@ -112,9 +194,7 @@ def _inquire_balance():
         "CTX_AREA_NK100": "",
     }
 
-    res = requests.get(url, headers=_headers(tr_id), params=params)
-    res.raise_for_status()
-    data = res.json()
+    data = _request("GET", url, tr_id, params=params)
     return data.get("output1", []), data.get("output2", [{}])
 
 
@@ -155,9 +235,7 @@ def get_current_price(stock_code):
         "FID_COND_MRKT_DIV_CODE": "J",
         "FID_INPUT_ISCD": stock_code,
     }
-    res = requests.get(url, headers=_headers("FHKST01010100"), params=params)
-    res.raise_for_status()
-    data = res.json()
+    data = _request("GET", url, "FHKST01010100", params=params)
     return float(data["output"]["stck_prpr"])
 
 
@@ -168,9 +246,7 @@ def get_per_eps(stock_code: str) -> dict:
         "FID_COND_MRKT_DIV_CODE": "J",
         "FID_INPUT_ISCD": stock_code,
     }
-    res = requests.get(url, headers=_headers("FHKST01010100"), params=params)
-    res.raise_for_status()
-    output = res.json().get("output", {})
+    output = _request("GET", url, "FHKST01010100", params=params).get("output", {})
     return {
         "per": float(output.get("per", 0)),
         "eps": float(output.get("eps", 0)),
@@ -184,9 +260,7 @@ def get_quote_snapshot(stock_code: str) -> dict:
         "FID_COND_MRKT_DIV_CODE": "J",
         "FID_INPUT_ISCD": stock_code,
     }
-    res = requests.get(url, headers=_headers("FHKST01010100"), params=params)
-    res.raise_for_status()
-    output = res.json().get("output", {})
+    output = _request("GET", url, "FHKST01010100", params=params).get("output", {})
     return {
         "현재가": float(output.get("stck_prpr", 0)),
         "52주최고": float(output.get("w52_hgpr", 0)),
@@ -215,9 +289,7 @@ def get_daily_ohlcv(stock_code: str, days: int = 60) -> list[dict]:
         "FID_PERIOD_DIV_CODE": "D",
         "FID_ORG_ADJ_PRC": "0",
     }
-    res = requests.get(url, headers=_headers("FHKST03010100"), params=params)
-    res.raise_for_status()
-    output = res.json().get("output2", [])
+    output = _request("GET", url, "FHKST03010100", params=params).get("output2", [])
 
     bars: list[dict] = []
     for bar in output:
@@ -252,9 +324,7 @@ def get_weekly_price_change(stock_code: str) -> float | None:
         "FID_PERIOD_DIV_CODE": "D",
         "FID_ORG_ADJ_PRC": "0",
     }
-    res = requests.get(url, headers=_headers("FHKST03010100"), params=params)
-    res.raise_for_status()
-    output = res.json().get("output2", [])
+    output = _request("GET", url, "FHKST03010100", params=params).get("output2", [])
 
     if len(output) < 2:
         return None
@@ -299,11 +369,10 @@ def get_market_cap_rank(top_n: int = 100, market: str = "all") -> list[dict]:
         "FID_VOL_CNT": "",
         "FID_INPUT_DATE_1": "",
     }
-    res = requests.get(url, headers=_headers("FHPST01740000"), params=params)
-    res.raise_for_status()
+    data = _request("GET", url, "FHPST01740000", params=params)
 
     result = []
-    for item in res.json().get("output", [])[:top_n]:
+    for item in data.get("output", [])[:top_n]:
         result.append({
             "종목코드": item.get("mksc_shrn_iscd", ""),
             "종목명": item.get("hts_kor_isnm", ""),
@@ -338,11 +407,10 @@ def get_volume_rank(top_n: int = 30, market: str = "all") -> list[dict]:
         "FID_VOL_CNT": "",
         "FID_INPUT_DATE_1": "",
     }
-    res = requests.get(url, headers=_headers("FHPST01710000"), params=params)
-    res.raise_for_status()
+    data = _request("GET", url, "FHPST01710000", params=params)
 
     result = []
-    for idx, item in enumerate(res.json().get("output", [])[:top_n], start=1):
+    for idx, item in enumerate(data.get("output", [])[:top_n], start=1):
         result.append({
             "순위": int(item.get("data_rank", idx) or idx),
             "종목코드": item.get("mksc_shrn_iscd", ""),
@@ -377,11 +445,10 @@ def get_fluctuation_rank(top_n: int = 30, market: str = "all") -> list[dict]:
         "FID_RSFL_RATE1": "",
         "FID_RSFL_RATE2": "",
     }
-    res = requests.get(url, headers=_headers("FHPST01700000"), params=params)
-    res.raise_for_status()
+    data = _request("GET", url, "FHPST01700000", params=params)
 
     result = []
-    for item in res.json().get("output", [])[:top_n]:
+    for item in data.get("output", [])[:top_n]:
         code = item.get("stck_shrn_iscd") or item.get("mksc_shrn_iscd", "")
         result.append({
             "종목코드": code,
@@ -406,9 +473,7 @@ def sell_market_order(stock_code, qty):
         "ORD_UNPR": "0",    # 시장가는 0
     }
 
-    res = requests.post(url, headers=_headers(tr_id), json=body)
-    res.raise_for_status()
-    return res.json()
+    return _request("POST", url, tr_id, json_body=body)
 
 
 def buy_market_order(stock_code, qty):
@@ -425,6 +490,4 @@ def buy_market_order(stock_code, qty):
         "ORD_UNPR": "0",    # 시장가는 0
     }
 
-    res = requests.post(url, headers=_headers(tr_id), json=body)
-    res.raise_for_status()
-    return res.json()
+    return _request("POST", url, tr_id, json_body=body)

@@ -3,7 +3,7 @@ import os
 import time
 from datetime import datetime, timedelta
 
-from config import CHECK_INTERVAL, MODE_LABEL
+from config import CHECK_INTERVAL, MODE_LABEL, IS_MOCK
 from core.kis_api import (
     get_holdings,
     get_current_price,
@@ -112,12 +112,27 @@ def plan_initial_buy(
 
 
 def is_market_open() -> bool:
-    """장 운영 시간 체크 (평일 09:00 ~ 15:30)"""
+    """실제 장 운영 시간 체크 (평일 09:00 ~ 15:30). 모드와 무관한 '실제 시장' 상태."""
     now = datetime.now()
     if now.weekday() >= 5:
         return False
     t = now.time()
     return datetime.strptime("09:00", "%H:%M").time() <= t <= datetime.strptime("15:30", "%H:%M").time()
+
+
+def is_trading_time() -> bool:
+    """매매(매수·매도·교체)를 진행해도 되는 시간인지 판정 — 매매 게이트 전용.
+
+    - 실전(IS_MOCK=False): 정규장(평일 09:00~15:30)에만 True. 시간외 오발주를 막는다.
+    - 모의(IS_MOCK=True): 장 시간과 무관하게 항상 True. 주말·시간외에도 매매 흐름을
+      자유롭게 시험할 수 있게 한다.
+
+    주의: 이 게이트는 '클라이언트가 매매 로직을 실행할지' 의 문제일 뿐, 체결 보장과는
+    별개다. KIS 모의투자 서버는 정규장 시간에만 체결하므로 시간외 시장가 주문은
+    서버에서 거부될 수 있다(주문 응답 msg1 로 확인 가능). 실제 시장 상태가 필요한
+    화면 표시에는 is_market_open() 을 쓴다.
+    """
+    return IS_MOCK or is_market_open()
 
 
 # 단타 실매수 지연 (분) 기본값 — 개장(09:00) 후 이 시간이 지나야 실제 시장가 매수를 시작한다.
@@ -588,7 +603,7 @@ class Trader:
 
         held = holdings.get(active_code) if active_code else None
         if held:
-            if not is_market_open():
+            if not is_trading_time():
                 log("[단타] 교체 예약됨 — 장 시간 외, 개장 후 이전 보유 매도 진행")
                 return
             qty = held["qty"]
@@ -685,6 +700,8 @@ class Trader:
 
     def run(self) -> None:
         log(f"트레이더 시작 [{MODE_LABEL}] | 매수전략: {type(self.buy_strategy).__name__} | 매도전략: {type(self.sell_strategy).__name__} | 확인 주기: {CHECK_INTERVAL // 60}분")
+        if IS_MOCK and not is_market_open():
+            log("[모의] 상시거래 모드 — 장 시간 외에도 매매 로직 동작 (KIS 모의서버는 정규장에만 체결될 수 있음)")
 
         self.sell_strategy.load()
 
@@ -701,16 +718,16 @@ class Trader:
             log(f"[초기화] 보유 종목 조회 실패: {e}")
 
         candidates = self.scan_buy_candidates()
-        if is_market_open():
+        if is_trading_time():
             self.execute_initial_buy(candidates)
         else:
             log("[초기매수] 장 운영 시간 외 - 다음 개장 후 실행")
 
-        did_initial_buy = is_market_open()
+        did_initial_buy = is_trading_time()
 
         while True:
             self._sync_sell_settings()
-            if is_market_open():
+            if is_trading_time():
                 if not did_initial_buy:
                     self.execute_initial_buy(candidates)
                     did_initial_buy = True

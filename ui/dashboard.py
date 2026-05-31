@@ -17,7 +17,7 @@ from core.short_term import (
     request_switch,
     target_to_settings,
 )
-from core.trader import is_market_open, plan_initial_buy, BUY_CANDIDATES_FILE, TRADE_HISTORY_FILE
+from core.trader import is_market_open, is_trading_time, plan_initial_buy, BUY_CANDIDATES_FILE, TRADE_HISTORY_FILE
 from core.strategy._activate import (
     primary_buy_strategy,
     view_buy_strategies,
@@ -153,18 +153,33 @@ def render_cash_balance() -> None:
 
 def render_header(market_open: bool, buy_strategy_label: str, sell_strategy_label: str) -> None:
     st.title("📈 트레이더 대시보드")
-    # 모드 배지 — 실전은 오발주 방지를 위해 눈에 띄게(에러색) 상시 표시, 모의는 안내색.
+    # 모드 배지 — 실전은 파란색(정보색)으로 상시 표시, 모의는 녹색(안내색).
     if IS_MOCK:
         st.success("🟢 **모의투자(MOCK)** — 가상 계좌입니다. 실제 주문·체결이 일어나지 않습니다.")
     else:
-        st.error("🔴 **실전투자(LIVE)** — 실제 계좌·실제 자금으로 주문이 체결됩니다.")
+        st.info("🔵 **실전투자(LIVE)** — 실제 계좌·실제 자금으로 주문이 체결됩니다.")
     render_cash_balance()
     st.divider()
-    if not market_open:
+
+    real_open = is_market_open()
+    mock_forced = IS_MOCK and not real_open  # 모의 상시거래 — 장 시간 외에도 매매 동작
+
+    if mock_forced:
+        st.info(
+            "🟢 **모의 상시거래** — 장 시간 외에도 매매 로직이 동작합니다. "
+            "단, KIS 모의서버는 정규장(평일 09:00~15:30)에만 체결될 수 있어 시간외 주문은 거부될 수 있습니다."
+        )
+    elif not market_open:
         st.info("⏸ 장 운영 시간 외입니다. 보유 종목과 마지막 가격 기준으로 표시합니다.")
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("장 상태", "🟢 운영 중" if market_open else "🔴 마감")
+    if real_open:
+        market_status = "🟢 운영 중"
+    elif mock_forced:
+        market_status = "🟢 운영 중 (모의)"
+    else:
+        market_status = "🔴 마감"
+    c1.metric("장 상태", market_status)
     c2.metric("매수 전략", buy_strategy_label)
     c3.metric("매도 전략", sell_strategy_label)
     c4.metric("확인 주기", f"{CHECK_INTERVAL // 60}분")
@@ -272,7 +287,7 @@ def _on_short_term_auto_change() -> None:
 
 
 def _on_short_term_select_change() -> None:
-    """단타 매매 종목 콤보 선택 변경 → 활성 슬롯 갱신.
+    """단타 매매 종목 라디오 선택 변경 → 활성 슬롯 갱신.
 
     - 선택이 현재 활성 종목과 같으면: 예약된 교체가 있으면 취소.
     - 활성 종목을 보유(매수 상태) 중이면: 즉시 갈아타지 않고 교체 예약(`request_switch`) —
@@ -317,7 +332,7 @@ def _on_short_term_select_change() -> None:
 
 
 def render_short_term(market_open: bool) -> None:
-    """단기 매매 (단타) — 상위 N종 후보 중 콤보 박스로 1종을 골라 자동매매.
+    """단기 매매 (단타) — 상위 N종 후보 목록에서 라디오로 1종을 골라 자동매매.
 
     후보 목록은 코스피200 근사 풀에서 등락률+거래량 ranking 결합 상위 N종을 일단위로 선정.
     트레이더는 후보의 selected_at 날짜가 오늘이 아니면 자동 재선정하며, 수동 버튼은 강제 재선정용.
@@ -366,12 +381,12 @@ def render_short_term(market_open: bool) -> None:
         st.markdown(
             f"**등락률 순위 + 거래량 순위가 모두 상위**인 종목 최대 {SHORT_TERM_CANDIDATE_COUNT}종을 후보로 선정합니다 (rank 합산이 작을수록 우선).\n\n"
             f"- 풀: KOSPI200 시총 상위 {strategy.pool_top_n} 우선, 풀 안에 후보가 없으면 KOSPI200 전체에서 fallback.\n"
-            f"- **콤보 박스로 후보 중 1종을 선택**하고 '자동매매'를 켜면 그 종목을 시장가 매수하고 매수가 대비 **{strategy.stop_loss_pct}% 하락** 시 전량 매도.\n"
+            f"- **후보 목록에서 라디오로 1종을 선택**하고 '자동매매'를 켜면 그 종목을 시장가 매수하고 매수가 대비 **{strategy.stop_loss_pct}% 하락** 시 전량 매도.\n"
             f"- **개장 직후 변동성 회피**: 후보 선정은 9시부터 하되, 실제 매수는 "
             f"**{buy_start} 이후**(개장 후 {buy_delay}분) 시작. 지연 시간은 사이드바에서 조절 가능.\n"
             f"- 매도 즉시 다음 후보로 활성 종목을 자동 지정 (직전 매도 종목 제외).\n"
             f"- 후보는 매일 자동 재선정되며, **보유 중인 종목은 유지**하고 미보유(빈) 슬롯만 새 후보 #1로 갱신.\n"
-            f"- 보유 중 콤보로 다른 종목을 고르면 **이전 보유를 전량 매도 후 전환**합니다.\n"
+            f"- 보유 중 라디오로 다른 종목을 고르면 **이전 보유를 전량 매도 후 전환**합니다.\n"
             f"- 매수 예산: **min(직전 매도 회수 금액, 상한 {budget_max:,.0f}원, 주문가능금액)** "
             f"— 이익은 상한으로 캡, 손실은 단타 자금 풀에서 흡수 (일반 자금 보충 X)."
         )
@@ -411,14 +426,23 @@ def render_short_term(market_open: bool) -> None:
         },
     )
 
-    # ── 콤보 박스(매매 종목 선택) + 자동매매 토글 ──
+    # ── 라디오(후보 목록에서 매매 종목 1종 선택) + 자동매매 토글 ──
     active_code = slot.get("code")
     options = [c.get("종목코드") for c in items if c.get("종목코드")]
-    label_map = {c.get("종목코드"): (c.get("종목명") or c.get("종목코드")) for c in items}
+    # 라디오 라벨에 위 표와 동일한 순위·종목명·등락률을 담아 목록 자체가 선택지가 되게 한다.
+    label_map: dict[str, str] = {}
+    for i, c in enumerate(items, start=1):
+        code = c.get("종목코드")
+        if not code:
+            continue
+        name = c.get("종목명") or code
+        chg = c.get("등락률(%)")
+        chg_str = f"  ({chg:+.2f}%)" if isinstance(chg, (int, float)) else ""
+        label_map[code] = f"{i}. {name} [{code}]{chg_str}"
     # 보유/활성 종목이 후보 목록 밖이어도 선택지에 포함 (보유 포지션 추적 유지)
     if active_code and active_code not in options:
         options = [active_code] + options
-        label_map.setdefault(active_code, slot.get("name") or active_code)
+        label_map.setdefault(active_code, f"(보유) {slot.get('name') or active_code} [{active_code}]")
 
     # session_state 선택값이 현재 옵션에 없으면 활성 종목(없으면 #1)으로 보정 (stale 값 에러 방지)
     if st.session_state.get("short_term_select") not in options:
@@ -431,13 +455,13 @@ def render_short_term(market_open: bool) -> None:
 
     col_sel, col_auto = st.columns([3, 1])
     with col_sel:
-        st.selectbox(
-            "매매 종목 선택",
+        st.radio(
+            "매매 종목 선택 (목록에서 1종)",
             options=options,
-            format_func=lambda c: f"{label_map.get(c, c)} ({c})",
+            format_func=lambda c: label_map.get(c, c),
             key="short_term_select",
             on_change=_on_short_term_select_change,
-            help="후보 중 실제 자동매매할 1종을 선택합니다. 보유 중 다른 종목으로 바꾸면 이전 보유를 전량 매도 후 전환합니다.",
+            help="후보 목록에서 실제 자동매매할 1종을 선택합니다. 보유 중 다른 종목을 고르면 이전 보유를 전량 매도 후 전환합니다.",
         )
     with col_auto:
         st.toggle(
@@ -447,12 +471,12 @@ def render_short_term(market_open: bool) -> None:
             help="켜면 선택 종목을 매수/매도 조건 충족 시 시장가로 자동 실행합니다.",
         )
 
-    # 교체 예약 안내 (보유 중 콤보로 다른 종목을 골랐을 때)
+    # 교체 예약 안내 (보유 중 라디오로 다른 종목을 골랐을 때)
     _render_short_term_pending(slot)
 
     # ── 활성 종목 상태 ──
     if not active_code:
-        st.caption("선택된 매매 종목이 없습니다. 콤보 박스에서 후보를 선택하세요.")
+        st.caption("선택된 매매 종목이 없습니다. 후보 목록에서 라디오로 종목을 선택하세요.")
         return
 
     name = slot.get("name") or active_code
@@ -492,7 +516,7 @@ def render_short_term(market_open: bool) -> None:
 
 
 def _render_short_term_pending(slot: dict) -> None:
-    """교체 예약(pending) 안내 — 보유 중 콤보로 다른 종목을 골랐을 때.
+    """교체 예약(pending) 안내 — 보유 중 라디오로 다른 종목을 골랐을 때.
 
     트레이더가 다음 주기에 이전 보유를 전량 매도한 뒤 예약 종목으로 전환한다.
     """
@@ -1077,7 +1101,9 @@ def render_sidebar() -> tuple[bool, int, str, str, float]:
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 
-market_open = is_market_open()
+# market_open: 대시보드가 '매매 활성' 으로 동작할지 여부 (모의는 장 시간 외에도 활성).
+# 실제 시장 상태는 render_header 가 is_market_open() 으로 따로 표시한다.
+market_open = is_trading_time()
 auto_refresh, refresh_interval, buy_label, sell_label, stop_loss_pct = render_sidebar()
 
 render_header(market_open, buy_label, sell_label)
