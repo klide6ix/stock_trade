@@ -97,6 +97,9 @@
 - [x] **모의투자 상시거래 — 장 시간 게이트를 모의 모드에서 우회** — 주말·시간외에 매수가 일어나지 않는 게 정상(장 마감)인데 모의 테스트가 불편하다는 요구 대응. `core/trader.py` 에 `is_trading_time()` 추가 (`IS_MOCK or is_market_open()`) — 실전은 정규장(평일 09:00~15:30)에만 매매(오발주 방지), 모의는 장 시간 무관 상시 매매. 트레이더 매매 게이트 4곳(초기매수·메인 루프·단타 교체)을 `is_market_open()` → `is_trading_time()` 로 교체, `is_market_open()` 은 실제 시장 상태 표시(대시보드 '장 상태' 배지) 전용으로 유지. 대시보드 `market_open=is_trading_time()` 로 매매 활성 판정, 헤더는 `실제마감 ∧ 모의` 시 "🟢 운영 중 (모의)" + "모의 상시거래" 안내 배너 표시. 시작 로그에도 `[모의] 상시거래 모드` 명시. **주의(코드 주석·UI 에 명시)**: KIS 모의서버는 정규장 시간에만 체결하므로 시간외 시장가 주문은 서버에서 거부될 수 있음(주문 응답 msg1 로 확인) — 우회는 어디까지나 매매 '로직' 검증용
 - [x] **단타 매매 종목 선택 UI 를 콤보 박스 → 라디오 목록으로 교체** — 후보 중 1종을 별도 콤보 박스(`st.selectbox`)로 고르던 방식이 직관적이지 않아, 후보 목록에서 직접 라디오 버튼으로 1종을 선택하는 방식(`st.radio`)으로 전환. 라디오 라벨에 `순위·종목명·[코드]·(등락률%)` 을 담아 목록 자체가 선택지 역할(상세 현재가·거래량·선정사유는 위 읽기전용 표가 보완). `key="short_term_select"`/`on_change=_on_short_term_select_change` 그대로라 선택 처리·교체 예약(`request_switch`)·자동매매 토글 로직은 무변경. 관련 docstring·help·안내 문구의 "콤보 박스" → "라디오 목록" 일괄 갱신
 - [x] **KIS REST 호출 공용 헬퍼 `_request()` 도입 — 일시적 5xx 재시도 + 에러 본문 노출** — KIS 모의투자 서버가 잔고/주문 API 에서 간헐적으로 500 Internal Server Error 를 반환해 대시보드가 죽던 문제 대응. `core/kis_api.py` 의 모든 GET/POST 호출(13곳)을 `requests.X → raise_for_status → json()` 직접 패턴에서 `_request(method, url, tr_id, params=/json_body=)` 단일 헬퍼 경유로 전환. 헬퍼는 (1) 5xx·네트워크 오류를 지수 backoff(`_RETRY_BACKOFF=1s × attempt`)로 최대 `_MAX_ATTEMPTS=3`회 재시도, (2) 4xx·재시도 소진 시 KIS 가 본문에 담는 `msg_cd`/`msg1` 을 폐기하지 않고 로그·`KisApiError` 메시지에 노출(`raise_for_status()` 는 URL 만 보여주고 본문을 버림), (3) `_REQUEST_TIMEOUT=10s` 로 무한 대기 방지. 토큰 발급(`get_token`)은 인증 전용 헤더라 의도적으로 직접 호출 유지. 모의투자 실호출로 검증 중 실제 500 발생 → 재시도로 자동 복구 확인
+- [x] **대시보드 '단타' 표현 중복 정리 — 대표 명칭을 '단기 매매'로 통일** — 단타 섹션 제목이 `🎯 단기 매매 (단타) — 단타 (코스피200···)` 처럼 같은 의미를 한 줄에 3번(병기 `(단타)` + `display_name` 접두사 `단타 `) 노출하던 중복 제거. `ShortTermStrategy.display_name` 에서 `단타 ` 접두사 삭제(→ `코스피200·등락률+거래량 ranking·5%손절`), 대시보드 화면 텍스트 7곳에서 '단타' 제거: 섹션/사이드바 제목 병기 `(단타)` 제거, `단타 후보→후보`, expander `단타 매매 동작 안내→동작 안내`, `단타 자금 풀→이 매매 자금 풀`, help `단타 실매수→실매수`. 코드 docstring 의 '단타'는 화면 비표시라 가독성용으로 유지. `display_name` 소비처는 대시보드 1곳뿐이라 영향 국소
+- [x] **가격 확인 주기 `CHECK_INTERVAL` 10분 → 1분(600→60초) 단축** — 매도 판단이 polling 방식이라 조건 충족~실제 매도 사이 최대 1주기 지연이 발생하는데, 10분은 손절 반응성이 너무 둔하다는 판단. 한 사이클 호출량(`get_holdings` 1 + 보유 종목당 `get_current_price`, 매도 전략 `trailing_stop`은 추가 일봉 호출 없음)이 분당 수회 수준이라 KIS rate limit 에 여유 → 10배 잦아져도 안전. 손절 최대 지연 10분 → 1분. `config.py` 상수 유지(사이드바 노출은 별도 "다음 작업 후보" 로 보류)
+- [x] **대시보드에서 모의/실전 모드 표시 일괄 제거** — 모의투자는 매매 로직 검증용으로만 쓰고 실사용은 안 해 view 의 모드 표시가 불필요하다는 판단. `ui/dashboard.py` 에서 (1) 탭 제목 `트레이더 [모의]/[실전]` → `트레이더`, (2) `🟢 모의투자(MOCK)` / `🔵 실전투자(LIVE)` 모드 배지, (3) `🟢 모의 상시거래` 안내 배너, (4) 장 상태 metric 의 `운영 중 (모의)` 분기를 모두 제거 — 장 상태는 `is_market_open()` 기준 `운영 중`/`마감` 만 표시. 미사용이던 `MODE_LABEL` import 와 `IS_MOCK` import 도 함께 정리. **로직은 무변경** — `config.IS_MOCK` · `core/trader.py::is_trading_time()`(모의 상시거래 게이트) 는 그대로 유지되므로 실제 모의/실전 동작·키 분리·상시거래는 코드 레벨에서 계속 작동. 대시보드 `market_open=is_trading_time()` 매매 활성 판정도 유지
 - [x] **단타 다중 후보(최대 5종) + 콤보 박스 선택 모델** — 단일 자동 선정 → **상위 N종(`SHORT_TERM_CANDIDATE_COUNT`=5) 후보 선정**으로 전환. `ShortTermStrategy.find_targets(n, exclude_codes)` 가 ranking 결합 상위 N종 리스트 반환(`find_target` 은 n=1 wrapper). 후보는 `settings.json::short_term_candidates`(`{selected_at, items}`) 컨테이너에 일단위 보관. 대시보드: **읽기 전용 후보 테이블**(순위/종목명/현재가/등락률/거래량/선정사유) + **콤보 박스(selectbox)로 매매할 1종 선택** + 단일 `자동매매` 토글. 실거래는 한 번에 1종(활성 슬롯)만 진행. 재선정 시 **보유 종목은 유지**(보호), 미보유 슬롯만 새 후보 #1로 자동 지정(Q2). 보유 중 콤보로 다른 종목 선택 시 `request_switch` → 트레이더가 이전 보유 전량 매도 후 전환(`_short_term_switch` 재사용). `check_short_term` 의 reselect 로직을 `_short_term_refresh_candidates` 로 교체, `core/short_term.py` 에 `find_targets`/`candidates_to_settings`/`candidates_need_refresh`/`empty_candidates`/`request_switch` 추가, 단일-슬롯 전용 헬퍼(`stage_pending`/`mark_switch`/`mark_reselect_checked`/`reselect_checked_today`/`needs_reselection`/`reselect_checked_date` 필드) 제거. 대시보드 data_editor(체크박스) → dataframe + selectbox + toggle 로 교체
 
 ## 다음 작업 후보
@@ -115,7 +118,7 @@
 | 항목           | 값                   |
 | -------------- | -------------------- |
 | 손절 기준      | 최고점 대비 10% 하락 |
-| 가격 확인 주기 | 10분                 |
+| 가격 확인 주기 | 1분                  |
 | 매도 방식      | 시장가               |
 | 장 운영 시간   | 평일 09:00 ~ 15:30   |
 
@@ -301,7 +304,7 @@ IS_MOCK = False
  │     └─ QualityTrendBuyStrategy: 시총 100 ∩ 일간등락률 상위 50 → 종목별 PER/EPS/PBR + 80일 일봉 조회
  │       → EPS<0·PER 0~50·PBR 0~5 + 20MA>60MA·현재가>20MA·RSI(14)≤70 필터 → 4주 신고가 근접도 내림차순 상위 4
  │
- └─ 10분마다 반복 (장 운영시간 내)
+ └─ 1분마다 반복 (장 운영시간 내)
       └─ 보유 종목 전체 조회
            ├─ 신규 편입 종목 감지 → trade_history.json 에 매수 기록 + SellStrategy.on_buy()
            └─ 각 종목 현재가 조회

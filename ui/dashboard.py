@@ -5,7 +5,7 @@ import streamlit as st
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 
-from config import CHECK_INTERVAL, IS_MOCK, MODE_LABEL
+from config import CHECK_INTERVAL
 from core.kis_api import get_holdings, get_current_price, get_cash_balance
 from core.logger import LOG_FILE
 from core.short_term import (
@@ -34,7 +34,7 @@ from core.strategy.sell import PEAK_PRICES_FILE
 from core.settings import load_settings, set_value as set_setting
 
 st.set_page_config(
-    page_title=f"트레이더 [{'모의' if IS_MOCK else '실전'}]",
+    page_title="트레이더",
     page_icon="📈",
     layout="wide",
 )
@@ -153,32 +153,16 @@ def render_cash_balance() -> None:
 
 def render_header(market_open: bool, buy_strategy_label: str, sell_strategy_label: str) -> None:
     st.title("📈 트레이더 대시보드")
-    # 모드 배지 — 실전은 파란색(정보색)으로 상시 표시, 모의는 녹색(안내색).
-    if IS_MOCK:
-        st.success("🟢 **모의투자(MOCK)** — 가상 계좌입니다. 실제 주문·체결이 일어나지 않습니다.")
-    else:
-        st.info("🔵 **실전투자(LIVE)** — 실제 계좌·실제 자금으로 주문이 체결됩니다.")
     render_cash_balance()
     st.divider()
 
     real_open = is_market_open()
-    mock_forced = IS_MOCK and not real_open  # 모의 상시거래 — 장 시간 외에도 매매 동작
 
-    if mock_forced:
-        st.info(
-            "🟢 **모의 상시거래** — 장 시간 외에도 매매 로직이 동작합니다. "
-            "단, KIS 모의서버는 정규장(평일 09:00~15:30)에만 체결될 수 있어 시간외 주문은 거부될 수 있습니다."
-        )
-    elif not market_open:
+    if not market_open:
         st.info("⏸ 장 운영 시간 외입니다. 보유 종목과 마지막 가격 기준으로 표시합니다.")
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    if real_open:
-        market_status = "🟢 운영 중"
-    elif mock_forced:
-        market_status = "🟢 운영 중 (모의)"
-    else:
-        market_status = "🔴 마감"
+    market_status = "🟢 운영 중" if real_open else "🔴 마감"
     c1.metric("장 상태", market_status)
     c2.metric("매수 전략", buy_strategy_label)
     c3.metric("매도 전략", sell_strategy_label)
@@ -340,7 +324,7 @@ def render_short_term(market_open: bool) -> None:
     strategy = ShortTermStrategy()
 
     col_title, col_btn = st.columns([6, 1])
-    col_title.subheader(f"🎯 단기 매매 (단타) — {strategy.display_name}")
+    col_title.subheader(f"🎯 단기 매매 — {strategy.display_name}")
     if col_btn.button("🔄 후보 선정", key="refresh_short_term"):
         with st.spinner("등락률·거래량 ranking 조회 중... (API 3회, 즉시 완료)"):
             items = strategy.find_targets(n=SHORT_TERM_CANDIDATE_COUNT)
@@ -364,7 +348,7 @@ def render_short_term(market_open: bool) -> None:
                 ),
             )
         if items:
-            st.success(f"단타 후보 {len(items)}종 선정 완료.")
+            st.success(f"후보 {len(items)}종 선정 완료.")
         else:
             st.warning("두 ranking 모두 등장한 종목이 시총 풀 안에 없습니다.")
         st.rerun()
@@ -377,7 +361,7 @@ def render_short_term(market_open: bool) -> None:
     budget_max = _Trader.SHORT_TERM_BUDGET_MAX
     buy_delay = short_term_buy_delay_min()
     buy_start = short_term_buy_start_label()
-    with st.expander("ℹ️ 단타 매매 동작 안내", expanded=False):
+    with st.expander("ℹ️ 동작 안내", expanded=False):
         st.markdown(
             f"**등락률 순위 + 거래량 순위가 모두 상위**인 종목 최대 {SHORT_TERM_CANDIDATE_COUNT}종을 후보로 선정합니다 (rank 합산이 작을수록 우선).\n\n"
             f"- 풀: KOSPI200 시총 상위 {strategy.pool_top_n} 우선, 풀 안에 후보가 없으면 KOSPI200 전체에서 fallback.\n"
@@ -388,7 +372,7 @@ def render_short_term(market_open: bool) -> None:
             f"- 후보는 매일 자동 재선정되며, **보유 중인 종목은 유지**하고 미보유(빈) 슬롯만 새 후보 #1로 갱신.\n"
             f"- 보유 중 라디오로 다른 종목을 고르면 **이전 보유를 전량 매도 후 전환**합니다.\n"
             f"- 매수 예산: **min(직전 매도 회수 금액, 상한 {budget_max:,.0f}원, 주문가능금액)** "
-            f"— 이익은 상한으로 캡, 손실은 단타 자금 풀에서 흡수 (일반 자금 보충 X)."
+            f"— 이익은 상한으로 캡, 손실은 이 매매 자금 풀에서 흡수 (일반 자금 보충 X)."
         )
 
     settings = load_settings()
@@ -399,7 +383,7 @@ def render_short_term(market_open: bool) -> None:
     items = container.get("items") or []
 
     if not items:
-        st.info("단타 후보가 없습니다. 위의 '🔄 후보 선정' 버튼을 누르거나, 트레이더가 다음 주기에 자동 선정합니다.")
+        st.info("후보가 없습니다. 위의 '🔄 후보 선정' 버튼을 누르거나, 트레이더가 다음 주기에 자동 선정합니다.")
         return
 
     # ── 후보 테이블 (읽기 전용, 상위 N종) ──
@@ -1066,14 +1050,14 @@ def render_sidebar() -> tuple[bool, int, str, str, float]:
             st.caption("ℹ️ 보유 종목 테이블의 '최고가/하락률' 컬럼은 참고용으로만 표시됩니다.")
 
         st.divider()
-        st.subheader("🎯 단기 매매 (단타)")
+        st.subheader("🎯 단기 매매")
         st.number_input(
             "개장 후 매수 지연 (분)",
             min_value=0, max_value=60,
             step=1,
             key="short_term_buy_delay_input",
             on_change=_on_short_term_buy_delay_change,
-            help="개장(09:00) 후 이 시간이 지나야 단타 실매수를 시작합니다. 종목 탐색·선정은 9시부터 진행. 0=개장 즉시 매수.",
+            help="개장(09:00) 후 이 시간이 지나야 실매수를 시작합니다. 종목 탐색·선정은 9시부터 진행. 0=개장 즉시 매수.",
         )
 
         st.divider()

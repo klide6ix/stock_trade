@@ -63,7 +63,7 @@ class ShortTermStrategy:
 
     @property
     def display_name(self) -> str:
-        return f"단타 (코스피200·등락률+거래량 ranking·{self.stop_loss_pct}%손절)"
+        return f"코스피200·등락률+거래량 ranking·{self.stop_loss_pct}%손절"
 
     # ── 종목 선정 ──────────────────────────────────────────────────────────────
 
