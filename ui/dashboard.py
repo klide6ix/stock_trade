@@ -40,16 +40,6 @@ st.set_page_config(
 )
 
 # ── 세션 상태 초기화 ───────────────────────────────────────────────────────────
-if "peak_prices" not in st.session_state:
-    # peak_prices.json 에서 복원 시도
-    _pp = {}
-    if os.path.exists(PEAK_PRICES_FILE):
-        try:
-            with open(PEAK_PRICES_FILE, "r", encoding="utf-8") as _f:
-                _pp = {k: float(v) for k, v in json.load(_f).get("prices", {}).items()}
-        except Exception:
-            pass
-    st.session_state.peak_prices = _pp
 if "last_prices" not in st.session_state:
     st.session_state.last_prices = {}
 if "buy_candidates" not in st.session_state:
@@ -71,9 +61,26 @@ def fetch_price(code: str, market_open: bool) -> tuple[float | None, bool]:
         return cached, cached is not None
 
 
+def _load_peak_prices() -> dict[str, float]:
+    """트레이더가 소유·갱신하는 peak_prices.json 을 읽어 반환 (대시보드는 읽기 전용).
+
+    최고가 갱신·매도 시 정리는 모두 트레이더의 TrailingStopSellStrategy 가 담당한다.
+    대시보드가 별도로 기록하면 dual-writer 로 인해 매도 후에도 stale 한 최고가가
+    다시 파일에 새어 들어가므로, 여기서는 표시(참고용)를 위해 읽기만 한다.
+    """
+    if not os.path.exists(PEAK_PRICES_FILE):
+        return {}
+    try:
+        with open(PEAK_PRICES_FILE, "r", encoding="utf-8") as f:
+            return {k: float(v) for k, v in json.load(f).get("prices", {}).items()}
+    except Exception:
+        return {}
+
+
 def build_holdings_rows(market_open: bool) -> tuple[list[dict], bool]:
     """보유 종목 데이터 생성. (rows, 캐시가격 사용여부) 반환"""
     holdings = get_holdings()
+    peak_prices = _load_peak_prices()
     rows = []
     any_stale = False
 
@@ -82,19 +89,7 @@ def build_holdings_rows(market_open: bool) -> tuple[list[dict], bool]:
         if stale:
             any_stale = True
 
-        if price and market_open:
-            if code not in st.session_state.peak_prices or price > st.session_state.peak_prices[code]:
-                st.session_state.peak_prices[code] = price
-                try:
-                    with open(PEAK_PRICES_FILE, "w", encoding="utf-8") as _pf:
-                        json.dump(
-                            {"updated_at": datetime.now().isoformat(), "prices": st.session_state.peak_prices},
-                            _pf, ensure_ascii=False, indent=2,
-                        )
-                except Exception:
-                    pass
-
-        peak = st.session_state.peak_prices.get(code, price)
+        peak = peak_prices.get(code, price)
         avg_price = info["avg_price"]
         drop_pct = (peak - price) / peak * 100 if (price and peak) else None
         profit_pct = (price - avg_price) / avg_price * 100 if (price and avg_price) else None

@@ -49,6 +49,17 @@ class TrailingStopSellStrategy(SellStrategy):
             self.peak_prices[code] = buy_price
             self.save()
 
+    def on_sell(self, code: str) -> None:
+        """매도 시 해당 종목의 최고가 상태를 제거.
+
+        제거하지 않으면 재매수 시 이전 보유 구간의 (대개 더 높은) 최고가가 남아,
+        매수가 대비 낮은데도 '최고가 대비 큰 하락'으로 오판되어 즉시 손절될 수 있다.
+        제거해 두면 다음 on_buy 가 매수가를 새 최고가로 세팅하고, 이후 observe 가
+        매 주기 상향 갱신한다.
+        """
+        if self.peak_prices.pop(code, None) is not None:
+            self.save()
+
     def should_sell(self, code: str, current_price: float) -> tuple[bool, str]:
         peak = self.peak_prices.get(code)
         if peak is None or peak <= 0:

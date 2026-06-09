@@ -46,6 +46,13 @@ class SellStrategy(ABC):
     def on_buy(self, code: str, buy_price: float) -> None:
         """신규 매수 감지 시 초기 상태 세팅. 기본 no-op."""
 
+    def on_sell(self, code: str) -> None:
+        """매도(보유 청산) 감지 시 종목별 내부 상태 정리. 기본 no-op.
+
+        재매수 시 이전 보유 구간의 상태(예: 최고가)가 남아 새 매수가 기준이
+        오염되지 않도록, 구현체가 종목별 상태를 폐기할 수 있게 한다.
+        """
+
     def load(self) -> None:
         """프로그램 시작 시 영속 상태 복원. 기본 no-op."""
 

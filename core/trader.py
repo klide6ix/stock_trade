@@ -658,6 +658,12 @@ class Trader:
                 self.log_trade("buy", code, info["name"], buy_price, info["qty"])
                 self.sell_strategy.on_buy(code, buy_price)
 
+            # 사라진 종목 = 보유 청산 감지 (자동 매도·수동 매도·외부 체결 모두 포괄).
+            # 매도 전략의 종목별 내부 상태(최고가 등)를 정리해, 재매수 시 stale 한
+            # 이전 최고가가 남아 매수가 대비 과도한 하락으로 오판되는 것을 막는다.
+            for code in self._known_holdings - current_codes:
+                self.sell_strategy.on_sell(code)
+
         self._known_holdings = current_codes
 
         for code, info in holdings.items():
