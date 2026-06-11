@@ -253,6 +253,38 @@ def get_per_eps(stock_code: str) -> dict:
     }
 
 
+def get_roe(stock_code: str) -> float | None:
+    """최근 결산 ROE(자기자본이익률, %) 반환. 실패/데이터 없음 시 None.
+
+    KIS 국내주식 재무비율 API(`finance/financial-ratio`, tr_id `FHKST66430300`)의
+    `roe_val` 을 사용한다. `FID_DIV_CLS_CODE="0"`(연간) 으로 조회해 응답 리스트의
+    첫 항목(가장 최근 결산)을 취한다.
+
+    ROE 를 쓰는 이유: PER=주가/EPS 라 PER 와 EPS 를 함께 비교하면 사실상 같은
+    축(주가 대비 이익)을 중복 평가하게 된다. ROE 는 '자본을 얼마나 효율적으로
+    이익으로 전환했나' 라는 독립적 수익성 지표라, PER(밸류에이션)·주간등락률(모멘텀)과
+    직교하는 신호를 더한다.
+    """
+    url = f"{BASE_URL}/uapi/domestic-stock/v1/finance/financial-ratio"
+    params = {
+        "FID_DIV_CLS_CODE": "0",            # 0=연간, 1=분기
+        "fid_cond_mrkt_div_code": "J",
+        "fid_input_iscd": stock_code,
+    }
+    try:
+        output = _request("GET", url, "FHKST66430300", params=params).get("output", [])
+    except Exception as e:
+        log(f"[재무비율] ROE 조회 실패 ({stock_code}): {e}")
+        return None
+    if not output:
+        return None
+    raw = output[0].get("roe_val")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_quote_snapshot(stock_code: str) -> dict:
     """현재가 + 52주 고/저 + PER/EPS/PBR 일괄 조회. inquire-price 단일 호출."""
     url = f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
