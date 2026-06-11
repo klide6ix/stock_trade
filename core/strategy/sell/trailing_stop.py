@@ -44,8 +44,12 @@ class TrailingStopSellStrategy(SellStrategy):
         if self._update_peak(code, current_price):
             self.save()
 
-    def on_buy(self, code: str, buy_price: float) -> None:
-        if code not in self.peak_prices and buy_price > 0:
+    def on_buy(self, code: str, buy_price: float, reset: bool = False) -> None:
+        if buy_price <= 0:
+            return
+        # reset=True: 외부 툴 매수/매도로 남은 orphan 최고가가 있어도 매수가로 강제
+        # 재설정. reset=False(시작 priming): 누적된 정상 최고가는 보존하고 없을 때만 세팅.
+        if reset or code not in self.peak_prices:
             self.peak_prices[code] = buy_price
             self.save()
 
@@ -59,6 +63,21 @@ class TrailingStopSellStrategy(SellStrategy):
         """
         if self.peak_prices.pop(code, None) is not None:
             self.save()
+
+    def reconcile(self, held_codes: set[str]) -> None:
+        """실제 보유하지 않는 종목의 최고가(orphan)를 폐기.
+
+        트레이더가 내려가 있는 동안 외부 툴로 매도된 종목은 on_sell 정리를 거치지
+        못해 peak_prices.json 에 stale 한 최고가가 남는다. 시작 시 이를 정리해야
+        같은 종목 재매수 시 on_buy(reset) 와 무관하게 잔여 orphan 이 쌓이지 않는다.
+        """
+        orphans = [c for c in self.peak_prices if c not in held_codes]
+        if not orphans:
+            return
+        for c in orphans:
+            del self.peak_prices[c]
+        log(f"[최고가] 미보유 orphan {len(orphans)}종 정리: {', '.join(orphans)}")
+        self.save()
 
     def should_sell(self, code: str, current_price: float) -> tuple[bool, str]:
         peak = self.peak_prices.get(code)

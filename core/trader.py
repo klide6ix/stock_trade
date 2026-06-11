@@ -656,7 +656,9 @@ class Trader:
                 buy_price = info["avg_price"]
                 log(f"[{info['name']}({code})] ★ 신규 매수 감지 (평균단가: {buy_price:,.0f}원 × {info['qty']}주)")
                 self.log_trade("buy", code, info["name"], buy_price, info["qty"])
-                self.sell_strategy.on_buy(code, buy_price)
+                # reset=True: 외부 툴 매매로 남은 orphan 최고가가 있어도 평균단가로 강제
+                # 재설정해, stale 한 이전 구간 최고가로 즉시 손절되는 오판을 막는다.
+                self.sell_strategy.on_buy(code, buy_price, reset=True)
 
             # 사라진 종목 = 보유 청산 감지 (자동 매도·수동 매도·외부 체결 모두 포괄).
             # 매도 전략의 종목별 내부 상태(최고가 등)를 정리해, 재매수 시 stale 한
@@ -718,6 +720,8 @@ class Trader:
             for code, info in initial.items():
                 if info["avg_price"] > 0:
                     self.sell_strategy.on_buy(code, info["avg_price"])
+            # 트레이더 down 중 외부 툴로 매도된 종목의 orphan 최고가를 정리.
+            self.sell_strategy.reconcile(set(initial.keys()))
             if initial:
                 log(f"[초기화] 기존 보유 종목 {len(initial)}개 확인 완료")
         except Exception as e:
@@ -769,9 +773,11 @@ class Trader:
             new_strategy = build_sell_strategy(desired_key)
             new_strategy.load()
             try:
-                for code, info in get_holdings().items():
+                holdings = get_holdings()
+                for code, info in holdings.items():
                     if info["avg_price"] > 0:
                         new_strategy.on_buy(code, info["avg_price"])
+                new_strategy.reconcile(set(holdings.keys()))
             except Exception as e:
                 log(f"[설정] 매도 전략 priming 실패: {e}")
             self.sell_strategy = new_strategy
