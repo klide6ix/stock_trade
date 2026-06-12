@@ -2,6 +2,7 @@ import subprocess
 import sys
 import threading
 
+from core.logger import cleanup_old_logs
 from core.short_term import ShortTermStrategy
 from core.trader import Trader
 from core.strategy._activate import (
@@ -16,6 +17,8 @@ def start_dashboard():
 
 
 if __name__ == "__main__":
+    cleanup_old_logs()  # 프로세스 기동 시 오래된 일별 로그 정리
+
     t = threading.Thread(target=start_dashboard, daemon=True)
     t.start()
 

@@ -1,8 +1,14 @@
 import json
 import os
+import random
 import time
 import requests
 from datetime import datetime, timedelta
+
+try:
+    import fcntl  # Unix 전용. cross-process throttle 의 flock 에 사용.
+except ImportError:  # pragma: no cover - 비 Unix 플랫폼 방어
+    fcntl = None
 from config import APP_KEY, APP_SECRET, ACCOUNT_NO, BASE_URL, IS_MOCK
 from core.logger import log
 
@@ -16,6 +22,20 @@ _DATA_DIR = os.path.join(_BASE_DIR, "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
 # 모의/실전 환경별 토큰 분리 저장
 TOKEN_CACHE_FILE = os.path.join(_DATA_DIR, f".kis_token_{'mock' if IS_MOCK else 'real'}.json")
+
+# ── Cross-process 호출 throttle ────────────────────────────────────────────────
+# trader 프로세스와 Streamlit 대시보드 subprocess 가 같은 app key 의 초당 한도를
+# 공유한다. in-process 캐시/재시도만으로는 두 프로세스의 호출이 합쳐져 burst 로
+# 한도(EGW00201/EGW00215)를 넘기므로, data/ 의 lock 파일에 '다음 호출 허용 시각'을
+# 기록하고 flock 으로 직렬화해 전체 시스템의 호출 간격을 강제한다.
+#
+# 초당 허용 호출 수: KIS 공식 상한은 실전 20/s · 모의 2/s 지만,
+#   (1) 원장(EGW00215) 한도는 잔고·주문 API 에 더 빡빡하게 걸리고,
+#   (2) 두 프로세스가 같은 키를 나눠 쓰므로
+# 보수적으로 잡는다. 스캔(후보 탐색)이 다소 느려지는 대신 한도 초과를 사전 차단한다.
+THROTTLE_FILE = os.path.join(_DATA_DIR, f".kis_throttle_{'mock' if IS_MOCK else 'real'}.lock")
+_MAX_CALLS_PER_SEC = 2 if IS_MOCK else 10
+_MIN_INTERVAL = 1.0 / _MAX_CALLS_PER_SEC
 
 _token = None
 _token_expired_at = None
@@ -99,9 +119,62 @@ _MAX_ATTEMPTS = 3       # 최초 1회 + 재시도 2회
 _RETRY_BACKOFF = 1.0    # 재시도 간 대기 기준(초). attempt 회차에 비례해 증가.
 _REQUEST_TIMEOUT = 10   # 응답 대기 한도(초). 무한 대기 방지.
 
+# 초당 거래건수 초과 코드. KIS 는 두 계층에서 별도로 한도를 건다.
+#   EGW00201 = API 게이트웨이(EGW) 레벨 초당 호출 초과.
+#   EGW00215 = 원장(브로커리지 백엔드) 레벨 초당 '거래'건수 초과 — 잔고·주문 등
+#              계좌 API 에만 걸리는 더 빡빡한 제한. HTTP 200 뿐 아니라 500 본문으로도 온다.
+# 둘 다 일시적 제한이라 backoff 후 재시도 대상이다.
+_RATE_LIMIT_CODES = {"EGW00201", "EGW00215"}
+_RATE_LIMIT_BACKOFF = 1.0   # 한도 초과는 '초당' 제한이라 1초 이상 + jitter 로 대기해 다음 창으로 넘긴다.
+
 
 class KisApiError(RuntimeError):
     """KIS API 호출 실패. 서버가 반환한 status·msg_cd·msg1 본문을 메시지에 포함한다."""
+
+
+def _throttle() -> None:
+    """모든 KIS REST 호출 직전에 호출. 프로세스 경계를 넘어 최소 호출 간격을 보장한다.
+
+    동작('슬롯 예약' 패턴):
+      1. lock 파일에 flock(LOCK_EX) — 동시에 한 호출자만 진입.
+      2. 파일에 저장된 '다음 허용 시각'(prev)을 읽는다.
+      3. 내 슬롯 = max(now, prev). 다음 호출자를 위해 (슬롯 + _MIN_INTERVAL)을 기록.
+      4. flock 해제 후, 슬롯 시각까지 sleep (lock 을 쥔 채 자지 않아 다른 호출자를
+         불필요하게 막지 않는다 — 예약은 이미 파일에 반영됨).
+
+    두 프로세스(trader·대시보드)가 같은 머신의 wall clock(time.time())을 공유하므로
+    프로세스 간에도 슬롯이 단조 증가하며 간격이 유지된다. 가용성 우선 — 파일/flock 에
+    문제가 생기면 throttle 없이 호출을 진행한다(거래를 막지 않음)."""
+    if fcntl is None:
+        return
+    try:
+        fd = os.open(THROTTLE_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return
+    f = os.fdopen(fd, "r+")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            content = f.read().strip()
+            prev = float(content) if content else 0.0
+        except (ValueError, OSError):
+            prev = 0.0
+        now = time.time()
+        slot = max(now, prev)
+        f.seek(0)
+        f.truncate()
+        f.write(f"{slot + _MIN_INTERVAL:.6f}")
+        f.flush()
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        f.close()
+
+    wait = slot - now
+    if wait > 0:
+        time.sleep(wait)
 
 
 def _request(method: str, url: str, tr_id: str, *, params=None, json_body=None) -> dict:
@@ -117,11 +190,13 @@ def _request(method: str, url: str, tr_id: str, *, params=None, json_body=None) 
       - **HTTP 200 이어도 본문 rt_cd != "0" 이면 논리적 실패**다 (예: 주문 거부
         "모의투자 영업일이 아닙니다", 초당 거래건수 초과 등). HTTP 상태만 보면 거부된
         주문이 '성공' 으로 처리돼 거래 이력에 유령 체결이 기록되므로, rt_cd 도 검증한다.
-        초당 거래건수 초과(EGW00201)는 일시적 제한이라 backoff 후 재시도한다.
+      - 초당 거래건수 초과(_RATE_LIMIT_CODES)는 HTTP 200·4xx·5xx 어느 상태로 오든
+        일시적 제한으로 보고, 다음 1초 창으로 넘기기 위해 길게(+jitter) backoff 후 재시도한다.
     """
     last_exc: Exception | None = None
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
+            _throttle()  # 프로세스 경계 넘어 초당 한도 준수 (재시도 호출도 포함).
             res = requests.request(
                 method, url,
                 headers=_headers(tr_id),
@@ -139,7 +214,24 @@ def _request(method: str, url: str, tr_id: str, *, params=None, json_body=None) 
                 continue
             raise KisApiError(f"[API] 네트워크 오류 ({tr_id}) {url}: {e}") from e
 
-        # 5xx 는 서버 측 일시 장애로 보고 재시도. (마지막 회차면 아래 오류 처리로 진행)
+        # 본문(JSON)을 먼저 파싱한다. KIS 는 한도 초과를 HTTP 500 본문으로도 보내므로,
+        # 상태 코드만 보지 말고 msg_cd 를 추출해 '한도 초과'인지부터 가린다.
+        # (5xx 가 HTML 등 비 JSON 이면 ValueError → body_json=None 으로 두고 아래 5xx 분기로 넘긴다.)
+        try:
+            body_json = res.json()
+        except ValueError:
+            body_json = None
+        msg_cd = body_json.get("msg_cd") if body_json else None
+
+        # 초당 거래건수 초과 — 상태 코드와 무관하게 backoff 후 재시도해 다음 창으로 넘긴다.
+        if msg_cd in _RATE_LIMIT_CODES and attempt < _MAX_ATTEMPTS:
+            wait = _RATE_LIMIT_BACKOFF * attempt + random.uniform(0, 0.5)
+            msg1 = (body_json.get("msg1") or "").strip()
+            log(f"[API] 초당 한도 초과 ({tr_id}/{msg_cd}) {msg1} — {wait:.1f}s 후 재시도 {attempt}/{_MAX_ATTEMPTS - 1}")
+            time.sleep(wait)
+            continue
+
+        # 5xx (한도 외) 는 서버 측 일시 장애로 보고 재시도. (마지막 회차면 아래 오류 처리로 진행)
         if res.status_code >= 500 and attempt < _MAX_ATTEMPTS:
             wait = _RETRY_BACKOFF * attempt
             log(f"[API] {res.status_code} 서버 오류 ({tr_id}), {wait:.0f}s 후 재시도 {attempt}/{_MAX_ATTEMPTS - 1}")
@@ -152,19 +244,14 @@ def _request(method: str, url: str, tr_id: str, *, params=None, json_body=None) 
             log(msg)
             raise KisApiError(msg)
 
-        data = res.json()
+        data = body_json if body_json is not None else res.json()
 
         # HTTP 200 이어도 rt_cd != "0" 이면 논리적 실패 — KIS 는 거부도 200 으로 보낸다.
+        # (한도 코드는 위에서 이미 재시도 처리됨 — 여기 도달하면 재시도 소진 또는 비한도 실패다.)
         rt_cd = data.get("rt_cd")
         if rt_cd is not None and rt_cd != "0":
             msg_cd = data.get("msg_cd", "")
             msg1 = (data.get("msg1") or "").strip()
-            # 초당 거래건수 초과(EGW00201)는 일시적 제한 — backoff 후 재시도.
-            if msg_cd == "EGW00201" and attempt < _MAX_ATTEMPTS:
-                wait = _RETRY_BACKOFF * attempt
-                log(f"[API] 호출 한도 초과 ({tr_id}) {msg1} — {wait:.0f}s 후 재시도 {attempt}/{_MAX_ATTEMPTS - 1}")
-                time.sleep(wait)
-                continue
             msg = f"[API] 거래 실패 ({tr_id}) rt_cd={rt_cd} msg_cd={msg_cd}: {msg1}"
             log(msg)
             raise KisApiError(msg)
@@ -175,8 +262,29 @@ def _request(method: str, url: str, tr_id: str, *, params=None, json_body=None) 
     raise KisApiError(f"[API] 재시도 모두 실패 ({tr_id}) {url}") from last_exc
 
 
-def _inquire_balance():
-    """잔고조회 API 호출. (output1, output2) 원본 반환"""
+# 잔고조회(inquire-balance) 단기 캐시.
+# 한 사이클에서 get_holdings()(매도 점검·단타) 와 get_cash_balance() 가 같은 원장 API 를
+# 여러 번 호출하는데, 이게 EGW00215(원장 초당 한도)의 직접적 원인이다. 짧은 TTL 로
+# 사이클 내 중복 호출을 1회로 합쳐 원장 부하를 줄인다. TTL(3초) << CHECK_INTERVAL(60초)
+# 이라 의사결정 granularity 에는 영향이 없고, 자기 주문 직후엔 아래에서 캐시를 무효화한다.
+_BALANCE_CACHE_TTL = 3.0
+_balance_cache: tuple[list, list] | None = None
+_balance_cache_at = 0.0
+
+
+def _invalidate_balance_cache() -> None:
+    """잔고 캐시 무효화. 자기 매수·매도 주문 직후 호출해 다음 조회가 최신 원장을 읽게 한다."""
+    global _balance_cache
+    _balance_cache = None
+
+
+def _inquire_balance(*, use_cache: bool = True):
+    """잔고조회 API 호출. (output1, output2) 원본 반환. 기본적으로 단기 캐시를 사용한다."""
+    global _balance_cache, _balance_cache_at
+    now = time.monotonic()
+    if use_cache and _balance_cache is not None and (now - _balance_cache_at) < _BALANCE_CACHE_TTL:
+        return _balance_cache
+
     url = f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
     tr_id = "VTTC8434R" if IS_MOCK else "TTTC8434R"
 
@@ -195,7 +303,10 @@ def _inquire_balance():
     }
 
     data = _request("GET", url, tr_id, params=params)
-    return data.get("output1", []), data.get("output2", [{}])
+    result = (data.get("output1", []), data.get("output2", [{}]))
+    _balance_cache = result
+    _balance_cache_at = now
+    return result
 
 
 def get_holdings():
@@ -505,7 +616,9 @@ def sell_market_order(stock_code, qty):
         "ORD_UNPR": "0",    # 시장가는 0
     }
 
-    return _request("POST", url, tr_id, json_body=body)
+    result = _request("POST", url, tr_id, json_body=body)
+    _invalidate_balance_cache()  # 보유·예수금이 바뀌므로 다음 조회는 캐시 우회.
+    return result
 
 
 def buy_market_order(stock_code, qty):
@@ -522,4 +635,6 @@ def buy_market_order(stock_code, qty):
         "ORD_UNPR": "0",    # 시장가는 0
     }
 
-    return _request("POST", url, tr_id, json_body=body)
+    result = _request("POST", url, tr_id, json_body=body)
+    _invalidate_balance_cache()  # 보유·예수금이 바뀌므로 다음 조회는 캐시 우회.
+    return result

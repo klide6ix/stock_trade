@@ -7,7 +7,7 @@ from streamlit_autorefresh import st_autorefresh
 
 from config import CHECK_INTERVAL
 from core.kis_api import get_holdings, get_current_price, get_cash_balance
-from core.logger import LOG_FILE
+from core.logger import current_log_file, latest_log_file
 from core.short_term import (
     SHORT_TERM_CANDIDATE_COUNT,
     ShortTermStrategy,
@@ -850,12 +850,17 @@ def render_trade_history() -> None:
 
 def render_log() -> None:
     st.subheader("최근 로그")
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        st.code("".join(lines[-50:]), language=None)
-    except FileNotFoundError:
+    # 오늘 일별 로그를 우선 표시하고, 자정 직후·기동 직후처럼 아직 없으면 직전 일자로 폴백.
+    path = current_log_file()
+    if not os.path.exists(path):
+        path = latest_log_file()
+    if not path or not os.path.exists(path):
         st.info("로그 파일이 없습니다. `python main.py`를 실행하면 로그가 표시됩니다.")
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    st.caption(f"파일: `{os.path.basename(path)}`")
+    st.code("".join(lines[-50:]), language=None)
 
 
 def _init_sidebar_state(settings: dict) -> None:
