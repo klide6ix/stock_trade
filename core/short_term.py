@@ -44,8 +44,31 @@ def select_kospi200_universe(top_n: int = 200, market: str = "kospi200") -> list
 class ShortTermStrategy:
     """단기 매매 (단타) — 코스피200 근사 풀에서 등락률+거래량 ranking 결합으로 1종목 선정.
 
+    진입(매수)·청산(매도) 철학:
+      단타에서 진입 타이밍을 완벽히 맞추려 필터를 빡빡하게 걸면 후보가 0개로 떨어진다.
+      따라서 진입은 '명백히 나쁜 자리'만 가볍게 거르고(추가 API 호출 0 — 매 주기 조회하는
+      현재가 snapshot 의 당일 OHLC·등락률만 사용), 리스크는 청산(트레일링+손절)으로 관리한다.
+
+      청산은 트레일링 스탑 중심의 3중 구조:
+        1. 하드 손절 — 매수가 대비 -stop_loss_pct
+        2. 트레일링 스탑 — 수익이 trail_arm_pct 도달해 '무장'된 뒤, 진입 후 최고가(peak) 대비
+           -trail_drop_pct 하락 시 청산. "올라도 못 파는" 문제(손절 일변도)의 핵심 해결책.
+        3. (옵션) 하드 익절 — 매수가 대비 +take_profit_pct (default 0 = 비활성, 트레일링에 위임)
+
     Args:
-        stop_loss_pct: 매수 평균가 대비 매도 발동 하락률 % (default 5.0).
+        stop_loss_pct: 매수 평균가 대비 손절 발동 하락률 % (default 3.0).
+        trail_arm_pct: 트레일링 무장(arm) 수익률 % — 최고 수익이 이 값에 도달해야 트레일링
+            청산이 활성화된다 (default 3.0). 진입 직후 잔파동에 트레일링이 즉시 발동하는 것 방지.
+        trail_drop_pct: 무장 후 진입 후 최고가(peak) 대비 이만큼 하락 시 청산 % (default 2.0).
+        take_profit_pct: 하드 익절 목표 % (default 0.0 = 비활성, 트레일링에 위임).
+        entry_max_chg_pct: 진입 허용 전일대비등락률 상한 % (default 15.0). 이미 폭등한 종목
+            추격 금지. 0 이면 비활성.
+        entry_min_rebound_pct: 당일 저가 대비 최소 반등 % (default 1.0). 현재가가 당일 최저점에서
+            이만큼 올라온 종목만 진입 — 저점에서 못 벗어나고 흘러내리는 종목('떨어지는 칼날') 회피.
+            "현재가 ≥ 시가" 기준 대신 "저점 대비 반등" 으로 보아, 갭하락으로 시작했어도 저점에서
+            반등 중인 종목을 놓치지 않는다. 0 이면 비활성.
+        entry_min_pullback_pct: 진입 시 당일 고가 대비 최소 눌림 % (default 0.0 = 비활성). >0 이면
+            현재가가 고가에서 이만큼 빠진 자리에서만 진입(꼭지 추격 회피). 단 떨어지는 칼날 위험.
         pool_top_n: 시총 상위 종목 수 = 코스피200 근사 풀 크기 (default 100).
         ranking_fetch_n: 각 ranking API 의 응답 종목 수 상한 (default 100). KIS 응답 한도가
             실제 적용되므로 큰 값을 주어도 KIS 가 주는 만큼만 받음.
@@ -53,17 +76,32 @@ class ShortTermStrategy:
 
     def __init__(
         self,
-        stop_loss_pct: float = 5.0,
+        stop_loss_pct: float = 3.0,
+        trail_arm_pct: float = 3.0,
+        trail_drop_pct: float = 2.0,
+        take_profit_pct: float = 0.0,
+        entry_max_chg_pct: float = 15.0,
+        entry_min_rebound_pct: float = 1.0,
+        entry_min_pullback_pct: float = 0.0,
         pool_top_n: int = 100,
         ranking_fetch_n: int = 100,
     ) -> None:
         self.stop_loss_pct = stop_loss_pct
+        self.trail_arm_pct = trail_arm_pct
+        self.trail_drop_pct = trail_drop_pct
+        self.take_profit_pct = take_profit_pct
+        self.entry_max_chg_pct = entry_max_chg_pct
+        self.entry_min_rebound_pct = entry_min_rebound_pct
+        self.entry_min_pullback_pct = entry_min_pullback_pct
         self.pool_top_n = pool_top_n
         self.ranking_fetch_n = ranking_fetch_n
 
     @property
     def display_name(self) -> str:
-        return f"코스피200·등락률+거래량 ranking·{self.stop_loss_pct}%손절"
+        return (
+            f"코스피200·등락률+거래량 ranking·트레일링({self.trail_arm_pct}%↑/"
+            f"peak−{self.trail_drop_pct}%)·{self.stop_loss_pct}%손절"
+        )
 
     # ── 종목 선정 ──────────────────────────────────────────────────────────────
 
@@ -214,12 +252,57 @@ class ShortTermStrategy:
 
     # ── 매수 트리거 ────────────────────────────────────────────────────────────
 
-    def should_buy(self, target: dict[str, Any], current_price: float) -> tuple[bool, str]:
-        """선정 자체가 매수 신호이므로, 종목이 지정된 동안에는 항상 매수 가능.
+    def should_buy(
+        self,
+        target: dict[str, Any],
+        snapshot: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """진입 게이트 — '명백히 나쁜 자리'만 거른다 (추가 API 호출 0).
 
-        실제 미보유/미매도 판단 (오늘 이미 매도했는지) 은 트레이더가 holdings + sold 플래그로 수행.
+        선정(등락률+거래량 ranking 상위)은 종목 후보일 뿐, 진입 시점에 당일 시세로
+        다음을 검사한다 (모두 통과해야 매수):
+          1. 과열 컷: 전일대비등락률 ≤ entry_max_chg_pct — 이미 폭등한 종목 추격 금지.
+          2. 반등 확인 컷: 현재가 ≥ 당일 저가 × (1 + entry_min_rebound_pct/100) — 저점에서
+             못 벗어나고 흘러내리는 종목('떨어지는 칼날') 회피. 갭하락 시작 종목도 저점에서
+             반등 중이면 통과.
+          3. (옵션) 고점 추격 컷: 현재가 ≤ 당일 고가 × (1 - entry_min_pullback_pct/100).
+
+        조건 미충족 시 매수하지 않고 다음 주기 재평가한다(슬롯·후보는 유지).
+
+        Args:
+            target: 활성 단타 슬롯 (현재 미사용 — 시그니처 일관성용).
+            snapshot: get_quote_snapshot() 결과 (현재가/시가/고가/저가/전일대비등락률(%)).
+
+        실제 미보유/미매도 판단은 트레이더가 holdings 로 수행한다.
         """
-        return True, "등락률+거래량 ranking 상위 종목 진입"
+        price = float(snapshot.get("현재가", 0) or 0)
+        if price <= 0:
+            return False, "현재가 조회 실패"
+
+        chg = float(snapshot.get("전일대비등락률(%)", 0) or 0)
+        if self.entry_max_chg_pct > 0 and chg > self.entry_max_chg_pct:
+            return False, f"과열 컷 (등락률 +{chg:.2f}% > 상한 +{self.entry_max_chg_pct}%)"
+
+        low = float(snapshot.get("저가", 0) or 0)
+        if self.entry_min_rebound_pct > 0 and low > 0:
+            rebound_floor = low * (1 + self.entry_min_rebound_pct / 100)
+            if price < rebound_floor:
+                return False, (
+                    f"반등 미달 컷 (현재가 {price:,.0f} < 당일저가 {low:,.0f} "
+                    f"+{self.entry_min_rebound_pct}% = {rebound_floor:,.0f})"
+                )
+
+        high = float(snapshot.get("고가", 0) or 0)
+        if self.entry_min_pullback_pct > 0 and high > 0:
+            threshold = high * (1 - self.entry_min_pullback_pct / 100)
+            if price > threshold:
+                return False, (
+                    f"고점 추격 컷 (현재가 {price:,.0f} > 고가 {high:,.0f} "
+                    f"−{self.entry_min_pullback_pct}% = {threshold:,.0f})"
+                )
+
+        rebound = ((price - low) / low * 100) if low > 0 else 0
+        return True, f"진입 조건 충족 (등락률 {chg:+.2f}% · 저가 대비 +{rebound:.2f}% 반등)"
 
     # ── 매도 트리거 ────────────────────────────────────────────────────────────
 
@@ -229,12 +312,42 @@ class ShortTermStrategy:
         current_price: float,
         avg_price: float | None,
     ) -> tuple[bool, str]:
-        """매수 평균가 대비 stop_loss_pct 이상 하락 시 매도."""
+        """3중 청산 — 하드 손절 / 트레일링 스탑 / (옵션) 하드 익절.
+
+        우선순위대로 검사하며, 트레일링은 진입 후 최고가(`target["peak"]`)를 기준으로 한다.
+        peak 는 트레이더가 매 주기 현재가로 갱신해 슬롯에 저장한다.
+
+        Args:
+            target: 활성 단타 슬롯. `peak`(진입 후 최고가) 필드를 참조한다.
+            current_price: 현재가.
+            avg_price: 매수 평균가.
+        """
         if not avg_price or avg_price <= 0:
             return False, ""
-        drop_pct = (avg_price - current_price) / avg_price * 100
-        if drop_pct >= self.stop_loss_pct:
-            return True, f"매수가 대비 {drop_pct:.2f}% 하락 (기준 {self.stop_loss_pct}%)"
+
+        # 1. 하드 손절 — 최악 손실 한정
+        drop_from_buy = (avg_price - current_price) / avg_price * 100
+        if drop_from_buy >= self.stop_loss_pct:
+            return True, f"손절: 매수가 대비 -{drop_from_buy:.2f}% (기준 -{self.stop_loss_pct}%)"
+
+        # 2. 트레일링 스탑 — 최고 수익이 무장 기준 도달 후, peak 대비 하락 시 청산
+        peak = float(target.get("peak") or 0) if isinstance(target, dict) else 0
+        if peak > 0:
+            peak_gain = (peak - avg_price) / avg_price * 100
+            if peak_gain >= self.trail_arm_pct:  # 무장됨
+                drop_from_peak = (peak - current_price) / peak * 100
+                if drop_from_peak >= self.trail_drop_pct:
+                    return True, (
+                        f"트레일링: 최고가 {peak:,.0f} 대비 -{drop_from_peak:.2f}% "
+                        f"(기준 -{self.trail_drop_pct}%, 최고수익 +{peak_gain:.2f}%)"
+                    )
+
+        # 3. (옵션) 하드 익절 — 트레일링에 위임 시 비활성(0)
+        if self.take_profit_pct > 0:
+            gain_from_buy = (current_price - avg_price) / avg_price * 100
+            if gain_from_buy >= self.take_profit_pct:
+                return True, f"익절: 매수가 대비 +{gain_from_buy:.2f}% (목표 +{self.take_profit_pct}%)"
+
         return False, ""
 
 
@@ -247,6 +360,10 @@ EMPTY_TARGET: dict[str, Any] = {
     "selection_reason": None,
     "auto_enabled": False,
     "last_realized_amount": None,
+    # 진입 후 최고가 — 트레일링 스탑 기준. 트레이더가 매 주기 현재가로 상향 갱신하고
+    # 매수 직후 체결가로 초기화한다. 매도/교체/재선정 시 새 슬롯에서 None 으로 리셋됨
+    # (일반 보유의 peak_prices.json 과 독립 — 서로 간섭 없음).
+    "peak": None,
     # 보유 중 활성 종목을 콤보 박스로 다른 후보로 바꾸면, 즉시 덮어쓰지 않고 여기 대기.
     # 트레이더가 이전 보유를 전량 매도한 뒤 이 후보(`find_targets()` 원형, 한글 키)로 전환한다.
     "pending_target": None,
@@ -289,6 +406,25 @@ def target_to_settings(
 def is_target_set(slot: dict[str, Any] | None) -> bool:
     """단타 활성 슬롯에 종목이 지정되어 있는지."""
     return bool(slot) and bool(slot.get("code"))
+
+
+def update_peak(slot: dict[str, Any] | None, current_price: float) -> dict[str, Any] | None:
+    """보유 중 현재가로 진입 후 최고가(peak)를 상향 갱신.
+
+    현재가가 기존 peak 보다 높으면 갱신된 새 슬롯을 반환하고, 그렇지 않으면 None 을 반환한다
+    (None 이면 트레이더가 settings 쓰기를 생략 → 불필요한 디스크 I/O 회피).
+    """
+    if not isinstance(slot, dict) or not current_price or current_price <= 0:
+        return None
+    peak = float(slot.get("peak") or 0)
+    if current_price > peak:
+        return {**slot, "peak": float(current_price)}
+    return None
+
+
+def set_peak(slot: dict[str, Any], peak: float) -> dict[str, Any]:
+    """매수 직후 peak 를 체결가로 초기화한 새 슬롯 반환."""
+    return {**slot, "peak": float(peak)}
 
 
 # ── 종목 교체(switch) 슬롯 헬퍼 ───────────────────────────────────────────────

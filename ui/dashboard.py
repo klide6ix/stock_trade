@@ -360,7 +360,10 @@ def render_short_term(market_open: bool) -> None:
         st.markdown(
             f"**등락률 순위 + 거래량 순위가 모두 상위**인 종목 최대 {SHORT_TERM_CANDIDATE_COUNT}종을 후보로 선정합니다 (rank 합산이 작을수록 우선).\n\n"
             f"- 풀: KOSPI200 시총 상위 {strategy.pool_top_n} 우선, 풀 안에 후보가 없으면 KOSPI200 전체에서 fallback.\n"
-            f"- **후보 목록에서 라디오로 1종을 선택**하고 '자동매매'를 켜면 그 종목을 시장가 매수하고 매수가 대비 **{strategy.stop_loss_pct}% 하락** 시 전량 매도.\n"
+            f"- **후보 목록에서 라디오로 1종을 선택**하고 '자동매매'를 켜면 그 종목을 매수합니다. 단 **진입 게이트**(전일대비등락률 ≤ +{strategy.entry_max_chg_pct:.0f}% 과열 컷 · 현재가 ≥ 당일 저가 +{strategy.entry_min_rebound_pct:.0f}% 반등)를 통과한 자리에서만 매수하고, 미충족 시 다음 주기 재평가.\n"
+            f"- **청산(3중)**: ① 손절 매수가 대비 **-{strategy.stop_loss_pct:.0f}%** · ② 트레일링 수익 **+{strategy.trail_arm_pct:.0f}%** 도달 후 최고가 대비 **-{strategy.trail_drop_pct:.0f}%** 하락 시 청산"
+            + (f" · ③ 익절 **+{strategy.take_profit_pct:.0f}%**" if strategy.take_profit_pct > 0 else " (익절은 트레일링에 위임)")
+            + ".\n"
             f"- **개장 직후 변동성 회피**: 후보 선정은 9시부터 하되, 실제 매수는 "
             f"**{buy_start} 이후**(개장 후 {buy_delay}분) 시작. 지연 시간은 사이드바에서 조절 가능.\n"
             f"- 매도 즉시 다음 후보로 활성 종목을 자동 지정 (직전 매도 종목 제외).\n"

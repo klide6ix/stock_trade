@@ -7,6 +7,7 @@ from config import CHECK_INTERVAL, MODE_LABEL, IS_MOCK
 from core.kis_api import (
     get_holdings,
     get_current_price,
+    get_quote_snapshot,
     sell_market_order,
     buy_market_order,
     get_cash_balance,
@@ -19,7 +20,9 @@ from core.short_term import (
     candidates_need_refresh,
     candidates_to_settings,
     has_pending,
+    set_peak,
     target_to_settings,
+    update_peak,
 )
 from core.strategy.base import BuyStrategy, SellStrategy
 
@@ -450,15 +453,24 @@ class Trader:
         name = slot.get("name") or code
 
         try:
-            current_price = get_current_price(code)
+            snapshot = get_quote_snapshot(code)
         except Exception as e:
-            log(f"[단타][{name}({code})] 가격 조회 실패: {e}")
+            log(f"[단타][{name}({code})] 시세 조회 실패: {e}")
+            return
+        current_price = snapshot.get("현재가", 0)
+        if not current_price or current_price <= 0:
+            log(f"[단타][{name}({code})] 현재가 0 — 스킵")
             return
 
         held = holdings.get(code)
 
         if held:
             avg_price = held.get("avg_price")
+            # 진입 후 최고가(peak) 상향 갱신 — 트레일링 스탑 기준. 변경 시에만 저장.
+            bumped = update_peak(slot, current_price)
+            if bumped is not None:
+                slot = bumped
+                set_setting("short_term_trade", slot)
             should_sell, reason = self.short_term_strategy.should_sell(slot, current_price, avg_price)
             if should_sell:
                 qty = held["qty"]
@@ -494,9 +506,10 @@ class Trader:
                     log(f"[단타][{name}({code})] 매도 실패: {e}")
             return
 
-        # 미보유 — 매수 진행
-        should_buy, reason = self.short_term_strategy.should_buy(slot, current_price)
+        # 미보유 — 매수 진행. 진입 게이트(과열·음봉·고점추격 컷) 미충족 시 보류.
+        should_buy, reason = self.short_term_strategy.should_buy(slot, snapshot)
         if not should_buy:
+            log(f"[단타][{name}({code})] 진입 보류 — {reason}")
             return
 
         # 개장 직후 변동성 회피 — 지연 시간 이전에는 선정만 유지하고 실매수는 보류.
@@ -541,6 +554,8 @@ class Trader:
         try:
             buy_market_order(code, qty)
             self.log_trade("buy", code, name, current_price, qty, reason=f"[단타] {reason}")
+            # 진입 후 최고가(peak)를 체결가로 초기화 — 다음 주기부터 트레일링 추적 시작.
+            set_setting("short_term_trade", set_peak(slot, current_price))
         except Exception as e:
             log(f"[단타][{name}({code})] 매수 실패: {e}")
 

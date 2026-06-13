@@ -406,6 +406,9 @@ def get_quote_snapshot(stock_code: str) -> dict:
     output = _request("GET", url, "FHKST01010100", params=params).get("output", {})
     return {
         "현재가": float(output.get("stck_prpr", 0)),
+        "시가": float(output.get("stck_oprc", 0) or 0),
+        "고가": float(output.get("stck_hgpr", 0) or 0),
+        "저가": float(output.get("stck_lwpr", 0) or 0),
         "52주최고": float(output.get("w52_hgpr", 0)),
         "52주최저": float(output.get("w52_lwpr", 0)),
         "per": float(output.get("per", 0)),
