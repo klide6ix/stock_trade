@@ -110,8 +110,11 @@
 - [x] **오래된 로그 자동 정리(보존 5일)** — `core/logger.py::cleanup_old_logs(retention_days=RETENTION_DAYS=5)` 추가. **파일명 날짜**(mtime 아님 — touch 돼도 '기록된 날' 기준 일관 판정) 기준 `(오늘 - 파일날짜).days >= 5` 인 일별 로그 삭제. 예) 오늘 6/12 → 6/7(5일 전) 이전 삭제, 6/8~6/12(5일치) 보존. 트리거 2곳: **(1) 새 일별 파일 생성 직후** — `log()` 가 당일 첫 기록(=자정 경과/당일 첫 호출)을 `is_new_file` 로 감지해 호출, **(2) 프로세스 기동 시** — `main.py` 진입부에서 1회 호출. 삭제 실패(권한·동시 삭제 race)는 무시(`OSError` catch — 로그 정리가 본 로직·거래를 막지 않음). 레거시 `trader.log` 및 무관 파일(`startup.log`)은 정규식 `trader-\d{4}-\d{2}-\d{2}\.log` 에 안 잡혀 보존. 검증: 경계(0~7일 전) 정확 삭제·5일치 보존·레거시 보존, 새 파일 생성 트리거 동작 확인
 - [x] **단타 매수·매도 조건 리팩토링 (진입 게이트 + 트레일링 청산)** — 기존 "선정 즉시 무조건 시장가 추격 매수 + 매수가 대비 -5% 손절만" 구조는 ① 진입 필터 부재로 급등 고점에 물리고 ② 익절 없이 손절 일변도라 "올라도 못 팔고 결국 -5%에서만 청산" → 기대값이 구조적으로 음수였던 문제 대응. **진입(`should_buy(target, snapshot)`)**: 선정은 후보일 뿐, 진입 시점 당일 시세로 게이트 검사 — (1) 과열 컷(전일대비등락률 ≤ `entry_max_chg_pct`=15%) (2) 반등 확인 컷(현재가 ≥ 당일 저가 × (1+`entry_min_rebound_pct`/100), 기본 +1% — 저점에서 흘러내리는 '떨어지는 칼날' 회피, 갭하락 시작 종목도 저점 반등 중이면 통과. 기존 "현재가 ≥ 시가" 기준을 교체) (3) 옵션 고점 추격 컷(`entry_min_pullback_pct`=0 비활성). 미충족 시 매수 보류·다음 주기 재평가(슬롯·후보 유지). **청산(`should_sell`)**: 3중 구조 — ① 하드 손절 매수가 대비 -`stop_loss_pct`(5%→**3%**) ② **트레일링 스탑** 수익 +`trail_arm_pct`(3%) 도달 무장 후 진입 후 최고가(peak) 대비 -`trail_drop_pct`(2%) 하락 시 청산 ③ 옵션 하드 익절(`take_profit_pct`=0 비활성, 트레일링 위임). peak 는 단타 슬롯(`short_term_trade.peak`)에 저장 — 트레이더가 매 주기 현재가로 상향 갱신(`update_peak`), 매수 직후 체결가로 초기화(`set_peak`), 매도/교체/재선정 시 `EMPTY_TARGET` 으로 자동 리셋(일반 보유 `peak_prices.json` 과 독립). **추가 API 호출 0** — `get_quote_snapshot` 에 당일 `시가/고가/저가` 필드 추가, 트레이더 단타 경로를 `get_current_price` → `get_quote_snapshot` 으로 교체(같은 `inquire-price` 1회). 대시보드 동작 안내 문구도 진입 게이트·3중 청산으로 갱신
 
+- [x] **장 전 준비(pre-market) 시간 도입 — 개장 전 매수·단타 후보 사전 선정** — 정규장은 09:00 시작이지만 장외(시간외) 거래가 8:00/8:30 부터 먼저 열리는 경우가 있어, 매매 불가하지만 조회 가능한 이 구간에 매수/매도 항목을 미리 정해두고 싶다는 요구 대응. `config.PRE_MARKET_OPEN`(기본 `"08:30"`) + `settings.json::pre_market_open_time`(사이드바 `st.time_input` 30분 단위로 변경, "HH:MM" 영속화) 도입. `core/trader.py` 에 `is_pre_market(now)`(평일 설정시각~09:00 직전) · `pre_market_open_time()` · `Trader.prepare_market_open()`(=`scan_buy_candidates` + `_prepare_short_term`, **주문 없이 조회·후보 선정만**) 추가. `run()` 메인 루프에 **장전 준비 분기** 신설 — 정규장도 모의 상시거래도 아닌 시간에 `is_pre_market` 면 하루 1회(`prep_date` 가드) 매수·단타 후보를 사전 선정하고 `did_initial_buy=False` 리셋해 개장(09:00)과 동시에 신선한 후보로 초기매수·단타 진입. 새벽(장전 시작 이전)에 기동 시엔 `prep_date=None` 으로 두어 08:30 도달 시 신선한 데이터로 재선정. 매도 측은 `fetch_price` 가 `market_open` 무관하게 실시간 조회를 시도하므로 장전에도 보유 종목 현재가·하락률(매도 예상)이 이미 표시됨. 대시보드 헤더에 `🕗 장 전 준비` 장 상태 + 안내 배너 추가
+
 ## 다음 작업 후보
 
+- [ ] 장전 준비 후보 선정 시 KIS 시간외 단일가 시세 반영 여부 점검 — 08:30~09:00 ranking/시세가 전일 종가 기준이면 개장 후 1회 재스캔 트리거 고려
 - [ ] 단타 진입/청산 파라미터 (`stop_loss_pct`, `trail_arm_pct`, `trail_drop_pct`, `take_profit_pct`, `entry_max_chg_pct`, `entry_min_rebound_pct`, `entry_min_pullback_pct`, `pool_top_n`) 사이드바 노출 + `settings.json` 영속화 (현재 모두 코드 상수)
 - [ ] 단타 트레일링/진입 게이트 실전 검증 — 진입 보류 빈도(후보 0 화) vs 고점 추격 회피 효과, 트레일링 `arm/drop` 임계값 튜닝
 - [ ] 매도 발생 시 알림 (Telegram / 카카오톡 등)
@@ -131,6 +134,7 @@
 | 가격 확인 주기 | 1분                  |
 | 매도 방식      | 시장가               |
 | 장 운영 시간   | 평일 09:00 ~ 15:30   |
+| 장 전 준비     | 평일 08:30 ~ 09:00 (조회·후보 사전 선정, 매매는 개장 후) |
 
 ---
 

@@ -3,7 +3,7 @@ import json
 import os
 from typing import Any
 
-from config import STOP_LOSS_PCT
+from config import STOP_LOSS_PCT, PRE_MARKET_OPEN
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DATA_DIR = os.path.join(_BASE_DIR, "data")
@@ -22,6 +22,7 @@ DEFAULTS: dict[str, Any] = {
     "max_holdings": 5,  # 동시 보유 종목 상한 — 초과 시 매수 스킵
     "auto_sell_enabled_codes": [],  # 자동 매도 활성화 종목 코드 (체크된 종목만 매도 실행, 미체크는 조건 충족해도 보류)
     "short_term_buy_delay_min": 10,  # 단타 실매수 지연(분) — 개장(09:00) 후 이 시간 경과 뒤 매수 시작 (0=즉시)
+    "pre_market_open_time": PRE_MARKET_OPEN,  # 장 전 준비 시작 시각("HH:MM") — 이 시각부터 매매 없이 매수·단타 후보를 미리 선정
     # 단기 매매 (단타) — 단일 종목 자동 매수/매도. ShortTermStrategy 가 자동 선정.
     # 매도 발생 시 즉시 재선정(실시간 회전)하되, 다음 매수 예산은 직전 회수 금액으로 캡해
     # 단타 자금 풀이 일반 자금으로 손실을 보충받지 않도록 한다.

@@ -3,7 +3,7 @@ import os
 import time
 from datetime import datetime, timedelta
 
-from config import CHECK_INTERVAL, MODE_LABEL, IS_MOCK
+from config import CHECK_INTERVAL, MODE_LABEL, IS_MOCK, PRE_MARKET_OPEN
 from core.kis_api import (
     get_holdings,
     get_current_price,
@@ -136,6 +136,34 @@ def is_trading_time() -> bool:
     화면 표시에는 is_market_open() 을 쓴다.
     """
     return IS_MOCK or is_market_open()
+
+
+def _parse_hhmm(value: object, default: str):
+    """'HH:MM' 문자열을 datetime.time 으로 안전하게 파싱. 실패 시 default 적용."""
+    try:
+        return datetime.strptime(str(value), "%H:%M").time()
+    except (TypeError, ValueError):
+        return datetime.strptime(default, "%H:%M").time()
+
+
+def pre_market_open_time():
+    """장 전 준비 시작 시각(datetime.time) — settings.json 의 `pre_market_open_time` 우선, 실패 시 config 기본값."""
+    return _parse_hhmm(get_setting("pre_market_open_time"), PRE_MARKET_OPEN)
+
+
+def is_pre_market(now: datetime | None = None) -> bool:
+    """장 전 준비 시간 여부 — 평일 (설정된 장전 시작 시각) ~ 정규장 개장(09:00) 직전.
+
+    이 구간에는 매매(주문)는 불가하지만 조회는 가능하므로, 매수·단타 후보를 미리
+    선정해 개장과 동시에 매매에 진입할 수 있게 한다. 장외(시간외) 거래가 8:00/8:30
+    부터 시작되는 경우에 대응하기 위한 '준비 창'.
+    """
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    market_open_t = datetime.strptime("09:00", "%H:%M").time()
+    return pre_market_open_time() <= t < market_open_t
 
 
 # 단타 실매수 지연 (분) 기본값 — 개장(09:00) 후 이 시간이 지나야 실제 시장가 매수를 시작한다.
@@ -559,6 +587,38 @@ class Trader:
         except Exception as e:
             log(f"[단타][{name}({code})] 매수 실패: {e}")
 
+    def prepare_market_open(self) -> list[dict]:
+        """장 전(또는 시작 시) 매매 없이 조회만으로 매수·단타 후보를 미리 선정.
+
+        정규장 개장(09:00) 전 '준비 창'(`is_pre_market`)이나 시작 시점에 호출해,
+        매수 후보(`scan_buy_candidates`)와 단타 후보(`_prepare_short_term`)를 함께
+        갱신한다. 실제 주문은 일절 발생하지 않으며(조회·후보 선정만), 개장 시
+        `execute_initial_buy`·`check_short_term` 이 이 결과를 그대로 사용한다.
+
+        Returns:
+            매수 실행용 primary 전략 후보 리스트 (개장 후 초기매수에 사용).
+        """
+        candidates = self.scan_buy_candidates()
+        self._prepare_short_term()
+        return candidates
+
+    def _prepare_short_term(self) -> None:
+        """단타 후보 목록·활성 슬롯을 미리 선정 (주문 없음).
+
+        `check_short_term` 의 후보 갱신 부분(`_short_term_refresh_candidates`)만 떼어내
+        매매 게이트와 무관하게 조회만으로 단타 후보를 준비한다. 내부의 일단위 날짜
+        가드(`candidates_need_refresh`)가 있어 하루 1회만 실제 재선정한다.
+        """
+        slot = get_setting("short_term_trade")
+        if not isinstance(slot, dict):
+            return
+        try:
+            holdings = get_holdings()
+        except Exception as e:
+            log(f"[장전준비][단타] 보유 종목 조회 실패: {e}")
+            return
+        self._short_term_refresh_candidates(slot, holdings)
+
     def _short_term_refresh_candidates(self, slot: dict, holdings: dict) -> dict:
         """단타 후보 목록 일단위 갱신 + 활성 슬롯 처리.
 
@@ -742,16 +802,25 @@ class Trader:
         except Exception as e:
             log(f"[초기화] 보유 종목 조회 실패: {e}")
 
-        candidates = self.scan_buy_candidates()
+        # 시작 시 매수·단타 후보를 미리 선정 (매매 없이 조회만).
+        candidates = self.prepare_market_open()
+        did_initial_buy = is_trading_time()
+        now = datetime.now()
+        # 장 전 준비를 마친 날짜 — 하루 1회만 사전 선정. 시작 시점이 장전/정규장이면
+        # 방금 prepare_market_open 으로 끝낸 셈이라 오늘 날짜로 마킹한다. 그 이전(예: 새벽)에
+        # 시작했다면 None 으로 두어, 장전 시작 시각이 되면 신선한 데이터로 다시 선정한다.
+        prep_date = now.date() if (is_trading_time() or is_pre_market(now)) else None
+
         if is_trading_time():
             self.execute_initial_buy(candidates)
+        elif is_pre_market(now):
+            log("[장전준비] 매매 없이 매수·단타 후보 사전 선정 완료 — 개장(09:00) 후 매매 시작")
         else:
             log("[초기매수] 장 운영 시간 외 - 다음 개장 후 실행")
 
-        did_initial_buy = is_trading_time()
-
         while True:
             self._sync_sell_settings()
+            now = datetime.now()
             if is_trading_time():
                 if not did_initial_buy:
                     self.execute_initial_buy(candidates)
@@ -764,6 +833,13 @@ class Trader:
                     self.check_short_term()
                 except Exception as e:
                     log(f"[단타] 처리 중 오류: {e}")
+            elif is_pre_market(now):
+                # 장 전 준비: 매매 없이 후보만 하루 1회 사전 선정. 개장 시 신선한 후보로 진입.
+                if prep_date != now.date():
+                    log(f"[장전준비] 매수·단타 후보 사전 선정 시작 (매매는 개장 후 — 현재 {now.strftime('%H:%M')})")
+                    candidates = self.prepare_market_open()
+                    prep_date = now.date()
+                    did_initial_buy = False  # 사전 선정된 후보로 개장 후 초기매수 실행
             else:
                 log("장 운영 시간 외 - 대기 중")
 

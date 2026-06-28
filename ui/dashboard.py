@@ -2,10 +2,10 @@ import json
 import os
 import pandas as pd
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, time as dtime
 from streamlit_autorefresh import st_autorefresh
 
-from config import CHECK_INTERVAL
+from config import CHECK_INTERVAL, PRE_MARKET_OPEN
 from core.kis_api import get_holdings, get_current_price, get_cash_balance
 from core.logger import current_log_file, latest_log_file
 from core.short_term import (
@@ -17,7 +17,7 @@ from core.short_term import (
     request_switch,
     target_to_settings,
 )
-from core.trader import is_market_open, is_trading_time, plan_initial_buy, BUY_CANDIDATES_FILE, TRADE_HISTORY_FILE
+from core.trader import is_market_open, is_trading_time, is_pre_market, pre_market_open_time, plan_initial_buy, BUY_CANDIDATES_FILE, TRADE_HISTORY_FILE
 from core.strategy._activate import (
     primary_buy_strategy,
     view_buy_strategies,
@@ -152,12 +152,24 @@ def render_header(market_open: bool, buy_strategy_label: str, sell_strategy_labe
     st.divider()
 
     real_open = is_market_open()
+    pre_market = is_pre_market()
 
     if not market_open:
-        st.info("⏸ 장 운영 시간 외입니다. 보유 종목과 마지막 가격 기준으로 표시합니다.")
+        if pre_market:
+            st.info(
+                f"🕗 장 전 준비 시간입니다 ({pre_market_open_time().strftime('%H:%M')}~09:00). "
+                "매매는 개장(09:00) 후 시작되며, 지금은 매수·단타 후보를 미리 선정합니다."
+            )
+        else:
+            st.info("⏸ 장 운영 시간 외입니다. 보유 종목과 마지막 가격 기준으로 표시합니다.")
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    market_status = "🟢 운영 중" if real_open else "🔴 마감"
+    if real_open:
+        market_status = "🟢 운영 중"
+    elif pre_market:
+        market_status = "🕗 장 전 준비"
+    else:
+        market_status = "🔴 마감"
     c1.metric("장 상태", market_status)
     c2.metric("매수 전략", buy_strategy_label)
     c3.metric("매도 전략", sell_strategy_label)
@@ -866,6 +878,14 @@ def render_log() -> None:
     st.code("".join(lines[-50:]), language=None)
 
 
+def _parse_time_setting(value: object, default: str) -> dtime:
+    """'HH:MM' 문자열을 datetime.time 으로 안전하게 파싱. 실패 시 default 적용."""
+    try:
+        return datetime.strptime(str(value), "%H:%M").time()
+    except (TypeError, ValueError):
+        return datetime.strptime(default, "%H:%M").time()
+
+
 def _init_sidebar_state(settings: dict) -> None:
     """settings.json 의 값을 session_state 로 1회 시드.
 
@@ -918,6 +938,9 @@ def _init_sidebar_state(settings: dict) -> None:
     st.session_state.stop_loss_input = float(settings.get("stop_loss_pct", 10.0))
     st.session_state.max_holdings_input = max_holdings_val
     st.session_state.short_term_buy_delay_input = buy_delay_val
+    st.session_state.pre_market_open_input = _parse_time_setting(
+        settings.get("pre_market_open_time"), PRE_MARKET_OPEN
+    )
     st.session_state.auto_refresh_toggle = bool(settings.get("auto_refresh", True))
     st.session_state.refresh_interval_slider = int(settings.get("refresh_interval", 60))
     st.session_state._sidebar_initialized = True
@@ -956,6 +979,13 @@ def _on_max_holdings_change() -> None:
 
 def _on_short_term_buy_delay_change() -> None:
     set_setting("short_term_buy_delay_min", int(st.session_state.short_term_buy_delay_input))
+
+
+def _on_pre_market_open_change() -> None:
+    """장 전 준비 시작 시각을 'HH:MM' 문자열로 영속화 (time_input 은 time 객체 반환)."""
+    value = st.session_state.pre_market_open_input
+    if isinstance(value, dtime):
+        set_setting("pre_market_open_time", value.strftime("%H:%M"))
 
 
 def _on_auto_refresh_change() -> None:
@@ -1051,6 +1081,16 @@ def render_sidebar() -> tuple[bool, int, str, str, float]:
             )
         else:
             st.caption("ℹ️ 보유 종목 테이블의 '최고가/하락률' 컬럼은 참고용으로만 표시됩니다.")
+
+        st.divider()
+        st.subheader("🕗 장 전 준비")
+        st.time_input(
+            "장 전 준비 시작 시각",
+            step=1800,  # 30분 단위
+            key="pre_market_open_input",
+            on_change=_on_pre_market_open_change,
+            help="이 시각부터 개장(09:00) 전까지, 매매 없이 매수·단타 후보를 미리 선정합니다. 장외 거래가 8:00/8:30 부터 시작되는 경우 대응.",
+        )
 
         st.divider()
         st.subheader("🎯 단기 매매")
