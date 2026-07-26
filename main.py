@@ -3,8 +3,7 @@ import sys
 import threading
 
 from core.logger import cleanup_old_logs
-from core.short_term import ShortTermStrategy
-from core.trader import Trader
+from core.trader import Trader, build_short_term_strategy
 from core.strategy._activate import (
     primary_buy_strategy,
     view_buy_strategies,
@@ -26,6 +25,6 @@ if __name__ == "__main__":
         buy_strategy=primary_buy_strategy(),
         sell_strategy=primary_sell_strategy(),
         view_strategies=view_buy_strategies(),
-        short_term_strategy=ShortTermStrategy(),
+        short_term_strategy=build_short_term_strategy(),
     )
     trader.run()

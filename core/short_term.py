@@ -1,106 +1,117 @@
-"""단기간 매매 (단타) 전략 — 코스피200 근사 풀에서 등락률+거래량 ranking 결합 상위 N종 후보.
+"""일 단위 단기 매매 (단타) — 장 전 시장 방향 판정 → 지수/인버스 ETF 1종 자동 매매.
 
-선정 흐름 (KIS API 3회 호출, 일봉 조회 없음 — 즉시 완료):
-  1. 시가총액 상위 N (default 100) → 코스피200 근사 풀. KIS API 에 코스피200 직접 조회가 없어
-     시총으로 근사한다 (한국시장 시총 상위 100 ≒ 코스피 대형주 핵심).
-  2. KIS 등락률 ranking (`ranking/fluctuation`) → 시총 풀 ∩ 등락률 양수 종목.
-  3. KIS 거래량 ranking (`quotations/volume-rank`) → 시총 풀 ∩ 거래량 상위 종목.
-  4. 두 ranking 모두에 등장하는 종목 → ranking 합산이 작을수록(=양쪽에서 상위) 상위. 상위 N종 후보.
+전략 요약
+  1. **장 전 준비(개장 30분 전)** 에 `market_direction.judge_direction()` 으로 오늘 시장이
+     오를지 내릴지 판정한다 (지수 프록시 일봉 추세 + 장전 예상체결가).
+  2. 상승이면 코스피200 정방향 ETF, 하락이면 인버스 ETF 를 후보로 세운다. 1순위 ETF 를
+     일반 매수 슬롯이 이미 보유 중이면 같은 지수를 추종하는 **대체 ETF** 로 자동 회피한다.
+  3. **개장(09:00) 과 동시에 시장가 매수**한다 (지연은 사이드바에서 조절 가능, 기본 0분).
+  4. 청산은 아래 4가지 — 먼저 충족되는 것으로 나간다.
+       ① 손절: 매수가 대비 -stop_loss_pct (기본 5%)
+       ② 최고가 청산: 매수 이후 최고가 대비 -peak_drop_pct (기본 5%)
+       ③ 보유기간 만료: 매수 다음 거래일 개장 시 전량 청산 → 그날 방향으로 재진입
+       ④ (옵션) 당일 마감 강제청산: `close_at_market_end` ON 이면 15:15 전량 청산
 
-매매 모델: 후보 최대 N종(`SHORT_TERM_CANDIDATE_COUNT`)을 선정해 대시보드 콤보 박스로 1종을 골라
-자동매매(매수/매도)한다. 실제 거래는 한 번에 1종(활성 슬롯)만 진행.
-매도 기준: 매수 평균가 대비 stop_loss_pct (default 5%) 이상 하락.
-초기화 단위: 일단위. 후보 목록의 selected_at 날짜가 오늘과 다르면 트레이더가 후보를 재선정.
+왜 ETF 인가: 개별주는 하루 안에 종목 고유 악재(실적·공시·수급)가 터질 수 있지만, 지수
+ETF 는 '오늘 시장이 오르냐 내리냐' 라는 단일 베팅으로 리스크가 단순화된다. 하락장에서도
+인버스로 같은 논리를 그대로 적용할 수 있어 방향에 관계없이 전략이 성립한다.
 
-설계 의도: 이전 "N일 연속 상승" 조건은 시총 상위에서 통과 종목이 0개로 떨어지는 경우가 잦아 폐기.
-ranking 결합 방식은 한국 시장에서 안정적으로 후보를 산출하면서도 모멘텀(등락률) + 유동성(거래량)
-양쪽을 동시에 반영해 단타 적합 종목을 골라낸다.
+자체 원장(ledger) — 일반 매수 슬롯과의 분리
+  증권사 잔고는 같은 종목코드를 하나의 평균단가로 합쳐서 보여준다. 일반 매수로 KODEX 200
+  을 들고 있는데 단기 매매가 또 KODEX 200 을 사면 평단이 섞여 **양쪽 수익률이 모두 왜곡**된다.
+  그래서 단기 매매 슬롯은 자기 진입가·수량·진입시각·최고가를 `settings.json` 에 직접 기록하고
+  (`entry_price`/`qty`/`entry_at`/`peak`), 손익 판단과 매도 수량을 전부 이 원장 기준으로 한다.
+  트레이더는 일반 매도 루프에서 원장 수량만큼을 잔고에서 차감해(`split_holdings`) 일반 슬롯이
+  단기 매매 물량을 건드리지 못하게 한다. 종목 겹침 자체는 대체 ETF 로 우선 회피한다.
 """
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any
+from datetime import date, datetime
+from typing import Any, NamedTuple
 
-from core.kis_api import (
-    get_fluctuation_rank,
-    get_market_cap_rank,
-    get_volume_rank,
+from core.etf_universe import (
+    DIRECTION_DOWN,
+    DIRECTION_NEUTRAL,
+    DIRECTION_UP,
+    INDEX_PROXY,
+    EtfSpec,
+    direction_of,
+    pick_etfs,
 )
+from core.kis_api import get_quote_snapshot
 from core.logger import log
+from core.market_direction import direction_label, judge_direction
 
-# 단타 후보 최대 종목 수 — 대시보드 콤보 박스에 노출할 후보 개수.
-SHORT_TERM_CANDIDATE_COUNT = 5
+# 대시보드에 노출할 후보 ETF 최대 개수 (같은 방향의 대체 ETF 포함).
+SHORT_TERM_CANDIDATE_COUNT = 3
 
+# 당일 마감 강제청산 시각 — 종가 동시호가(15:20) 진입 전에 시장가로 정리한다.
+FORCE_CLOSE_TIME = "15:15"
 
-def select_kospi200_universe(top_n: int = 200, market: str = "kospi200") -> list[dict]:
-    """코스피200 시총 상위 풀.
-
-    KIS ranking API 의 `FID_INPUT_ISCD=2001` (KOSPI200 지수 구성종목) 으로 직접 조회.
-    실 응답 검증 완료 — KIS 가 KOSPI200 구성종목만 정확히 반환한다.
-    """
-    return get_market_cap_rank(top_n=top_n, market=market)
+# 정규장 개장 시각 — 보유기간 만료 청산은 개장 이후에만 판정한다.
+MARKET_OPEN_TIME = "09:00"
 
 
-class ShortTermStrategy:
-    """단기 매매 (단타) — 코스피200 근사 풀에서 등락률+거래량 ranking 결합으로 1종목 선정.
+# ── 청산 사유 ─────────────────────────────────────────────────────────────────
+SELL_STOP_LOSS = "stop_loss"
+SELL_PEAK_DROP = "peak_drop"
+SELL_HOLDING_PERIOD = "holding_period"
+SELL_MARKET_END = "market_end"
 
-    진입(매수)·청산(매도) 철학:
-      단타에서 진입 타이밍을 완벽히 맞추려 필터를 빡빡하게 걸면 후보가 0개로 떨어진다.
-      따라서 진입은 '명백히 나쁜 자리'만 가볍게 거르고(추가 API 호출 0 — 매 주기 조회하는
-      현재가 snapshot 의 당일 OHLC·등락률만 사용), 리스크는 청산(트레일링+손절)으로 관리한다.
+# 청산 후 **같은 날 재진입을 허용**하는 사유. 보유기간 만료는 '어제 포지션을 정리하고
+# 오늘 방향으로 새로 들어간다' 는 정상 회전이므로 재진입한다. 반대로 손절·최고가 청산은
+# 오늘 판단이 틀렸다는 신호라 같은 날 다시 들어가지 않는다(재진입 차단 → 다음 거래일 재개).
+REENTRY_ALLOWED_KINDS = {SELL_HOLDING_PERIOD}
 
-      청산은 트레일링 스탑 중심의 3중 구조:
-        1. 하드 손절 — 매수가 대비 -stop_loss_pct
-        2. 트레일링 스탑 — 수익이 trail_arm_pct 도달해 '무장'된 뒤, 진입 후 최고가(peak) 대비
-           -trail_drop_pct 하락 시 청산. "올라도 못 파는" 문제(손절 일변도)의 핵심 해결책.
-        3. (옵션) 하드 익절 — 매수가 대비 +take_profit_pct (default 0 = 비활성, 트레일링에 위임)
+
+class SellDecision(NamedTuple):
+    sell: bool
+    reason: str = ""
+    kind: str = ""
+
+    @property
+    def allows_reentry_today(self) -> bool:
+        return self.kind in REENTRY_ALLOWED_KINDS
+
+
+def _parse_time(value: str):
+    return datetime.strptime(value, "%H:%M").time()
+
+
+class EtfDayTradeStrategy:
+    """일 단위 ETF 방향 매매 — 상승이면 지수 ETF, 하락이면 인버스 ETF.
 
     Args:
-        stop_loss_pct: 매수 평균가 대비 손절 발동 하락률 % (default 3.0).
-        trail_arm_pct: 트레일링 무장(arm) 수익률 % — 최고 수익이 이 값에 도달해야 트레일링
-            청산이 활성화된다 (default 3.0). 진입 직후 잔파동에 트레일링이 즉시 발동하는 것 방지.
-        trail_drop_pct: 무장 후 진입 후 최고가(peak) 대비 이만큼 하락 시 청산 % (default 2.0).
-        take_profit_pct: 하드 익절 목표 % (default 0.0 = 비활성, 트레일링에 위임).
-        entry_max_chg_pct: 진입 허용 전일대비등락률 상한 % (default 15.0). 이미 폭등한 종목
-            추격 금지. 0 이면 비활성.
-        entry_min_rebound_pct: 당일 저가 대비 최소 반등 % (default 1.0). 현재가가 당일 최저점에서
-            이만큼 올라온 종목만 진입 — 저점에서 못 벗어나고 흘러내리는 종목('떨어지는 칼날') 회피.
-            "현재가 ≥ 시가" 기준 대신 "저점 대비 반등" 으로 보아, 갭하락으로 시작했어도 저점에서
-            반등 중인 종목을 놓치지 않는다. 0 이면 비활성.
-        entry_min_pullback_pct: 진입 시 당일 고가 대비 최소 눌림 % (default 0.0 = 비활성). >0 이면
-            현재가가 고가에서 이만큼 빠진 자리에서만 진입(꼭지 추격 회피). 단 떨어지는 칼날 위험.
-        pool_top_n: 시총 상위 종목 수 = 코스피200 근사 풀 크기 (default 100).
-        ranking_fetch_n: 각 ranking API 의 응답 종목 수 상한 (default 100). KIS 응답 한도가
-            실제 적용되므로 큰 값을 주어도 KIS 가 주는 만큼만 받음.
+        stop_loss_pct: 매수가 대비 손절 하락률 % (기본 5.0).
+        peak_drop_pct: 매수 이후 최고가 대비 청산 하락률 % (기본 5.0).
+        hold_days: 보유 기간(일). 진입일 + 이 일수가 지난 거래일 개장 시 청산 (기본 1).
+        close_at_market_end: True 면 당일 `FORCE_CLOSE_TIME` 에 전량 청산 (오버나이트 미보유).
+        neutral_band: |방향 점수| 가 이 값 이하이면 중립 → 당일 진입 보류 (기본 0 = 항상 진입).
+        proxy: 방향 판정에 쓸 지수 프록시 ETF.
     """
 
     def __init__(
         self,
-        stop_loss_pct: float = 3.0,
-        trail_arm_pct: float = 3.0,
-        trail_drop_pct: float = 2.0,
-        take_profit_pct: float = 0.0,
-        entry_max_chg_pct: float = 15.0,
-        entry_min_rebound_pct: float = 1.0,
-        entry_min_pullback_pct: float = 0.0,
-        pool_top_n: int = 100,
-        ranking_fetch_n: int = 100,
+        stop_loss_pct: float = 5.0,
+        peak_drop_pct: float = 5.0,
+        hold_days: int = 1,
+        close_at_market_end: bool = False,
+        neutral_band: float = 0.0,
+        proxy: EtfSpec = INDEX_PROXY,
     ) -> None:
         self.stop_loss_pct = stop_loss_pct
-        self.trail_arm_pct = trail_arm_pct
-        self.trail_drop_pct = trail_drop_pct
-        self.take_profit_pct = take_profit_pct
-        self.entry_max_chg_pct = entry_max_chg_pct
-        self.entry_min_rebound_pct = entry_min_rebound_pct
-        self.entry_min_pullback_pct = entry_min_pullback_pct
-        self.pool_top_n = pool_top_n
-        self.ranking_fetch_n = ranking_fetch_n
+        self.peak_drop_pct = peak_drop_pct
+        self.hold_days = max(0, int(hold_days))
+        self.close_at_market_end = close_at_market_end
+        self.neutral_band = neutral_band
+        self.proxy = proxy
 
     @property
     def display_name(self) -> str:
+        hold = "당일 마감 청산" if self.close_at_market_end else f"{self.hold_days}일 보유"
         return (
-            f"코스피200·등락률+거래량 ranking·트레일링({self.trail_arm_pct}%↑/"
-            f"peak−{self.trail_drop_pct}%)·{self.stop_loss_pct}%손절"
+            f"지수/인버스 ETF 방향매매 · {hold} · "
+            f"손절 -{self.stop_loss_pct:g}% · 최고가 -{self.peak_drop_pct:g}%"
         )
 
     # ── 종목 선정 ──────────────────────────────────────────────────────────────
@@ -109,146 +120,77 @@ class ShortTermStrategy:
         self,
         n: int = SHORT_TERM_CANDIDATE_COUNT,
         exclude_codes: set[str] | None = None,
-    ) -> list[dict[str, Any]]:
-        """등락률 ranking + 거래량 ranking 결합으로 상위 n종 후보 선정.
-
-        호출 수: 3회 (시총 / 등락률 / 거래량). 일봉 조회 없음 → 즉시 완료.
+        now: datetime | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """시장 방향을 판정하고 그 방향의 ETF 후보를 우선순위대로 반환.
 
         Args:
-            n: 반환할 최대 후보 수 (rank 합산 오름차순 상위 n종).
-            exclude_codes: 후보에서 제외할 종목코드 집합. 매도 직후 같은 종목이 다시 선정되는
-                것을 방지하기 위해 트레이더가 직전 매도 종목을 전달한다. None 이면 제외 없음.
+            n: 최대 후보 수 (1순위 + 대체 ETF).
+            exclude_codes: 일반 매수 슬롯이 보유 중이라 평단 혼입을 피해야 하는 종목코드.
+            now: 판정 기준 시각 (테스트 주입용).
 
         Returns:
-            각 후보 dict — `종목코드`/`종목명`/`현재가`/`등락률(%)`/`거래량`/`등락률순위`/
-            `거래량순위`/`선정사유`. 후보가 없으면 빈 리스트.
+            (후보 리스트, 방향 판정 결과). 중립 판정이거나 가용 ETF 가 없으면 후보는 빈 리스트.
 
-        시총 풀 fallback: 시총 풀 ∩ ranking 교집합이 비면 두 ranking 의 KOSPI200 전체
-        교집합으로 fallback 한다. 사용자에게는 선정 사유에 풀 종류를 명시.
+        호출 수: 방향 판정 2회 + 후보 ETF 수만큼 시세 조회 (기본 최대 3회) ≈ 5회.
         """
-        exclude = set(exclude_codes) if exclude_codes else set()
-        # 세 ranking 모두 KOSPI200 구성종목만 조회 (`FID_INPUT_ISCD=2001`).
-        # KIS 가 KOSPI200 지수 구성종목 한정으로 정확히 응답하는 것을 실 호출 검증 완료.
-        # 거래량 ranking 도 KOSDAQ 저가 소형주가 사라지고 KOSPI200 대형주만 들어와
-        # 시총 풀과의 교집합이 자연스럽게 확보된다.
-        pool = select_kospi200_universe(top_n=self.pool_top_n, market="kospi200")
-        cap_codes: set[str] = {item["종목코드"] for item in pool}
+        now = now or datetime.now()
+        verdict = judge_direction(self.proxy, neutral_band=self.neutral_band, now=now)
+        direction = verdict["direction"]
 
-        try:
-            fluct = get_fluctuation_rank(top_n=self.ranking_fetch_n, market="kospi200")
-        except Exception as e:
-            log(f"[단타] 등락률 ranking 조회 실패: {e}")
-            return None
-        try:
-            volume = get_volume_rank(top_n=self.ranking_fetch_n, market="kospi200")
-        except Exception as e:
-            log(f"[단타] 거래량 ranking 조회 실패: {e}")
-            return None
+        if direction == DIRECTION_NEUTRAL:
+            log(f"[단기매매] 방향 중립 — 진입 보류 ({verdict['summary']})")
+            return [], verdict
 
-        # 등락률 ranking — 양봉만 인덱싱 (시총 풀과 무관하게 모든 응답).
-        fluct_rank: dict[str, dict] = {}
-        for i, item in enumerate(fluct, start=1):
-            code = item["종목코드"]
-            chg_pct = float(item.get("등락률(%)", 0) or 0)
-            if not code or chg_pct <= 0:
-                continue
-            fluct_rank[code] = {
-                "rank": i,
-                "chg_pct": chg_pct,
-                "name": item.get("종목명", ""),
-                "price": float(item.get("현재가", 0) or 0),
-            }
+        specs = pick_etfs(direction, exclude_codes=exclude_codes, limit=max(1, n))
+        if not specs:
+            log(
+                f"[단기매매] {direction_label(direction)} 판정이나 매수 가능한 ETF 없음 "
+                f"(제외 {sorted(exclude_codes or ())})"
+            )
+            return [], verdict
 
-        # 거래량 ranking — 모든 응답 인덱싱 (시총 풀과 무관).
-        volume_rank: dict[str, dict] = {}
-        for i, item in enumerate(volume, start=1):
-            code = item["종목코드"]
-            if not code:
-                continue
-            volume_rank[code] = {
-                "rank": i,
-                "volume": int(item.get("거래량", 0) or 0),
-                "name": item.get("종목명", ""),
-                "price": float(item.get("현재가", 0) or 0),
-            }
-
-        # 1단계: 두 ranking 의 시장 전체 교집합 — 제외 종목 컷
-        market_intersect = (set(fluct_rank) & set(volume_rank)) - exclude
-        # 2단계: 시총 풀 ∩ ranking 교집합 (primary 후보)
-        cap_intersect = market_intersect & cap_codes
-
-        if cap_intersect:
-            selected = cap_intersect
-            scope = "KOSPI200 시총상위"
-        elif market_intersect:
-            selected = market_intersect
-            scope = "KOSPI200 전체(시총 풀 fallback)"
-        else:
-            selected = set()
-            scope = "(없음)"
-
-        log(
-            f"[단타] 시총 {len(cap_codes)} / 양봉등락률 {len(fluct_rank)} / "
-            f"거래량 {len(volume_rank)} / 시장교집합 {len(market_intersect)} / "
-            f"시총교집합 {len(cap_intersect)} → '{scope}' {len(selected)}종목 평가"
-        )
-
-        if not selected:
-            log("[단타] 두 ranking 모두 등장한 종목 자체가 없음")
-            return []
-
-        ranked: list[dict] = []
-        for code in selected:
-            fr = fluct_rank[code]
-            vr = volume_rank[code]
-            # 종목명/현재가는 두 ranking 응답 중 채워진 쪽 우선
-            name = fr["name"] or vr["name"]
-            price = fr["price"] or vr["price"]
-            ranked.append({
-                "종목코드": code,
-                "종목명": name,
-                "현재가": price,
-                "등락률(%)": round(fr["chg_pct"], 2),
-                "거래량": vr["volume"],
-                "등락률순위": fr["rank"],
-                "거래량순위": vr["rank"],
-                "rank_sum": fr["rank"] + vr["rank"],
-                "in_kospi": code in cap_codes,
-            })
-        ranked.sort(key=lambda c: c["rank_sum"])
-        top = ranked[: max(1, n)]
-
+        score = verdict["score"]
+        signal_score = round(abs(score) * 100, 1)
         candidates: list[dict[str, Any]] = []
-        for c in top:
-            in_kospi_label = "KOSPI200 시총상위" if c["in_kospi"] else "KOSPI200"
+
+        for rank, spec in enumerate(specs, start=1):
+            try:
+                snap = get_quote_snapshot(spec.code)
+            except Exception as e:
+                log(f"[단기매매] {spec.name}({spec.code}) 시세 조회 실패 — 후보 제외: {e}")
+                continue
+            price = float(snap.get("현재가", 0) or 0)
+            if price <= 0:
+                log(f"[단기매매] {spec.name}({spec.code}) 현재가 0 — 후보 제외")
+                continue
+
+            alt = "" if rank == 1 else " · 대체 ETF"
             candidates.append({
-                "종목코드": c["종목코드"],
-                "종목명": c["종목명"],
-                "현재가": c["현재가"],
-                "등락률(%)": c["등락률(%)"],
-                "거래량": c["거래량"],
-                "등락률순위": c["등락률순위"],
-                "거래량순위": c["거래량순위"],
+                "종목코드": spec.code,
+                "종목명": spec.name,
+                "현재가": price,
+                "등락률(%)": round(float(snap.get("전일대비등락률(%)", 0) or 0), 2),
+                "방향": direction,
+                "방향라벨": direction_label(direction),
+                "시그널점수": signal_score,
+                "우선순위": rank,
                 "선정사유": (
-                    f"등락률 {c['등락률순위']}위 · 거래량 {c['거래량순위']}위 · "
-                    f"+{c['등락률(%)']:.2f}% · {in_kospi_label}"
+                    f"{direction_label(direction)} 판정 (점수 {score:+.2f}) · "
+                    f"{spec.note}{alt} · {verdict['summary']}"
                 ),
             })
 
+        if not candidates:
+            log("[단기매매] 방향은 정해졌으나 시세 조회 가능한 ETF 가 없음")
+            return [], verdict
+
         names = ", ".join(f"{c['종목명']}({c['종목코드']})" for c in candidates)
-        log(f"[단타] ranking 결합 후보 {len(ranked)}개 평가 → 상위 {len(candidates)}종 선정: {names}")
-        return candidates
-
-    def find_target(
-        self,
-        exclude_codes: set[str] | None = None,
-    ) -> dict[str, Any] | None:
-        """상위 1종만 선정 (find_targets 의 단일 종목 wrapper). 후보 없으면 None.
-
-        매도 직후 다음 활성 종목을 자동 지정할 때처럼 단일 결과만 필요한 경우 사용.
-        """
-        items = self.find_targets(n=1, exclude_codes=exclude_codes)
-        return items[0] if items else None
+        log(
+            f"[단기매매] {direction_label(direction)} → ETF 후보 {len(candidates)}종: {names} "
+            f"(방향 점수 {score:+.3f})"
+        )
+        return candidates, verdict
 
     # ── 매수 트리거 ────────────────────────────────────────────────────────────
 
@@ -257,162 +199,264 @@ class ShortTermStrategy:
         target: dict[str, Any],
         snapshot: dict[str, Any],
     ) -> tuple[bool, str]:
-        """진입 게이트 — '명백히 나쁜 자리'만 거른다 (추가 API 호출 0).
+        """진입 판정 — 방향 판정이 곧 진입 신호이므로 시세 유효성만 확인한다.
 
-        선정(등락률+거래량 ranking 상위)은 종목 후보일 뿐, 진입 시점에 당일 시세로
-        다음을 검사한다 (모두 통과해야 매수):
-          1. 과열 컷: 전일대비등락률 ≤ entry_max_chg_pct — 이미 폭등한 종목 추격 금지.
-          2. 반등 확인 컷: 현재가 ≥ 당일 저가 × (1 + entry_min_rebound_pct/100) — 저점에서
-             못 벗어나고 흘러내리는 종목('떨어지는 칼날') 회피. 갭하락 시작 종목도 저점에서
-             반등 중이면 통과.
-          3. (옵션) 고점 추격 컷: 현재가 ≤ 당일 고가 × (1 - entry_min_pullback_pct/100).
-
-        조건 미충족 시 매수하지 않고 다음 주기 재평가한다(슬롯·후보는 유지).
+        개별주 단타처럼 과열·눌림 게이트를 두지 않는 이유: 이 전략의 전제는 '장 전에 정한
+        방향대로 개장과 함께 들어간다' 이고, 진입 시점에 추가 필터를 걸면 방향이 맞은 날
+        오히려 못 들어가는 경우가 생긴다. 리스크는 진입이 아니라 청산(-5% 손절 / 최고가
+        -5% / 1일 보유)에서 관리한다.
 
         Args:
-            target: 활성 단타 슬롯 (현재 미사용 — 시그니처 일관성용).
-            snapshot: get_quote_snapshot() 결과 (현재가/시가/고가/저가/전일대비등락률(%)).
-
-        실제 미보유/미매도 판단은 트레이더가 holdings 로 수행한다.
+            target: 활성 단기 매매 슬롯.
+            snapshot: `get_quote_snapshot()` 결과.
         """
         price = float(snapshot.get("현재가", 0) or 0)
         if price <= 0:
             return False, "현재가 조회 실패"
 
-        chg = float(snapshot.get("전일대비등락률(%)", 0) or 0)
-        if self.entry_max_chg_pct > 0 and chg > self.entry_max_chg_pct:
-            return False, f"과열 컷 (등락률 +{chg:.2f}% > 상한 +{self.entry_max_chg_pct}%)"
-
-        low = float(snapshot.get("저가", 0) or 0)
-        if self.entry_min_rebound_pct > 0 and low > 0:
-            rebound_floor = low * (1 + self.entry_min_rebound_pct / 100)
-            if price < rebound_floor:
-                return False, (
-                    f"반등 미달 컷 (현재가 {price:,.0f} < 당일저가 {low:,.0f} "
-                    f"+{self.entry_min_rebound_pct}% = {rebound_floor:,.0f})"
-                )
-
-        high = float(snapshot.get("고가", 0) or 0)
-        if self.entry_min_pullback_pct > 0 and high > 0:
-            threshold = high * (1 - self.entry_min_pullback_pct / 100)
-            if price > threshold:
-                return False, (
-                    f"고점 추격 컷 (현재가 {price:,.0f} > 고가 {high:,.0f} "
-                    f"−{self.entry_min_pullback_pct}% = {threshold:,.0f})"
-                )
-
-        rebound = ((price - low) / low * 100) if low > 0 else 0
-        return True, f"진입 조건 충족 (등락률 {chg:+.2f}% · 저가 대비 +{rebound:.2f}% 반등)"
+        code = target.get("code") or ""
+        direction = direction_of(code)
+        label = {
+            DIRECTION_UP: "지수 추종 ETF",
+            DIRECTION_DOWN: "인버스 ETF",
+        }.get(direction, "ETF")
+        return True, f"{label} 진입 (현재가 {price:,.0f}원)"
 
     # ── 매도 트리거 ────────────────────────────────────────────────────────────
 
     def should_sell(
         self,
-        target: dict[str, Any],
+        slot: dict[str, Any],
         current_price: float,
-        avg_price: float | None,
-    ) -> tuple[bool, str]:
-        """3중 청산 — 하드 손절 / 트레일링 스탑 / (옵션) 하드 익절.
+        now: datetime | None = None,
+    ) -> SellDecision:
+        """4중 청산 판정 — 손절 / 최고가 하락 / 보유기간 만료 / (옵션) 마감 강제청산.
 
-        우선순위대로 검사하며, 트레일링은 진입 후 최고가(`target["peak"]`)를 기준으로 한다.
-        peak 는 트레이더가 매 주기 현재가로 갱신해 슬롯에 저장한다.
+        모두 **자체 원장의 진입가**(`slot["entry_price"]`) 기준이다. 증권사 평균단가는
+        같은 종목을 일반 매수로도 들고 있으면 섞이므로 쓰지 않는다.
 
         Args:
-            target: 활성 단타 슬롯. `peak`(진입 후 최고가) 필드를 참조한다.
+            slot: 활성 단기 매매 슬롯 (entry_price / entry_at / peak 참조).
             current_price: 현재가.
-            avg_price: 매수 평균가.
+            now: 판정 기준 시각 (테스트 주입용).
         """
-        if not avg_price or avg_price <= 0:
-            return False, ""
+        now = now or datetime.now()
+        entry = entry_price(slot)
+        if not entry or entry <= 0 or current_price <= 0:
+            return SellDecision(False)
 
-        # 1. 하드 손절 — 최악 손실 한정
-        drop_from_buy = (avg_price - current_price) / avg_price * 100
-        if drop_from_buy >= self.stop_loss_pct:
-            return True, f"손절: 매수가 대비 -{drop_from_buy:.2f}% (기준 -{self.stop_loss_pct}%)"
+        # 1. 하드 손절 — 매수가 대비 하락
+        drop_from_entry = (entry - current_price) / entry * 100
+        if drop_from_entry >= self.stop_loss_pct:
+            return SellDecision(
+                True,
+                f"손절: 매수가 {entry:,.0f}원 대비 -{drop_from_entry:.2f}% "
+                f"(기준 -{self.stop_loss_pct:g}%)",
+                SELL_STOP_LOSS,
+            )
 
-        # 2. 트레일링 스탑 — 최고 수익이 무장 기준 도달 후, peak 대비 하락 시 청산
-        peak = float(target.get("peak") or 0) if isinstance(target, dict) else 0
+        # 2. 최고가 대비 하락 — 매수 이후 고점에서 되밀린 폭
+        peak = float(slot.get("peak") or 0)
         if peak > 0:
-            peak_gain = (peak - avg_price) / avg_price * 100
-            if peak_gain >= self.trail_arm_pct:  # 무장됨
-                drop_from_peak = (peak - current_price) / peak * 100
-                if drop_from_peak >= self.trail_drop_pct:
-                    return True, (
-                        f"트레일링: 최고가 {peak:,.0f} 대비 -{drop_from_peak:.2f}% "
-                        f"(기준 -{self.trail_drop_pct}%, 최고수익 +{peak_gain:.2f}%)"
-                    )
+            drop_from_peak = (peak - current_price) / peak * 100
+            if drop_from_peak >= self.peak_drop_pct:
+                return SellDecision(
+                    True,
+                    f"최고가 청산: 최고가 {peak:,.0f}원 대비 -{drop_from_peak:.2f}% "
+                    f"(기준 -{self.peak_drop_pct:g}%)",
+                    SELL_PEAK_DROP,
+                )
 
-        # 3. (옵션) 하드 익절 — 트레일링에 위임 시 비활성(0)
-        if self.take_profit_pct > 0:
-            gain_from_buy = (current_price - avg_price) / avg_price * 100
-            if gain_from_buy >= self.take_profit_pct:
-                return True, f"익절: 매수가 대비 +{gain_from_buy:.2f}% (목표 +{self.take_profit_pct}%)"
+        # 3. 당일 마감 강제청산 (옵션) — 오버나이트 갭 리스크 회피
+        if self.close_at_market_end and now.time() >= _parse_time(FORCE_CLOSE_TIME):
+            return SellDecision(
+                True,
+                f"마감 강제청산 ({FORCE_CLOSE_TIME} 경과, 오버나이트 미보유 설정)",
+                SELL_MARKET_END,
+            )
 
-        return False, ""
+        # 4. 보유기간 만료 — 진입일 + hold_days 가 지난 거래일의 개장 이후
+        entry_day = entry_date(slot)
+        if entry_day is not None and now.time() >= _parse_time(MARKET_OPEN_TIME):
+            elapsed = (now.date() - entry_day).days
+            if elapsed >= self.hold_days:
+                return SellDecision(
+                    True,
+                    f"보유기간 만료: {entry_day.isoformat()} 매수 후 {elapsed}일 경과 "
+                    f"(기준 {self.hold_days}일) — 개장 청산 후 오늘 방향으로 재진입",
+                    SELL_HOLDING_PERIOD,
+                )
+
+        return SellDecision(False)
 
 
-# ── settings 직렬화 / 검증 헬퍼 ────────────────────────────────────────────────
+# ── 활성 슬롯 (자체 원장) ─────────────────────────────────────────────────────
+#
+# 단기 매매 슬롯은 증권사 잔고와 별개로 자기 포지션을 기록한다. 같은 종목을 일반 매수로도
+# 보유하면 잔고의 평균단가·수량이 합쳐지므로, 손익 판단과 매도 수량은 이 원장을 신뢰한다.
 
 EMPTY_TARGET: dict[str, Any] = {
     "code": None,
     "name": None,
     "selected_at": None,
     "selection_reason": None,
+    "direction": None,              # "up" | "down" — 선정 당시 시장 방향
     "auto_enabled": False,
-    "last_realized_amount": None,
-    # 진입 후 최고가 — 트레일링 스탑 기준. 트레이더가 매 주기 현재가로 상향 갱신하고
-    # 매수 직후 체결가로 초기화한다. 매도/교체/재선정 시 새 슬롯에서 None 으로 리셋됨
-    # (일반 보유의 peak_prices.json 과 독립 — 서로 간섭 없음).
-    "peak": None,
-    # 보유 중 활성 종목을 콤보 박스로 다른 후보로 바꾸면, 즉시 덮어쓰지 않고 여기 대기.
-    # 트레이더가 이전 보유를 전량 매도한 뒤 이 후보(`find_targets()` 원형, 한글 키)로 전환한다.
-    "pending_target": None,
-    # 사용자가 보유 중 종목 교체를 요청하면 "switch" — 트레이더가 매도 후 pending 으로 전환.
-    "pending_action": None,
+    # ── 자체 원장 (포지션) ──
+    "entry_price": None,            # 단기 매매가 실제로 진입한 체결 평균가 (증권사 평단과 독립)
+    "qty": 0,                       # 단기 매매가 보유 중인 수량 — 매도 시 이 수량만 판다
+    "invested": None,               # 진입에 실제로 나간 현금 (체결금액 + 매수 제비용)
+    "entry_at": None,               # 진입 시각(ISO) — 보유기간 만료 판정 기준
+    "peak": None,                   # 진입 이후 최고가 — 최고가 대비 청산 기준
+    # ── 진입 차단 ──
+    # 손절·최고가 청산이 난 날짜(ISO date). 같은 날에는 재진입하지 않는다.
+    "blocked_date": None,
+    # ── 종목 교체 예약 ──
+    "pending_target": None,         # 보유 중 다른 후보 선택 시 대기 (find_targets 항목)
+    "pending_action": None,         # "switch" → 트레이더가 전량 매도 후 전환
 }
 
 
 def target_to_settings(
     target: dict[str, Any] | None,
     auto_enabled: bool,
-    last_realized_amount: float | None = None,
+    blocked_date: str | None = None,
 ) -> dict[str, Any]:
     """후보(`find_targets()` 항목) 를 활성 슬롯 저장 포맷으로 변환.
 
-    항상 pending 관련 필드를 초기화한 새 슬롯을 반환하므로, 활성 종목이 교체되면
-    이전 대기 후보/예약 액션이 자동으로 정리된다.
+    항상 원장·pending 필드를 초기화한 새 슬롯을 반환하므로, 활성 종목이 바뀌면 이전
+    포지션 기록과 교체 예약이 함께 정리된다. 진입 차단 날짜(`blocked_date`)는 슬롯이
+    바뀌어도 '오늘은 더 진입하지 않는다' 는 판단이 유지되어야 하므로 명시적으로 이월한다.
 
-    Args:
-        last_realized_amount: 직전 매도 시 회수된 금액(체결가×수량). 다음 매수 예산 상한으로 사용.
-            None 이면 첫 진입 또는 매도 이력 없음 → 매수 시 `SHORT_TERM_BUDGET_MAX` 로 fallback.
+    자금은 슬롯이 아니라 별도 자금 풀(`settings.json::short_term_pool`)이 들고 있으므로
+    종목이 바뀌어도 예산은 영향을 받지 않는다.
     """
-    if target is None:
-        return {
-            **EMPTY_TARGET,
-            "auto_enabled": auto_enabled,
-            "last_realized_amount": last_realized_amount,
-        }
-    return {
+    base = {
         **EMPTY_TARGET,
+        "auto_enabled": auto_enabled,
+        "blocked_date": blocked_date,
+    }
+    if target is None:
+        return base
+    return {
+        **base,
         "code": target.get("종목코드"),
         "name": target.get("종목명"),
         "selected_at": datetime.now().isoformat(),
         "selection_reason": target.get("선정사유"),
-        "auto_enabled": auto_enabled,
-        "last_realized_amount": last_realized_amount,
+        "direction": target.get("방향"),
     }
 
 
-def is_target_set(slot: dict[str, Any] | None) -> bool:
-    """단타 활성 슬롯에 종목이 지정되어 있는지."""
-    return bool(slot) and bool(slot.get("code"))
+# ── 원장 조작 헬퍼 ────────────────────────────────────────────────────────────
+
+
+def position_qty(slot: dict[str, Any] | None) -> int:
+    """단기 매매가 보유 중인 수량 (원장 기준). 없으면 0."""
+    if not isinstance(slot, dict):
+        return 0
+    try:
+        return max(0, int(slot.get("qty") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def has_position(slot: dict[str, Any] | None) -> bool:
+    return position_qty(slot) > 0 and bool(slot.get("code"))
+
+
+def entry_price(slot: dict[str, Any] | None) -> float | None:
+    if not isinstance(slot, dict):
+        return None
+    try:
+        value = float(slot.get("entry_price") or 0)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def entry_date(slot: dict[str, Any] | None) -> date | None:
+    """진입 시각의 날짜 부분. 기록이 없거나 파싱 실패면 None."""
+    if not isinstance(slot, dict):
+        return None
+    raw = slot.get("entry_at")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw)).date()
+    except ValueError:
+        return None
+
+
+def mark_entry(
+    slot: dict[str, Any],
+    price: float,
+    qty: int,
+    invested: float | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """매수 체결 직후 원장에 포지션 기록 (진입가·수량·투입액·진입시각·최고가 초기화).
+
+    Args:
+        price: 체결 평균가 (체결 조회로 확인한 실제 가격).
+        qty: 체결 수량.
+        invested: 실제로 나간 현금 (체결금액 + 매수 제비용). None 이면 `price × qty` 로 둔다.
+    """
+    now = now or datetime.now()
+    return {
+        **slot,
+        "entry_price": float(price),
+        "qty": int(qty),
+        "invested": float(invested) if invested is not None else float(price) * int(qty),
+        "entry_at": now.isoformat(),
+        "peak": float(price),
+    }
+
+
+def clear_position(
+    slot: dict[str, Any],
+    blocked_date: str | None = None,
+) -> dict[str, Any]:
+    """청산 후 원장 비우기. 진입 차단일은 선택적으로 갱신한다.
+
+    실현손익 반영은 자금 풀(`trader.apply_short_term_pnl`)이 따로 담당한다 — 슬롯은
+    '무엇을 얼마나 들고 있나' 만, 풀은 '얼마를 굴리고 있나' 만 책임진다.
+    """
+    return {
+        **slot,
+        "entry_price": None,
+        "qty": 0,
+        "invested": None,
+        "entry_at": None,
+        "peak": None,
+        "blocked_date": blocked_date if blocked_date is not None else slot.get("blocked_date"),
+    }
+
+
+def invested_amount(slot: dict[str, Any] | None) -> float:
+    """현재 포지션에 투입된 실제 현금. 포지션이 없으면 0.
+
+    청산 시 `회수액 - 투입액 = 실현손익` 으로 자금 풀을 갱신하는 데 쓴다. 매수 체결 조회로
+    확인한 `invested`(체결금액 + 제비용)를 우선 쓰고, 그 기록이 없으면 `진입가 × 수량` 으로
+    근사한다 — 체결 조회가 실패했거나 외부 매수로 잡힌 포지션의 fallback 경로다.
+    """
+    if isinstance(slot, dict):
+        try:
+            value = float(slot.get("invested") or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return value
+    entry = entry_price(slot)
+    qty = position_qty(slot)
+    return float(entry) * qty if (entry and qty > 0) else 0.0
 
 
 def update_peak(slot: dict[str, Any] | None, current_price: float) -> dict[str, Any] | None:
-    """보유 중 현재가로 진입 후 최고가(peak)를 상향 갱신.
+    """보유 중 현재가로 진입 이후 최고가를 상향 갱신.
 
-    현재가가 기존 peak 보다 높으면 갱신된 새 슬롯을 반환하고, 그렇지 않으면 None 을 반환한다
-    (None 이면 트레이더가 settings 쓰기를 생략 → 불필요한 디스크 I/O 회피).
+    갱신된 새 슬롯을 반환하고, 갱신할 게 없으면 None 을 반환한다 (None 이면 트레이더가
+    settings 쓰기를 생략 → 불필요한 디스크 I/O 회피).
     """
     if not isinstance(slot, dict) or not current_price or current_price <= 0:
         return None
@@ -422,15 +466,88 @@ def update_peak(slot: dict[str, Any] | None, current_price: float) -> dict[str, 
     return None
 
 
-def set_peak(slot: dict[str, Any], peak: float) -> dict[str, Any]:
-    """매수 직후 peak 를 체결가로 초기화한 새 슬롯 반환."""
-    return {**slot, "peak": float(peak)}
+def set_position_qty(slot: dict[str, Any], qty: int) -> dict[str, Any]:
+    """원장 수량을 실제 잔고에 맞춰 보정한 새 슬롯 반환 (부분 체결·외부 매도 대응).
+
+    투입액도 같은 비율로 줄인다 — 절반이 외부에서 팔렸다면 남은 포지션의 투입액도
+    절반이어야 청산 시 실현손익이 맞는다.
+    """
+    new_qty = max(0, int(qty))
+    old_qty = position_qty(slot)
+    updated = {**slot, "qty": new_qty}
+    if old_qty > 0 and new_qty != old_qty:
+        invested = invested_amount(slot)
+        if invested > 0:
+            updated["invested"] = invested * new_qty / old_qty
+    return updated
 
 
-# ── 종목 교체(switch) 슬롯 헬퍼 ───────────────────────────────────────────────
-#
-# 활성 종목을 보유(매수 상태) 중일 때 콤보 박스로 다른 후보를 고르면, 즉시 갈아타지 않고
-# 'pending_target' 으로 예약한다. 트레이더가 이전 보유를 전량 매도한 뒤 새 종목으로 전환한다.
+# ── 진입 차단 (같은 날 재진입 금지) ───────────────────────────────────────────
+
+
+def block_today(slot: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    """오늘은 더 이상 진입하지 않도록 표시 (손절·최고가 청산 후)."""
+    now = now or datetime.now()
+    return {**slot, "blocked_date": now.date().isoformat()}
+
+
+def clear_block(slot: dict[str, Any]) -> dict[str, Any]:
+    return {**slot, "blocked_date": None}
+
+
+def is_blocked(slot: dict[str, Any] | None, now: datetime | None = None) -> bool:
+    """오늘 진입이 차단된 상태인지 (손절·최고가 청산이 오늘 발생했는지)."""
+    if not isinstance(slot, dict):
+        return False
+    raw = slot.get("blocked_date")
+    if not raw:
+        return False
+    now = now or datetime.now()
+    return str(raw) == now.date().isoformat()
+
+
+# ── 일반 슬롯과의 보유 분리 ───────────────────────────────────────────────────
+
+
+def split_holdings(
+    holdings: dict[str, dict],
+    slot: dict[str, Any] | None,
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """증권사 잔고를 (일반 보유, 단기 매매 보유) 로 분리.
+
+    단기 매매 원장 수량만큼을 잔고에서 차감해 일반 슬롯의 몫을 계산한다. 차감 결과가
+    0 이하이면 그 종목은 일반 보유에서 제외된다 — 일반 매도 전략이 단기 매매 물량을
+    팔아버리는 것을 막는 핵심 장치다.
+
+    수량이 원장보다 적으면(외부 매도 등) 잔고 수량까지만 단기 매매 몫으로 인정한다.
+
+    Returns:
+        (일반 보유 dict, 단기 매매 보유 dict) — 둘 다 `get_holdings()` 와 같은 형태.
+    """
+    general = {code: dict(info) for code, info in holdings.items()}
+    short_term: dict[str, dict] = {}
+
+    code = slot.get("code") if isinstance(slot, dict) else None
+    reserved = position_qty(slot)
+    if not code or reserved <= 0 or code not in general:
+        return general, short_term
+
+    info = general[code]
+    held_qty = int(info.get("qty") or 0)
+    st_qty = min(reserved, held_qty)
+    if st_qty <= 0:
+        return general, short_term
+
+    short_term[code] = {**info, "qty": st_qty}
+    remain = held_qty - st_qty
+    if remain > 0:
+        general[code] = {**info, "qty": remain}
+    else:
+        del general[code]
+    return general, short_term
+
+
+# ── 종목 교체(switch) 예약 ────────────────────────────────────────────────────
 
 
 def has_pending(slot: dict[str, Any] | None) -> bool:
@@ -452,34 +569,46 @@ def clear_pending(slot: dict[str, Any]) -> dict[str, Any]:
     return {**slot, "pending_target": None, "pending_action": None}
 
 
-# ── 후보 목록(container) 헬퍼 ─────────────────────────────────────────────────
+# ── 후보 목록(container) ──────────────────────────────────────────────────────
 #
-# 콤보 박스에 노출할 상위 N종 후보를 `selected_at` + `items` 컨테이너로 관리한다.
-# selected_at 의 날짜가 오늘과 다르면(또는 비어 있으면) 트레이더가 일단위로 재선정한다.
+# 오늘 방향에 맞는 ETF 후보(1순위 + 대체)를 `selected_at` + `items` + `direction` 컨테이너로
+# 관리한다. selected_at 의 날짜가 오늘과 다르면 트레이더가 일단위로 재선정한다.
 
 
-def empty_candidates() -> dict[str, Any]:
-    return {"selected_at": None, "items": []}
+def candidates_to_settings(
+    items: list[dict[str, Any]],
+    direction: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """`find_targets()` 결과를 후보 컨테이너 저장 포맷으로 변환.
 
-
-def candidates_to_settings(items: list[dict[str, Any]]) -> dict[str, Any]:
-    """`find_targets()` 결과 리스트를 후보 컨테이너 저장 포맷으로 변환."""
-    return {"selected_at": datetime.now().isoformat(), "items": list(items or [])}
+    방향 판정 결과(`direction`)를 함께 저장해, 대시보드가 어떤 근거로 오늘 방향이
+    정해졌는지 트레이더 재조회 없이 보여줄 수 있게 한다.
+    """
+    return {
+        "selected_at": datetime.now().isoformat(),
+        "items": list(items or []),
+        "direction": direction,
+    }
 
 
 def candidates_need_refresh(
     container: dict[str, Any] | None,
     today: datetime | None = None,
 ) -> bool:
-    """후보 목록이 비어 있거나 다른 날짜에 선정됐으면 재선정 필요 (일단위 초기화)."""
-    if not isinstance(container, dict) or not container.get("items"):
+    """후보 목록이 비어 있거나 다른 날짜에 선정됐으면 재선정 필요 (일단위 초기화).
+
+    후보가 0개여도 `selected_at` 이 오늘이면 재선정하지 않는다 — 중립 판정으로 후보가
+    비는 것은 정상 상태이고, 매 주기 방향 판정 API 를 다시 때릴 이유가 없기 때문이다.
+    (같은 날 강제 재판정이 필요하면 대시보드의 '방향 재판정' 버튼을 쓴다.)
+    """
+    if not isinstance(container, dict):
         return True
     selected_at = container.get("selected_at")
     if not selected_at:
         return True
     try:
-        selected_date = datetime.fromisoformat(selected_at).date()
-    except Exception:
+        selected_date = datetime.fromisoformat(str(selected_at)).date()
+    except ValueError:
         return True
     now = today or datetime.now()
     return selected_date != now.date()

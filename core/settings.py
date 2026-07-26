@@ -21,25 +21,44 @@ DEFAULTS: dict[str, Any] = {
     "sell_strategy": "trailing_stop",
     "max_holdings": 5,  # 동시 보유 종목 상한 — 초과 시 매수 스킵
     "auto_sell_enabled_codes": [],  # 자동 매도 활성화 종목 코드 (체크된 종목만 매도 실행, 미체크는 조건 충족해도 보류)
-    "short_term_buy_delay_min": 10,  # 단타 실매수 지연(분) — 개장(09:00) 후 이 시간 경과 뒤 매수 시작 (0=즉시)
-    "pre_market_open_time": PRE_MARKET_OPEN,  # 장 전 준비 시작 시각("HH:MM") — 이 시각부터 매매 없이 매수·단타 후보를 미리 선정
-    # 단기 매매 (단타) — 단일 종목 자동 매수/매도. ShortTermStrategy 가 자동 선정.
-    # 매도 발생 시 즉시 재선정(실시간 회전)하되, 다음 매수 예산은 직전 회수 금액으로 캡해
-    # 단타 자금 풀이 일반 자금으로 손실을 보충받지 않도록 한다.
-    # 단타 후보 목록 — 콤보 박스에 노출할 상위 N종. selected_at 날짜가 오늘과 다르면 재선정.
+    "short_term_buy_delay_min": 0,  # 단기 매매 실매수 지연(분) — 개장(09:00) 후 이 시간 경과 뒤 매수 (0=개장 즉시)
+    "pre_market_open_time": PRE_MARKET_OPEN,  # 장 전 준비 시작 시각("HH:MM") — 이 시각부터 매매 없이 매수·단기매매 후보를 미리 선정
+    # ── 일 단위 단기 매매 (지수/인버스 ETF 방향 매매) ──────────────────────────
+    # 장 전에 시장 방향을 판정해 상승이면 지수 ETF, 하락이면 인버스 ETF 를 개장 시 매수하고
+    # 손절 -5% / 최고가 대비 -5% / 1일 보유 만료로 청산한다. 자세한 설계는 core/short_term.py 참고.
+    # 배정 자금(씨드, 원) — 이 금액으로 자금 풀을 시작한다. 사이드바에서 바꾸면 풀도 재설정.
+    "short_term_budget": 3_000_000,
+    # 자금 풀 잔액(원) — 청산할 때마다 실현손익이 누적되는 실제 운용 자금.
+    # 이익이 나면 다음 진입 금액이 커지고(복리), 손실이 나면 줄어든 금액으로 들어간다.
+    # None = 미초기화 → 배정액으로 시작. 일반 매수 자금과 서로 보충하지 않는다.
+    "short_term_pool": None,
+    "short_term_stop_loss_pct": 5.0,         # 매수가 대비 손절 하락률 %
+    "short_term_peak_drop_pct": 5.0,         # 매수 이후 최고가 대비 청산 하락률 %
+    "short_term_close_at_market_end": False, # True 면 당일 15:15 강제청산 (오버나이트 미보유)
+    # 후보 목록 — 오늘 방향에 맞는 ETF(1순위 + 대체). selected_at 날짜가 오늘과 다르면 재선정.
     "short_term_candidates": {
         "selected_at": None,            # ISO 시각 — 날짜 부분이 오늘과 다르면 후보 재선정 트리거
         "items": [],                    # find_targets() 결과 리스트 (최대 SHORT_TERM_CANDIDATE_COUNT 종)
+        "direction": None,              # judge_direction() 결과 (방향·점수·신호 근거)
     },
-    # 단타 활성 슬롯 — 후보 중 콤보 박스로 고른 1종을 자동매매(매수/매도).
+    # 활성 슬롯 — 후보 중 1종을 자동매매. `core/short_term.py::EMPTY_TARGET` 이 원본 정의이며
+    # 여기서는 파일 최초 생성 시의 기본값으로 같은 구조를 유지한다 (설정 모듈을 leaf 로 두기 위해 중복).
     "short_term_trade": {
         "code": None,
         "name": None,
         "selected_at": None,            # 활성 종목으로 지정된 시각
-        "selection_reason": None,       # 선정 사유 (예: "등락률 N위 · 거래량 M위 ...")
+        "selection_reason": None,       # 선정 사유 (예: "📈 상승 판정 (점수 +0.42) · ...")
+        "direction": None,              # 선정 당시 시장 방향 ("up" | "down")
         "auto_enabled": False,          # 자동매매 ON/OFF (매수·매도 모두 제어)
-        "last_realized_amount": None,   # 직전 매도 회수 금액(체결가×수량). 다음 매수 예산 상한으로 사용.
-        # 보유 중 콤보로 다른 종목을 고르면 즉시 갈아타지 않고 여기 대기 — 트레이더가 매도 후 전환.
+        # ── 자체 원장 — 증권사 평단과 독립적으로 단기 매매 포지션만 추적 ──
+        # (자금은 슬롯이 아니라 위의 `short_term_pool` 이 들고 있다)
+        "entry_price": None,            # 단기 매매 진입가 (체결 조회로 확인한 실제 체결 평균가)
+        "qty": 0,                       # 단기 매매 보유 수량 (매도 시 이 수량만 매도)
+        "invested": None,               # 진입에 실제로 나간 현금 (체결금액 + 매수 제비용)
+        "entry_at": None,               # 진입 시각(ISO) — 보유기간 만료 판정 기준
+        "peak": None,                   # 진입 이후 최고가 — 최고가 대비 청산 기준
+        "blocked_date": None,           # 손절·최고가 청산이 난 날짜 — 같은 날 재진입 금지
+        # 보유 중 다른 후보를 고르면 즉시 갈아타지 않고 여기 대기 — 트레이더가 매도 후 전환.
         "pending_target": None,         # 교체 예약 후보 (find_targets 항목, 한글 키) | None
         "pending_action": None,         # "switch" → 트레이더가 이전 보유 전량 매도 후 pending 으로 전환
     },

@@ -418,6 +418,43 @@ def get_quote_snapshot(stock_code: str) -> dict:
     }
 
 
+def get_expected_open_quote(stock_code: str) -> dict:
+    """장 시작 전(08:30~09:00) 예상체결 정보 조회. `inquire-asking-price-exp-ccn` 단일 호출.
+
+    개장 전에는 실시간 체결가가 없고 `inquire-price` 는 전일 종가를 그대로 주므로,
+    '오늘 시장이 위로 열릴지 아래로 열릴지' 를 판단하려면 동시호가 예상체결가를 봐야 한다.
+
+    **주의 — stale 응답**: 이 API 는 장 시간 외에도 직전 세션의 잔존값을 그대로 반환한다
+    (실측: 일요일 호출 시 금요일 장 데이터가 그대로 나오고, `기준가` 는 목요일 종가였다).
+    따라서 호출부는 반드시 `기준가` 가 '오늘 세션 기준의 전일 종가' 와 일치하는지 대조해
+    stale 여부를 판정해야 한다. → `core/market_direction.py::_gap_signal` 참고.
+
+    Returns:
+        {예상체결가, 예상등락률(%), 예상거래량, 기준가, 현재가, 장운영구분코드}
+    """
+    url = f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": stock_code,
+    }
+    output = _request("GET", url, "FHKST01010200", params=params).get("output2", {})
+
+    def _f(key: str) -> float:
+        try:
+            return float(output.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    return {
+        "예상체결가": _f("antc_cnpr"),
+        "예상등락률(%)": _f("antc_cntg_prdy_ctrt"),
+        "예상거래량": int(_f("antc_vol")),
+        "기준가": _f("stck_sdpr"),          # 오늘 세션의 전일 종가 — stale 판정용
+        "현재가": _f("stck_prpr"),
+        "장운영구분코드": output.get("antc_mkop_cls_code", ""),
+    }
+
+
 def get_daily_ohlcv(stock_code: str, days: int = 60) -> list[dict]:
     """최근 N영업일 일봉 OHLCV 시계열. 최신순 정렬 (index 0 = 가장 최근).
 
@@ -603,6 +640,92 @@ def get_fluctuation_rank(top_n: int = 30, market: str = "all") -> list[dict]:
             "등락률(%)": float(item.get("prdy_ctrt", 0)),
         })
     return result
+
+
+def get_order_execution(
+    order_no: str,
+    stock_code: str,
+    side: str,
+    date: datetime | None = None,
+) -> dict | None:
+    """주문번호로 **실제 체결 결과**를 조회. 체결 내역이 없으면 None.
+
+    시장가 주문은 주문 시점 현재가와 체결가가 호가 스프레드만큼 어긋난다(ETF 1,125원짜리
+    2,600주면 1틱 5원 차이가 1만원 이상). 손익을 현재가 기준으로 계산하면 이 오차가 계속
+    누적되므로, 체결 후 원장에는 이 함수가 돌려주는 실제 체결가·체결금액을 기록한다.
+
+    `inquire-daily-ccld`(주식일별주문체결조회) 를 오늘·해당 종목·해당 매매구분으로 좁혀
+    조회한 뒤 `odno`(주문번호) 가 일치하는 행을 찾는다.
+
+    제비용(수수료·세금) 주의: 응답의 `output2.prsm_tlex_smtl`(추정 제비용 합계)은
+    **ODNO 필터를 무시하고 조회 구간 전체를 합산**한다(실측 확인). 따라서 조회 결과가
+    우리 주문 1건뿐일 때만 그 값을 이 주문의 비용으로 인정하고(`제비용신뢰=True`),
+    같은 종목을 그날 여러 번 거래했다면 귀속이 불가능하므로 0·False 로 돌려준다.
+
+    Args:
+        order_no: 주문 응답의 `ODNO`.
+        stock_code: 종목코드 (조회 범위 축소용).
+        side: "buy" | "sell".
+        date: 주문일 (기본 오늘).
+
+    Returns:
+        {주문번호, 체결수량, 체결평균가, 총체결금액, 미체결수량, 추정제비용, 제비용신뢰}
+        또는 None (아직 체결 미반영·조회 실패).
+    """
+    day = (date or datetime.now()).strftime("%Y%m%d")
+    url = f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+    tr_id = "VTTC8001R" if IS_MOCK else "TTTC8001R"
+    params = {
+        "CANO": ACCT_PREFIX,
+        "ACNT_PRDT_CD": ACCT_SUFFIX,
+        "INQR_STRT_DT": day,
+        "INQR_END_DT": day,
+        "SLL_BUY_DVSN_CD": "01" if side == "sell" else "02",
+        "INQR_DVSN": "00",          # 역순 (최근 주문부터)
+        "PDNO": stock_code,
+        "CCLD_DVSN": "01",          # 체결된 건만
+        "ORD_GNO_BRNO": "",
+        "ODNO": str(order_no or ""),
+        "INQR_DVSN_3": "00",
+        "INQR_DVSN_1": "",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+    }
+    try:
+        data = _request("GET", url, tr_id, params=params)
+    except Exception as e:
+        log(f"[체결조회] 실패 ({stock_code} {side} {order_no}): {e}")
+        return None
+
+    rows = data.get("output1", []) or []
+    row = next((r for r in rows if str(r.get("odno", "")).lstrip("0") == str(order_no).lstrip("0")), None)
+    if row is None:
+        return None
+
+    def _f(src: dict, key: str) -> float:
+        try:
+            return float(src.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    filled_qty = int(_f(row, "tot_ccld_qty"))
+    if filled_qty <= 0:
+        return None
+
+    summary = data.get("output2") or {}
+    # 조회 결과가 우리 주문 1건뿐일 때만 제비용을 이 주문에 귀속시킨다.
+    fee_trusted = len(rows) == 1
+    fee = _f(summary, "prsm_tlex_smtl") if fee_trusted else 0.0
+
+    return {
+        "주문번호": str(row.get("odno", "")),
+        "체결수량": filled_qty,
+        "체결평균가": _f(row, "avg_prvs"),
+        "총체결금액": _f(row, "tot_ccld_amt"),
+        "미체결수량": int(_f(row, "rmn_qty")),
+        "추정제비용": fee,
+        "제비용신뢰": fee_trusted,
+    }
 
 
 def sell_market_order(stock_code, qty):

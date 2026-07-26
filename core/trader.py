@@ -7,6 +7,7 @@ from config import CHECK_INTERVAL, MODE_LABEL, IS_MOCK, PRE_MARKET_OPEN
 from core.kis_api import (
     get_holdings,
     get_current_price,
+    get_order_execution,
     get_quote_snapshot,
     sell_market_order,
     buy_market_order,
@@ -16,11 +17,19 @@ from core.logger import log
 from core.settings import get as get_setting, set_value as set_setting
 from core.short_term import (
     SHORT_TERM_CANDIDATE_COUNT,
-    ShortTermStrategy,
+    EtfDayTradeStrategy,
+    block_today,
+    invested_amount,
     candidates_need_refresh,
     candidates_to_settings,
+    clear_position,
     has_pending,
-    set_peak,
+    has_position,
+    is_blocked,
+    mark_entry,
+    position_qty,
+    set_position_qty,
+    split_holdings,
     target_to_settings,
     update_peak,
 )
@@ -154,8 +163,8 @@ def pre_market_open_time():
 def is_pre_market(now: datetime | None = None) -> bool:
     """장 전 준비 시간 여부 — 평일 (설정된 장전 시작 시각) ~ 정규장 개장(09:00) 직전.
 
-    이 구간에는 매매(주문)는 불가하지만 조회는 가능하므로, 매수·단타 후보를 미리
-    선정해 개장과 동시에 매매에 진입할 수 있게 한다. 장외(시간외) 거래가 8:00/8:30
+    이 구간에는 매매(주문)는 불가하지만 조회는 가능하므로, 매수 후보와 오늘의 시장 방향을
+    미리 정해 개장과 동시에 매매에 진입할 수 있게 한다. 장외(시간외) 거래가 8:00/8:30
     부터 시작되는 경우에 대응하기 위한 '준비 창'.
     """
     now = now or datetime.now()
@@ -166,9 +175,10 @@ def is_pre_market(now: datetime | None = None) -> bool:
     return pre_market_open_time() <= t < market_open_t
 
 
-# 단타 실매수 지연 (분) 기본값 — 개장(09:00) 후 이 시간이 지나야 실제 시장가 매수를 시작한다.
-# 종목 탐색/선정은 9시부터 수행하되 매수만 미룬다. 실제 적용값은 settings.json 에서 조절 가능.
-SHORT_TERM_BUY_DELAY_MIN = 10
+# 단기 매매 실매수 지연 (분) 기본값 — 개장(09:00) 후 이 시간이 지나야 실제 시장가 매수를 시작한다.
+# ETF 방향 매매는 '개장과 동시에 진입' 이 기본 설계라 0 (즉시). 시초가 변동성을 피하고 싶으면
+# 사이드바에서 늘릴 수 있다. 후보 선정은 지연과 무관하게 장 전에 이미 끝나 있다.
+SHORT_TERM_BUY_DELAY_MIN = 0
 
 
 def short_term_buy_delay_min() -> int:
@@ -185,7 +195,7 @@ def short_term_buy_delay_min() -> int:
 
 
 def short_term_buy_start_label(now: datetime | None = None) -> str:
-    """단타 실매수 시작 시각 라벨 (예: '09:10') — 개장(09:00) + 설정 지연."""
+    """단기 매매 실매수 시작 시각 라벨 (예: '09:10') — 개장(09:00) + 설정 지연."""
     now = now or datetime.now()
     start = now.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(
         minutes=short_term_buy_delay_min()
@@ -194,15 +204,142 @@ def short_term_buy_start_label(now: datetime | None = None) -> str:
 
 
 def short_term_buy_window_open(now: datetime | None = None) -> bool:
-    """단타 실매수 허용 시간 여부 — 개장(09:00) 후 설정 지연(분) 경과 시 True.
+    """단기 매매 실매수 허용 시간 여부 — 개장(09:00) 후 설정 지연(분) 경과 시 True.
 
-    개장 직후에는 등락률·거래량 ranking 이 출렁여 '진짜 오르는 종목' 판별이 어렵다.
-    따라서 종목 탐색·선정은 9시부터 진행하되, 실제 매수는 지연 시간 이후로 미뤄
-    시초가 변동성에 휩쓸려 잘못된 종목을 잡는 것을 줄인다. 지연은 사이드바에서 조절 가능.
+    ETF 방향 매매는 개장과 동시에 진입하는 것이 기본(지연 0분)이다. 다만 시초가 변동성이
+    큰 날 진입을 조금 늦추고 싶을 수 있어 지연을 사이드바에서 조절할 수 있게 열어 둔다.
+    매수 대상 자체는 장 전 준비 시각에 이미 정해져 있으므로 지연은 주문 시점만 미룬다.
     """
     now = now or datetime.now()
     open_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
     return now >= open_time + timedelta(minutes=short_term_buy_delay_min())
+
+
+# 단기 매매에 배정하는 초기 자금(원). settings.json 의 `short_term_budget` 로 조절.
+# 이 값은 '씨드(seed)' 이고, 실제로 굴리는 금액은 아래 자금 풀(`short_term_pool`)이다.
+SHORT_TERM_BUDGET_DEFAULT = 3_000_000
+
+
+def _safe_float_setting(key: str, default: float, minimum: float = 0.0) -> float:
+    """settings.json 의 실수 설정값을 안전하게 읽는다. 타입 오류·범위 미달은 default."""
+    try:
+        value = float(get_setting(key))
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
+
+
+def short_term_budget() -> float:
+    """단기 매매 배정 자금(씨드, 원). 잘못된 값은 기본값으로 fallback.
+
+    사이드바에서 이 값을 바꾸면 자금 풀도 그 금액으로 재설정된다(= 재배정).
+    """
+    return _safe_float_setting("short_term_budget", SHORT_TERM_BUDGET_DEFAULT, minimum=1.0)
+
+
+def short_term_pool() -> float:
+    """단기 매매 자금 풀 잔액(원) — 손익이 누적되는 실제 운용 자금.
+
+    배정액(씨드)에서 출발해 청산할 때마다 **실현손익이 그대로 더해지거나 빠진다**.
+    이익이 나면 다음 진입 금액이 커지고(복리), 손실이 나면 줄어든 금액으로 다시 들어간다.
+    일반 매수 자금에서 손실분을 보충하지도, 이익을 일반 자금으로 빼내지도 않는다.
+
+    미초기화(None)면 배정액으로 시작한다.
+    """
+    raw = get_setting("short_term_pool")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return short_term_budget()
+    return max(0.0, value)
+
+
+def apply_short_term_pnl(invested: float, realized: float) -> float:
+    """청산 결과를 자금 풀에 반영하고 새 잔액을 반환한다.
+
+    `풀 += (회수액 - 투입액)` — 즉 실현손익만큼 풀이 늘거나 준다. 포지션 보유 중에는
+    자금이 주식으로 바뀌어 있을 뿐 풀 잔액은 그대로 두고, 청산 시점에 한 번만 정산한다.
+
+    주의: 회수액은 `청산가 × 수량` 근사치다. 위탁수수료(및 해당 시 세금)는 반영되지
+    않으므로 풀 잔액이 실제 현금보다 아주 조금 높게 잡힐 수 있다. 국내 주식형 ETF 는
+    매도 증권거래세가 면제라 오차는 수수료 수준(수천 원)에 그친다.
+    """
+    pnl = float(realized) - float(invested)
+    new_pool = max(0.0, short_term_pool() + pnl)
+    set_setting("short_term_pool", new_pool)
+    log(
+        f"[단기매매][자금풀] 실현손익 {pnl:+,.0f}원 반영 → 풀 잔액 {new_pool:,.0f}원 "
+        f"(투입 {invested:,.0f} → 회수 {realized:,.0f} · 배정 {short_term_budget():,.0f})"
+    )
+    return new_pool
+
+
+def build_short_term_strategy() -> EtfDayTradeStrategy:
+    """settings.json 의 사용자 설정을 반영한 단기 매매 전략 인스턴스."""
+    return EtfDayTradeStrategy(
+        stop_loss_pct=_safe_float_setting("short_term_stop_loss_pct", 5.0, minimum=0.1),
+        peak_drop_pct=_safe_float_setting("short_term_peak_drop_pct", 5.0, minimum=0.1),
+        close_at_market_end=bool(get_setting("short_term_close_at_market_end")),
+    )
+
+
+# 체결 조회 재시도 — 시장가는 즉시 체결되지만 원장 반영에 약간의 지연이 있을 수 있다.
+_SETTLE_ATTEMPTS = 3
+_SETTLE_RETRY_DELAY = 1.0
+
+
+def settle_order(
+    order_result: dict,
+    code: str,
+    side: str,
+    fallback_price: float,
+    fallback_qty: int,
+) -> dict:
+    """주문 응답을 실제 체결 내역으로 정산한다.
+
+    시장가 주문은 주문 시점 현재가와 체결가가 어긋나므로(호가 스프레드), 손익을 현재가로
+    계산하면 오차가 매 거래 누적된다. 주문 응답의 `ODNO` 로 체결 내역을 되짚어 실제
+    체결가·체결수량·현금흐름을 확정한다.
+
+    현금흐름(`amount`)은 방향에 맞게 제비용을 반영한다 — 매수는 비용만큼 더 나가고
+    (체결금액 + 제비용), 매도는 비용만큼 덜 들어온다(체결금액 − 제비용). 제비용을 이
+    주문에 귀속할 수 없으면(같은 종목을 그날 여러 번 거래) 0 으로 두고 체결금액만 쓴다.
+
+    체결 조회가 실패하면 주문 시점 값(fallback)으로 되돌아가되 `exact=False` 로 표시해
+    호출부가 근사치임을 로그에 남길 수 있게 한다.
+
+    Returns:
+        {qty, price, amount, fee, exact} — exact=False 면 fallback 근사치.
+    """
+    order_no = ((order_result or {}).get("output") or {}).get("ODNO", "")
+    if order_no:
+        for attempt in range(1, _SETTLE_ATTEMPTS + 1):
+            exec_info = get_order_execution(order_no, code, side)
+            if exec_info:
+                gross = exec_info["총체결금액"]
+                fee = exec_info["추정제비용"]
+                amount = gross + fee if side == "buy" else gross - fee
+                return {
+                    "qty": exec_info["체결수량"],
+                    "price": exec_info["체결평균가"] or fallback_price,
+                    "amount": amount,
+                    "fee": fee,
+                    "exact": True,
+                }
+            if attempt < _SETTLE_ATTEMPTS:
+                time.sleep(_SETTLE_RETRY_DELAY)
+
+    log(
+        f"[체결조회] {code} {side} 체결 확인 실패 (주문번호 {order_no or '없음'}) — "
+        f"주문 시점 값으로 근사: {fallback_qty}주 × {fallback_price:,.0f}원"
+    )
+    return {
+        "qty": int(fallback_qty),
+        "price": float(fallback_price),
+        "amount": float(fallback_price) * int(fallback_qty),
+        "fee": 0.0,
+        "exact": False,
+    }
 
 
 class Trader:
@@ -211,16 +348,31 @@ class Trader:
         buy_strategy: BuyStrategy,
         sell_strategy: SellStrategy,
         view_strategies: list[BuyStrategy] | None = None,
-        short_term_strategy: ShortTermStrategy | None = None,
+        short_term_strategy: EtfDayTradeStrategy | None = None,
     ) -> None:
         from core.strategy._activate import sell_strategy_key_of
 
         self.buy_strategy = buy_strategy
         self.sell_strategy = sell_strategy
         self.view_strategies = list(view_strategies or [])
-        self.short_term_strategy = short_term_strategy or ShortTermStrategy()
+        self.short_term_strategy = short_term_strategy or build_short_term_strategy()
         self._known_holdings: set[str] = set()
         self._sell_strategy_key: str = sell_strategy_key_of(sell_strategy)
+
+    # ── 보유 분리 (일반 슬롯 ↔ 단기 매매 슬롯) ─────────────────────────────────
+
+    def general_holdings(self, holdings: dict | None = None) -> dict:
+        """일반 매수 슬롯의 보유분만 반환 — 단기 매매 원장 수량을 차감한다.
+
+        일반 매도 전략·초기매수·보유 한도 계산은 모두 이 값을 기준으로 해야 한다.
+        그러지 않으면 단기 매매가 사 둔 물량을 일반 매도 전략이 팔아버리거나, 단기 매매
+        종목이 보유 한도를 잡아먹어 일반 매수가 막히는 등 두 슬롯이 서로 간섭한다.
+        """
+        if holdings is None:
+            holdings = get_holdings()
+        slot = get_setting("short_term_trade")
+        general, _ = split_holdings(holdings, slot if isinstance(slot, dict) else None)
+        return general
 
     # ── 거래 이력 ──────────────────────────────────────────────────────────────
 
@@ -352,7 +504,8 @@ class Trader:
             log(f"[초기매수] 주문가능금액 조회 실패: {e}")
             return
 
-        owned = set(get_holdings().keys())
+        # 단기 매매 물량은 별도 슬롯이므로 일반 보유 수·한도 계산에서 제외한다.
+        owned = set(self.general_holdings().keys())
         max_holdings = _safe_max_holdings()
         plan = plan_initial_buy(candidates, cash, owned, max_holdings=max_holdings)
 
@@ -381,7 +534,7 @@ class Trader:
             log(f"[매도후재매수] 매수 옵션 OFF - 스킵 ({sold_code} 매도 후)")
             return
 
-        holdings = get_holdings()
+        holdings = self.general_holdings()
         max_holdings = _safe_max_holdings()
         # 잔고 반영 지연 가능성 — 방금 매도한 종목은 보유 수에서 빼고 판단
         effective_owned = {k for k in holdings.keys() if k != sold_code}
@@ -425,54 +578,63 @@ class Trader:
 
         log("[매도후재매수] 미보유 후보 없음 - 스킵")
 
-    # ── 단타 처리 ──────────────────────────────────────────────────────────────
+    # ── 단기 매매 (지수/인버스 ETF 방향 매매) ───────────────────────────────────
 
-    # 단타 매수 1회 최대 사용 금액 (원). 주문가능금액이 이보다 많아도 이 금액으로 상한 제한.
-    # 단타는 단발 진입 + 빠른 청산이므로 고정 상한으로 운용해 일반 매수와 자금 경합을 줄인다.
-    SHORT_TERM_BUDGET_MAX = 3_000_000
+    def _sync_short_term_settings(self) -> None:
+        """단기 매매 파라미터를 settings.json 에서 다시 읽어 반영 (변경 시에만 로그)."""
+        s = self.short_term_strategy
+        for attr, key, default, label in (
+            ("stop_loss_pct", "short_term_stop_loss_pct", 5.0, "손절 기준"),
+            ("peak_drop_pct", "short_term_peak_drop_pct", 5.0, "최고가 대비 청산"),
+        ):
+            value = _safe_float_setting(key, default, minimum=0.1)
+            if getattr(s, attr) != value:
+                log(f"[단기매매][설정] {label} 변경: {getattr(s, attr):g}% → {value:g}%")
+                setattr(s, attr, value)
+
+        close_end = bool(get_setting("short_term_close_at_market_end"))
+        if s.close_at_market_end != close_end:
+            log(f"[단기매매][설정] 당일 마감 강제청산 {'ON' if close_end else 'OFF'}")
+            s.close_at_market_end = close_end
 
     def check_short_term(self) -> None:
-        """단기 매매 (단타) — 후보 목록 일단위 갱신 + 활성 종목 매수/매도/교체 처리.
+        """일 단위 ETF 방향 매매 — 후보 갱신 · 진입 · 청산 · 교체를 매 주기 처리한다.
 
         흐름:
-          0. 후보 목록 일단위 재선정 (selected_at 날짜 ≠ 오늘 또는 비어있음):
-             `find_targets()` 으로 상위 N종 후보를 새로 뽑아 저장. 활성 종목을 **보유 중**이면
-             유지(보호), **미보유**면 새 후보 #1 종목을 활성으로 자동 지정 (빈 슬롯만 갱신).
-          1. `pending_action == "switch"` (콤보로 보유 중 다른 종목 선택) → 이전 보유 전량 매도 후
-             대기 후보(pending_target)로 전환.
-          2. auto_enabled OFF 이면 종료.
-          3. 활성 종목 보유 중 + should_sell True → 전량 시장가 매도 →
-             회수 금액(`체결가 × 수량`)을 `last_realized_amount` 로 기록 →
-             **즉시 `find_target(exclude_codes={매도종목})` 으로 다음 활성 종목 자동 지정**.
-          4. 미보유 + should_buy True → 매수 (개장 후 지연 시간 경과 후).
-             예산 = min(직전 `last_realized_amount` (없으면 `SHORT_TERM_BUDGET_MAX`),
-                       `SHORT_TERM_BUDGET_MAX`, 주문가능금액).
+          0. 원장 정합성 보정 — 외부 매도/부분 체결로 실제 잔고가 원장과 어긋나면 맞춘다.
+          1. 후보 일단위 갱신 — 날짜가 바뀌었으면 오늘 방향을 판정해 ETF 후보를 다시 세운다
+             (장 전 준비 시각에 이미 끝나 있으면 재판정하지 않음).
+          2. 교체 예약(`pending_action == "switch"`) 처리 — 이전 포지션 청산 후 전환.
+          3. 포지션 보유 중 → 최고가 갱신 후 4중 청산 판정 (손절 / 최고가 / 보유기간 / 마감).
+          4. 미보유 → 개장 후 매수 창이 열렸으면 시장가 진입.
 
-        예산 정책의 의도: 단타 자금 풀을 독립 추적해 일반 매수와 자금 경합 차단.
-        이익 발생 시 BUDGET_MAX 로 캡(=초과분은 일반 자금으로 풀어줌), 손실 시 단타 풀에서 흡수.
+        모든 손익 판단은 **자체 원장**(진입가·수량) 기준이다. 같은 ETF 를 일반 매수로도
+        보유 중이면 증권사 평균단가가 섞이므로 잔고 평단은 신뢰하지 않는다.
         """
         slot = get_setting("short_term_trade")
         if not isinstance(slot, dict):
             return
 
+        self._sync_short_term_settings()
+
         try:
             holdings = get_holdings()
         except Exception as e:
-            log(f"[단타] 보유 종목 조회 실패: {e}")
+            log(f"[단기매매] 보유 종목 조회 실패: {e}")
             return
 
-        # 0. 후보 목록 일단위 갱신 + 활성 슬롯 처리 (보유 유지 / 미보유 갱신)
-        slot = self._short_term_refresh_candidates(slot, holdings)
+        # 0. 원장 ↔ 실제 잔고 정합성 보정
+        slot = self._reconcile_short_term_ledger(slot, holdings)
+        general, _ = split_holdings(holdings, slot)
+
+        # 1. 후보 일단위 갱신 (+ 미보유 슬롯 자동 지정)
+        slot = self._short_term_refresh_candidates(slot, general)
 
         auto_enabled = bool(slot.get("auto_enabled", False))
-        last_realized = slot.get("last_realized_amount")
 
-        # 1. 사용자 '교체' 예약 처리 — 이전 보유 전량 매도 후 대기 후보로 전환
+        # 2. 사용자 '교체' 예약 처리
         if slot.get("pending_action") == "switch" and has_pending(slot):
-            self._short_term_switch(slot, holdings, auto_enabled)
-            return
-
-        if not auto_enabled:
+            self._short_term_switch(slot, general, auto_enabled)
             return
 
         code = slot.get("code")
@@ -480,92 +642,93 @@ class Trader:
             return
         name = slot.get("name") or code
 
+        holding = has_position(slot)
+        # 포지션도 없고 자동매매도 꺼져 있으면 시세를 조회할 이유가 없다 (불필요한 API 호출 회피).
+        if not holding and not auto_enabled:
+            return
+
         try:
             snapshot = get_quote_snapshot(code)
         except Exception as e:
-            log(f"[단타][{name}({code})] 시세 조회 실패: {e}")
+            log(f"[단기매매][{name}({code})] 시세 조회 실패: {e}")
             return
-        current_price = snapshot.get("현재가", 0)
-        if not current_price or current_price <= 0:
-            log(f"[단타][{name}({code})] 현재가 0 — 스킵")
+        current_price = float(snapshot.get("현재가", 0) or 0)
+        if current_price <= 0:
+            log(f"[단기매매][{name}({code})] 현재가 0 — 스킵")
             return
 
-        held = holdings.get(code)
-
-        if held:
-            avg_price = held.get("avg_price")
-            # 진입 후 최고가(peak) 상향 갱신 — 트레일링 스탑 기준. 변경 시에만 저장.
+        # 3. 보유 중 — 최고가 갱신 후 청산 판정
+        if holding:
             bumped = update_peak(slot, current_price)
             if bumped is not None:
                 slot = bumped
                 set_setting("short_term_trade", slot)
-            should_sell, reason = self.short_term_strategy.should_sell(slot, current_price, avg_price)
-            if should_sell:
-                qty = held["qty"]
-                log(f"[단타][{name}({code})] ★ 매도 조건 충족 ({reason}) → {qty}주 시장가 매도")
-                try:
-                    sell_market_order(code, qty)
-                    self.log_trade("sell", code, name, current_price, qty, reason=f"[단타] {reason}")
-
-                    # 매도 회수 금액 (체결가 × 수량) — 다음 매수 예산 상한으로 사용.
-                    realized = float(current_price) * int(qty)
-                    log(
-                        f"[단타][{name}({code})] 매도 회수 ≈ {realized:,.0f}원 → "
-                        f"다음 진입 예산 = min({realized:,.0f}, 상한 {self.SHORT_TERM_BUDGET_MAX:,.0f}, 주문가능)"
-                    )
-
-                    # 실시간 재선정 — 직전 매도 종목 제외해 즉시 회전 방지.
-                    new_target = self.short_term_strategy.find_target(exclude_codes={code})
-                    new_slot = target_to_settings(
-                        new_target,
-                        auto_enabled=auto_enabled,
-                        last_realized_amount=realized,
-                    )
-                    set_setting("short_term_trade", new_slot)
-                    if new_target is None:
-                        log("[단타] 매도 후 재선정 결과 없음 - 다음 사이클 재시도")
-                    else:
-                        log(
-                            f"[단타] 매도 후 실시간 재선정 완료: "
-                            f"{new_slot['name']}({new_slot['code']}) - "
-                            f"{new_slot.get('selection_reason', '')}"
-                        )
-                except Exception as e:
-                    log(f"[단타][{name}({code})] 매도 실패: {e}")
+            if not auto_enabled:
+                log(f"[단기매매][{name}({code})] 자동매매 OFF — 청산 판정 보류 (최고가만 추적)")
+                return
+            decision = self.short_term_strategy.should_sell(slot, current_price)
+            if decision.sell:
+                self._short_term_exit(slot, current_price, decision, general)
+            else:
+                entry = slot.get("entry_price") or 0
+                profit = ((current_price - entry) / entry * 100) if entry else 0
+                log(
+                    f"[단기매매][{name}({code})] 보유 중 {position_qty(slot)}주 · "
+                    f"현재가 {current_price:,.0f}원 · 수익률 {profit:+.2f}% · "
+                    f"최고가 {float(slot.get('peak') or 0):,.0f}원"
+                )
             return
 
-        # 미보유 — 매수 진행. 진입 게이트(과열·음봉·고점추격 컷) 미충족 시 보류.
+        # 4. 미보유 — 진입 시도
+        if not auto_enabled:
+            return
+        if is_blocked(slot):
+            log(
+                f"[단기매매][{name}({code})] 오늘은 청산 후 재진입 차단 상태 "
+                f"— 다음 거래일 개장부터 재개"
+            )
+            return
+
         should_buy, reason = self.short_term_strategy.should_buy(slot, snapshot)
         if not should_buy:
-            log(f"[단타][{name}({code})] 진입 보류 — {reason}")
+            log(f"[단기매매][{name}({code})] 진입 보류 — {reason}")
             return
 
-        # 개장 직후 변동성 회피 — 지연 시간 이전에는 선정만 유지하고 실매수는 보류.
         if not short_term_buy_window_open():
             log(
-                f"[단타][{name}({code})] 개장 후 {short_term_buy_delay_min()}분 대기 — "
+                f"[단기매매][{name}({code})] 개장 후 {short_term_buy_delay_min()}분 대기 — "
                 f"실매수 보류 ({short_term_buy_start_label()} 이후 매수 시작)"
             )
             return
 
+        self._short_term_enter(slot, current_price, reason)
+
+    # ── 단기 매매: 진입 ────────────────────────────────────────────────────────
+
+    def _short_term_enter(self, slot: dict, current_price: float, reason: str) -> None:
+        """시장가 진입 + 자체 원장 기록.
+
+        예산 = min(자금 풀 잔액, 주문가능금액). 자금 풀은 배정액(씨드)에서 출발해 청산할
+        때마다 실현손익이 누적되므로, **번 만큼 다음 진입 금액이 커지고 잃은 만큼 작아진다**.
+        일반 매수 자금에서 손실을 보충하거나 이익을 빼내지 않고 풀 안에서만 굴린다.
+        주문가능금액으로 한 번 더 자르는 이유는 실제 현금보다 많이 주문할 수 없기 때문이다.
+        """
+        code = slot["code"]
+        name = slot.get("name") or code
+
         try:
             cash = get_cash_balance()["주문가능금액"]
         except Exception as e:
-            log(f"[단타][{name}({code})] 주문가능금액 조회 실패: {e}")
+            log(f"[단기매매][{name}({code})] 주문가능금액 조회 실패: {e}")
             return
 
-        # 예산: 직전 매도 회수 금액(없으면 BUDGET_MAX) 과 상한, 주문가능금액 셋 중 최솟값.
-        # 사용자 요구: 손실분은 단타 풀이 흡수, 일반 자금에서 끌어오지 않음.
-        if isinstance(last_realized, (int, float)) and last_realized > 0:
-            base_budget = float(last_realized)
-        else:
-            base_budget = float(self.SHORT_TERM_BUDGET_MAX)
-        budget = min(base_budget, float(self.SHORT_TERM_BUDGET_MAX), float(cash))
+        pool = short_term_pool()
+        budget = min(pool, float(cash))
 
         if budget < current_price:
             log(
-                f"[단타][{name}({code})] 예산 부족 "
-                f"(예산 {budget:,.0f}원 = min(직전회수 {base_budget:,.0f}, 상한 {self.SHORT_TERM_BUDGET_MAX:,.0f}, 주문가능 {cash:,.0f}) "
+                f"[단기매매][{name}({code})] 예산 부족 (예산 {budget:,.0f}원 = "
+                f"min(자금풀 {pool:,.0f}, 주문가능 {cash:,.0f}) "
                 f"< 현재가 {current_price:,.0f}원) - 스킵"
             )
             return
@@ -575,150 +738,335 @@ class Trader:
             return
 
         log(
-            f"[단타][{name}({code})] ★ 매수 조건 충족 ({reason}) → "
-            f"{qty}주 × {current_price:,.0f}원 ≈ {qty*current_price:,.0f}원 "
-            f"(예산 {budget:,.0f}원 = min(직전회수 {base_budget:,.0f}, 상한 {self.SHORT_TERM_BUDGET_MAX:,.0f}, 주문가능 {cash:,.0f}))"
+            f"[단기매매][{name}({code})] ★ 진입 ({reason}) → {qty}주 × {current_price:,.0f}원 "
+            f"≈ {qty * current_price:,.0f}원 (예산 {budget:,.0f}원 = "
+            f"min(자금풀 {pool:,.0f}, 주문가능 {cash:,.0f}))"
         )
         try:
-            buy_market_order(code, qty)
-            self.log_trade("buy", code, name, current_price, qty, reason=f"[단타] {reason}")
-            # 진입 후 최고가(peak)를 체결가로 초기화 — 다음 주기부터 트레일링 추적 시작.
-            set_setting("short_term_trade", set_peak(slot, current_price))
+            result = buy_market_order(code, qty)
         except Exception as e:
-            log(f"[단타][{name}({code})] 매수 실패: {e}")
+            log(f"[단기매매][{name}({code})] 매수 실패: {e}")
+            return
 
-    def prepare_market_open(self) -> list[dict]:
-        """장 전(또는 시작 시) 매매 없이 조회만으로 매수·단타 후보를 미리 선정.
+        # 실제 체결가·체결수량·지출액을 확정 — 이후 손익 계산이 전부 이 값을 따른다.
+        fill = settle_order(result, code, "buy", current_price, qty)
+        log(
+            f"[단기매매][{name}({code})] 체결 {fill['qty']}주 @ {fill['price']:,.0f}원 "
+            f"· 지출 {fill['amount']:,.0f}원 (제비용 {fill['fee']:,.0f}원)"
+            + ("" if fill["exact"] else " ※ 주문 시점 근사치")
+        )
+        self.log_trade("buy", code, name, fill["price"], fill["qty"], reason=f"[단기매매] {reason}")
+        set_setting(
+            "short_term_trade",
+            mark_entry(slot, fill["price"], fill["qty"], invested=fill["amount"]),
+        )
+
+    # ── 단기 매매: 청산 ────────────────────────────────────────────────────────
+
+    def _short_term_exit(
+        self,
+        slot: dict,
+        current_price: float,
+        decision,
+        general: dict,
+    ) -> None:
+        """원장 수량만큼 시장가 청산 후 재진입 여부를 사유에 따라 결정.
+
+        - 보유기간 만료 청산 → 오늘 방향의 후보로 슬롯을 갱신해 **같은 날 재진입**한다
+          (일 단위 회전이 이 전략의 정상 동작).
+        - 손절·최고가·마감 청산 → 오늘은 재진입하지 않는다 (`blocked_date` 마킹).
+        """
+        code = slot["code"]
+        name = slot.get("name") or code
+        qty = position_qty(slot)
+        entry = slot.get("entry_price") or 0
+        invested = invested_amount(slot)
+        profit_pct = ((current_price - entry) / entry * 100) if entry else 0
+
+        log(
+            f"[단기매매][{name}({code})] ★ 청산 조건 충족 ({decision.reason}) → "
+            f"{qty}주 시장가 매도 (수익률 {profit_pct:+.2f}%)"
+        )
+        try:
+            result = sell_market_order(code, qty)
+        except Exception as e:
+            log(f"[단기매매][{name}({code})] 매도 실패: {e}")
+            return
+
+        fill = settle_order(result, code, "sell", current_price, qty)
+        log(
+            f"[단기매매][{name}({code})] 체결 {fill['qty']}주 @ {fill['price']:,.0f}원 "
+            f"· 회수 {fill['amount']:,.0f}원 (제비용 {fill['fee']:,.0f}원)"
+            + ("" if fill["exact"] else " ※ 주문 시점 근사치")
+        )
+        self.log_trade("sell", code, name, fill["price"], fill["qty"], reason=f"[단기매매] {decision.reason}")
+        # 실현손익을 자금 풀에 누적 — 다음 진입 금액이 이 잔액을 그대로 따라간다.
+        apply_short_term_pnl(invested, fill["amount"])
+
+        if not decision.allows_reentry_today:
+            set_setting("short_term_trade", block_today(clear_position(slot)))
+            log("[단기매매] 손실성 청산 — 오늘은 재진입하지 않음 (다음 거래일 개장부터 재개)")
+            return
+
+        # 보유기간 만료 — 오늘 방향의 후보로 갈아타 재진입 (같은 종목이어도 무방).
+        auto_enabled = bool(slot.get("auto_enabled", False))
+        next_target = self._short_term_pick_from_candidates(set(general.keys()))
+        new_slot = target_to_settings(
+            next_target,
+            auto_enabled=auto_enabled,
+            blocked_date=None,
+        )
+        set_setting("short_term_trade", new_slot)
+        if next_target is None:
+            log("[단기매매] 청산 후 재진입 후보 없음 — 다음 주기 재시도")
+        else:
+            log(
+                f"[단기매매] 청산 후 재진입 대상: {new_slot['name']}({new_slot['code']}) - "
+                f"{new_slot.get('selection_reason', '')}"
+            )
+
+    def _short_term_pick_from_candidates(self, exclude_codes: set[str]) -> dict | None:
+        """오늘 후보 목록에서 매매할 1종을 고른다. 목록이 오래됐으면 방향을 다시 판정한다.
+
+        장 전 준비 시각에 정한 오늘의 방향을 그대로 쓰는 것이 이 전략의 전제이므로,
+        같은 날 청산 직후에는 저장된 후보를 재사용하고 API 를 다시 때리지 않는다.
+        """
+        container = get_setting("short_term_candidates")
+        if candidates_need_refresh(container):
+            items, verdict = self.short_term_strategy.find_targets(
+                n=SHORT_TERM_CANDIDATE_COUNT, exclude_codes=exclude_codes
+            )
+            set_setting("short_term_candidates", candidates_to_settings(items, verdict))
+        else:
+            items = (container or {}).get("items") or []
+        for item in items:
+            if item.get("종목코드") and item["종목코드"] not in exclude_codes:
+                return item
+        return None
+
+    # ── 단기 매매: 원장 정합성 ─────────────────────────────────────────────────
+
+    def _reconcile_short_term_ledger(self, slot: dict, holdings: dict) -> dict:
+        """자체 원장을 실제 잔고와 대조해 보정한다.
+
+        보정 대상:
+          - 잔고에 없는데 원장에 수량이 남아 있음 → 외부(HTS/MTS) 매도로 청산된 것으로 보고
+            원장을 비운다. 남겨두면 유령 포지션으로 계속 청산 판정을 돌린다.
+          - 잔고 수량 < 원장 수량 → 부분 체결·부분 매도. 잔고 수량까지로 낮춘다.
+          - 잔고 수량 == 원장 수량 (겹치는 일반 보유 없음) → 증권사 평균단가가 곧 이 포지션의
+            실제 체결가이므로 진입가를 그것으로 보정한다. 시장가 주문은 주문 시점 현재가와
+            체결가가 어긋날 수 있어, 확인 가능한 시점에 진짜 체결가로 맞춰준다.
+        """
+        code = slot.get("code")
+        qty = position_qty(slot)
+        if not code or qty <= 0:
+            return slot
+
+        held = holdings.get(code)
+        held_qty = int(held.get("qty") or 0) if held else 0
+        name = slot.get("name") or code
+
+        if held_qty <= 0:
+            log(f"[단기매매][{name}({code})] 잔고에 없음 — 외부 청산으로 보고 원장 정리")
+            updated = clear_position(slot)
+            set_setting("short_term_trade", updated)
+            return updated
+
+        updated = slot
+        changed = False
+        if held_qty < qty:
+            log(f"[단기매매][{name}({code})] 원장 수량 보정: {qty}주 → {held_qty}주 (실제 잔고 기준)")
+            updated = set_position_qty(updated, held_qty)
+            changed = True
+
+        avg_price = float(held.get("avg_price") or 0)
+        if held_qty == position_qty(updated) and avg_price > 0:
+            # 잔고가 단기 매매 물량뿐 → 평균단가 = 이 포지션의 실제 체결가.
+            recorded = float(updated.get("entry_price") or 0)
+            if abs(recorded - avg_price) >= 1:
+                log(
+                    f"[단기매매][{name}({code})] 진입가 보정: {recorded:,.0f}원 → "
+                    f"{avg_price:,.0f}원 (실제 체결 평균단가)"
+                )
+                updated = {**updated, "entry_price": avg_price}
+                # 체결 조회로 확정한 투입액이 있으면 그쪽이 더 정확하므로 건드리지 않고,
+                # 기록이 없을 때(외부 매수 등)만 평단 기준으로 채운다.
+                if not updated.get("invested"):
+                    updated["invested"] = avg_price * position_qty(updated)
+                # 최고가가 진입가보다 낮게 기록돼 있으면 함께 끌어올린다.
+                if float(updated.get("peak") or 0) < avg_price:
+                    updated = {**updated, "peak": avg_price}
+                changed = True
+
+        if changed:
+            set_setting("short_term_trade", updated)
+        return updated
+
+    # ── 단기 매매: 후보 갱신 / 교체 ────────────────────────────────────────────
+
+    def prepare_market_open(self, force_short_term: bool = False) -> list[dict]:
+        """장 전(또는 시작 시) 매매 없이 조회만으로 매수·단기매매 후보를 미리 선정.
 
         정규장 개장(09:00) 전 '준비 창'(`is_pre_market`)이나 시작 시점에 호출해,
-        매수 후보(`scan_buy_candidates`)와 단타 후보(`_prepare_short_term`)를 함께
+        매수 후보(`scan_buy_candidates`)와 단기 매매 후보(`_prepare_short_term`)를 함께
         갱신한다. 실제 주문은 일절 발생하지 않으며(조회·후보 선정만), 개장 시
         `execute_initial_buy`·`check_short_term` 이 이 결과를 그대로 사용한다.
+
+        Args:
+            force_short_term: True 면 같은 날 이미 판정했더라도 시장 방향을 다시 판정한다.
+                장 전 준비 창(08:30~09:00)에서 쓴다 — 그 이전(예: 08:00)에 트레이더를 켜면
+                당일 날짜로 판정 기록이 남아 일단위 가드에 걸리는데, 개장 전 갭 신호
+                (예상체결가)는 08:30 이후에만 형성되므로 그 시각에 반드시 다시 판정해야 한다.
 
         Returns:
             매수 실행용 primary 전략 후보 리스트 (개장 후 초기매수에 사용).
         """
         candidates = self.scan_buy_candidates()
-        self._prepare_short_term()
+        self._prepare_short_term(force=force_short_term)
         return candidates
 
-    def _prepare_short_term(self) -> None:
-        """단타 후보 목록·활성 슬롯을 미리 선정 (주문 없음).
+    def _prepare_short_term(self, force: bool = False) -> None:
+        """오늘의 시장 방향을 판정해 ETF 후보·활성 슬롯을 미리 준비 (주문 없음).
 
-        `check_short_term` 의 후보 갱신 부분(`_short_term_refresh_candidates`)만 떼어내
-        매매 게이트와 무관하게 조회만으로 단타 후보를 준비한다. 내부의 일단위 날짜
-        가드(`candidates_need_refresh`)가 있어 하루 1회만 실제 재선정한다.
+        개장 30분 전(장 전 준비 시각)에 호출되며, 평소에는 일단위 날짜 가드
+        (`candidates_need_refresh`)가 있어 하루 1회만 실제 판정한다. `force=True` 면
+        가드를 건너뛰고 재판정한다.
         """
         slot = get_setting("short_term_trade")
         if not isinstance(slot, dict):
             return
+        self._sync_short_term_settings()
         try:
             holdings = get_holdings()
         except Exception as e:
-            log(f"[장전준비][단타] 보유 종목 조회 실패: {e}")
+            log(f"[장전준비][단기매매] 보유 종목 조회 실패: {e}")
             return
-        self._short_term_refresh_candidates(slot, holdings)
+        slot = self._reconcile_short_term_ledger(slot, holdings)
+        general, _ = split_holdings(holdings, slot)
+        self._short_term_refresh_candidates(slot, general, force=force)
 
-    def _short_term_refresh_candidates(self, slot: dict, holdings: dict) -> dict:
-        """단타 후보 목록 일단위 갱신 + 활성 슬롯 처리.
+    def _short_term_refresh_candidates(self, slot: dict, general: dict, force: bool = False) -> dict:
+        """후보 목록 일단위 갱신 + 활성 슬롯 처리.
 
-        후보 목록(`short_term_candidates`)의 selected_at 날짜가 오늘과 다르면(또는 비어있으면)
-        `find_targets()` 으로 상위 N종을 새로 뽑아 저장한다.
+        후보 목록(`short_term_candidates`)의 selected_at 날짜가 오늘과 다르면 오늘의 시장
+        방향을 판정해 ETF 후보를 새로 세운다. 일반 매수로 이미 보유 중인 종목은 후보에서
+        제외해(`exclude_codes`) 대체 ETF 가 선택되게 한다 — 평단 혼입 회피.
 
-        활성 슬롯은 사용자 결정(콤보 선택)대로:
-          - 활성 종목 **보유 중** → 유지 (보호 — 새 후보가 와도 갈아타지 않음).
-          - **미보유**(빈 슬롯/매도됨) → 새 후보 #1 종목을 활성으로 자동 지정.
+        활성 슬롯:
+          - 포지션 **보유 중** → 유지 (보호). 청산은 `should_sell` 이 판단한다.
+          - **미보유** → 새 후보 #1 을 활성으로 지정하고 진입 차단(blocked_date)을 해제한다
+            (날짜가 바뀌었으므로 어제의 손절 차단은 더 이상 유효하지 않다).
+
+        Args:
+            force: True 면 일단위 날짜 가드를 무시하고 다시 판정한다 (장 전 준비 창).
 
         Returns:
             이후 로직에서 사용할 (갱신됐을 수 있는) 활성 슬롯 dict.
         """
         container = get_setting("short_term_candidates")
-        if not candidates_need_refresh(container):
+        if not force and not candidates_need_refresh(container):
             return slot
 
-        items = self.short_term_strategy.find_targets(n=SHORT_TERM_CANDIDATE_COUNT)
-        set_setting("short_term_candidates", candidates_to_settings(items))
+        exclude = set(general.keys())
+        items, verdict = self.short_term_strategy.find_targets(
+            n=SHORT_TERM_CANDIDATE_COUNT, exclude_codes=exclude
+        )
+        set_setting("short_term_candidates", candidates_to_settings(items, verdict))
+
         if not items:
-            log("[단타] 후보 재선정 — 조건 통과 종목 없음 (다음 주기 재시도)")
+            log("[단기매매] 후보 재선정 — 진입 대상 없음 (중립 판정이거나 가용 ETF 없음)")
             return slot
 
-        names = ", ".join(f"{c['종목명']}({c['종목코드']})" for c in items)
-        log(f"[단타] 후보 {len(items)}종 재선정: {names}")
-
-        active_code = slot.get("code")
-        held_active = bool(active_code) and active_code in holdings
-        if held_active:
-            log(f"[단타] 활성 종목 {active_code} 보유 중 — 유지 (후보 목록만 갱신)")
+        if has_position(slot):
+            log(
+                f"[단기매매] 활성 종목 {slot.get('name')}({slot.get('code')}) 보유 중 — 유지 "
+                f"(후보 목록만 갱신, 청산은 보유기간·손절 판정에 위임)"
+            )
             return slot
 
-        # 미보유 — 새 후보 #1 을 활성으로 자동 지정 (예산 풀은 이월)
         new_slot = target_to_settings(
             items[0],
             auto_enabled=bool(slot.get("auto_enabled", False)),
-            last_realized_amount=slot.get("last_realized_amount"),
+            blocked_date=None,  # 날짜가 바뀌었으므로 어제의 재진입 차단 해제
         )
         set_setting("short_term_trade", new_slot)
         log(
-            f"[단타] 활성 종목 자동 지정(미보유 슬롯): "
-            f"{new_slot['name']}({new_slot['code']}) - {new_slot.get('selection_reason', '')}"
+            f"[단기매매] 오늘의 매매 대상: {new_slot['name']}({new_slot['code']}) - "
+            f"{new_slot.get('selection_reason', '')}"
         )
         return new_slot
 
-    def _short_term_switch(self, slot: dict, holdings: dict, auto_enabled: bool) -> None:
-        """사용자 '교체' 선택 처리 — 이전 보유 종목 전량 매도 후 대기 후보로 전환.
+    def _short_term_switch(self, slot: dict, general: dict, auto_enabled: bool) -> None:
+        """사용자 '교체' 선택 처리 — 이전 포지션을 청산한 뒤 대기 후보로 전환.
 
-        이전 종목을 보유 중이면 시장가로 전량 매도하고 회수 금액을 다음 매수 예산 상한으로
-        이월한다. 장 시간 외에는 매도가 불가능하므로 다음 개장 후 사이클에서 재시도한다
-        (`pending_action` 유지). 매도가 필요 없으면(미보유) 즉시 전환한다.
+        원장 수량만 매도하므로 같은 종목을 일반 매수로 보유 중이어도 그쪽 물량은 건드리지
+        않는다. 장 시간 외에는 매도가 불가능하므로 다음 개장 후 사이클에서 재시도한다
+        (`pending_action` 유지).
         """
         pending = slot.get("pending_target")
         active_code = slot.get("code")
         active_name = slot.get("name") or active_code
-        realized = slot.get("last_realized_amount")  # 매도 없으면 직전 값 이월
+        invested = invested_amount(slot)
 
-        held = holdings.get(active_code) if active_code else None
-        if held:
+        qty = position_qty(slot)
+        if qty > 0 and active_code:
             if not is_trading_time():
-                log("[단타] 교체 예약됨 — 장 시간 외, 개장 후 이전 보유 매도 진행")
+                log("[단기매매] 교체 예약됨 — 장 시간 외, 개장 후 이전 포지션 청산 진행")
                 return
-            qty = held["qty"]
             try:
                 price = get_current_price(active_code)
             except Exception as e:
-                log(f"[단타] 교체용 가격 조회 실패 ({active_name}): {e}")
+                log(f"[단기매매] 교체용 가격 조회 실패 ({active_name}): {e}")
                 return
-            log(f"[단타] 교체 — 이전 보유 {active_name}({active_code}) {qty}주 전량 시장가 매도")
+            log(f"[단기매매] 교체 — 이전 포지션 {active_name}({active_code}) {qty}주 전량 시장가 매도")
             try:
-                sell_market_order(active_code, qty)
-                self.log_trade(
-                    "sell", active_code, active_name, price, qty,
-                    reason="[단타] 사용자 교체 — 이전 종목 전량 매도",
-                )
-                realized = float(price) * int(qty)
-                log(f"[단타] 교체 매도 회수 ≈ {realized:,.0f}원 → 새 종목 매수 예산 상한으로 이월")
+                result = sell_market_order(active_code, qty)
             except Exception as e:
-                log(f"[단타] 교체 매도 실패 ({active_name}): {e}")
+                log(f"[단기매매] 교체 매도 실패 ({active_name}): {e}")
                 return
+            fill = settle_order(result, active_code, "sell", price, qty)
+            self.log_trade(
+                "sell", active_code, active_name, fill["price"], fill["qty"],
+                reason="[단기매매] 사용자 교체 — 이전 포지션 전량 매도",
+            )
+            # 교체도 실현손익이 확정되는 청산이므로 자금 풀에 그대로 반영한다.
+            apply_short_term_pnl(invested, fill["amount"])
 
         new_slot = target_to_settings(
             pending,
             auto_enabled=auto_enabled,
-            last_realized_amount=realized,
+            blocked_date=slot.get("blocked_date"),
         )
         set_setting("short_term_trade", new_slot)
         log(
-            f"[단타] 교체 완료 → 새 종목: {new_slot['name']}({new_slot['code']}) - "
+            f"[단기매매] 교체 완료 → 새 종목: {new_slot['name']}({new_slot['code']}) - "
             f"{new_slot.get('selection_reason', '')}"
         )
 
     # ── 매도 체크 ──────────────────────────────────────────────────────────────
 
     def check_and_sell(self) -> None:
-        """보유 종목 가격 확인 후 SellStrategy 판단에 따라 매도"""
-        holdings = get_holdings()
+        """보유 종목 가격 확인 후 SellStrategy 판단에 따라 매도.
+
+        단기 매매 원장 수량은 잔고에서 차감한 뒤 판단한다 — 별도 슬롯으로 운용되는
+        물량을 일반 매도 전략이 대신 팔아버리지 않도록 하기 위해서다.
+        """
+        raw_holdings = get_holdings()
+        st_slot = get_setting("short_term_trade")
+        holdings, short_term_held = split_holdings(
+            raw_holdings, st_slot if isinstance(st_slot, dict) else None
+        )
+        for code, info in short_term_held.items():
+            if code in holdings:
+                # 같은 ETF 를 양쪽 슬롯이 함께 보유 — 대체 ETF 로 피하는 게 원칙이라 이례적.
+                log(
+                    f"[{info['name']}({code})] 단기 매매 {info['qty']}주 분리 — "
+                    f"일반 슬롯 {holdings[code]['qty']}주만 매도 판단 대상 "
+                    f"(증권사 평단은 합산되므로 수익률 표시는 참고용)"
+                )
 
         if not holdings:
-            log("보유 종목 없음")
+            log("보유 종목 없음" + (" (단기 매매 물량 제외)" if short_term_held else ""))
             self._known_holdings = set()
             return
 
@@ -788,9 +1136,10 @@ class Trader:
 
         self.sell_strategy.load()
 
-        # 기존 보유 종목 초기화 (재시작 시 false-positive 매수 감지 방지)
+        # 기존 보유 종목 초기화 (재시작 시 false-positive 매수 감지 방지).
+        # 단기 매매 원장 물량은 제외 — 일반 매도 전략의 추적 대상이 아니다.
         try:
-            initial = get_holdings()
+            initial = self.general_holdings()
             self._known_holdings.update(initial.keys())
             for code, info in initial.items():
                 if info["avg_price"] > 0:
@@ -802,10 +1151,10 @@ class Trader:
         except Exception as e:
             log(f"[초기화] 보유 종목 조회 실패: {e}")
 
-        # 시작 시 매수·단타 후보를 미리 선정 (매매 없이 조회만).
-        candidates = self.prepare_market_open()
-        did_initial_buy = is_trading_time()
+        # 시작 시 매수 후보와 오늘의 시장 방향을 미리 선정 (매매 없이 조회만).
         now = datetime.now()
+        candidates = self.prepare_market_open(force_short_term=is_pre_market(now))
+        did_initial_buy = is_trading_time()
         # 장 전 준비를 마친 날짜 — 하루 1회만 사전 선정. 시작 시점이 장전/정규장이면
         # 방금 prepare_market_open 으로 끝낸 셈이라 오늘 날짜로 마킹한다. 그 이전(예: 새벽)에
         # 시작했다면 None 으로 두어, 장전 시작 시각이 되면 신선한 데이터로 다시 선정한다.
@@ -814,7 +1163,7 @@ class Trader:
         if is_trading_time():
             self.execute_initial_buy(candidates)
         elif is_pre_market(now):
-            log("[장전준비] 매매 없이 매수·단타 후보 사전 선정 완료 — 개장(09:00) 후 매매 시작")
+            log("[장전준비] 매매 없이 매수 후보·시장 방향 사전 선정 완료 — 개장(09:00) 후 매매 시작")
         else:
             log("[초기매수] 장 운영 시간 외 - 다음 개장 후 실행")
 
@@ -832,12 +1181,14 @@ class Trader:
                 try:
                     self.check_short_term()
                 except Exception as e:
-                    log(f"[단타] 처리 중 오류: {e}")
+                    log(f"[단기매매] 처리 중 오류: {e}")
             elif is_pre_market(now):
                 # 장 전 준비: 매매 없이 후보만 하루 1회 사전 선정. 개장 시 신선한 후보로 진입.
                 if prep_date != now.date():
-                    log(f"[장전준비] 매수·단타 후보 사전 선정 시작 (매매는 개장 후 — 현재 {now.strftime('%H:%M')})")
-                    candidates = self.prepare_market_open()
+                    log(f"[장전준비] 매수 후보·시장 방향 사전 선정 시작 (매매는 개장 후 — 현재 {now.strftime('%H:%M')})")
+                    # force: 장전 창 이전에 기동해 오늘 날짜로 판정 기록이 남았더라도,
+                    # 갭 신호를 반영해 이 시각에 반드시 다시 판정한다.
+                    candidates = self.prepare_market_open(force_short_term=True)
                     prep_date = now.date()
                     did_initial_buy = False  # 사전 선정된 후보로 개장 후 초기매수 실행
             else:
@@ -864,7 +1215,7 @@ class Trader:
             new_strategy = build_sell_strategy(desired_key)
             new_strategy.load()
             try:
-                holdings = get_holdings()
+                holdings = self.general_holdings()
                 for code, info in holdings.items():
                     if info["avg_price"] > 0:
                         new_strategy.on_buy(code, info["avg_price"])
