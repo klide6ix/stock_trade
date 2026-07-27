@@ -339,6 +339,99 @@ def get_cash_balance() -> dict:
     }
 
 
+def get_orderbook(stock_code: str, depth: int = 5) -> dict:
+    """호가창 조회 — 매도/매수 호가와 잔량 (`inquire-asking-price-exp-ccn`).
+
+    지정가 주문의 단가를 여기서 그대로 가져오면 **호가 단위를 추측할 필요가 없다**.
+    한국 시장은 종목·가격대마다 호가 단위가 달라(실측: 인버스 ETF 1원, KODEX 200 5원)
+    현재가에 임의 버퍼를 더하면 유효하지 않은 단가가 나올 수 있는데, 거래소가 준 호가는
+    정의상 항상 유효하다.
+
+    Returns:
+        {"매도호가": [(가격, 잔량), ...], "매수호가": [(가격, 잔량), ...]} — 1호가부터 순서대로.
+    """
+    url = f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn"
+    data = _request("GET", url, "FHKST01010200", params={
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": stock_code,
+    })
+    out = data.get("output1") or {}
+
+    def _levels(price_key: str, qty_key: str) -> list[tuple[float, int]]:
+        levels = []
+        for i in range(1, min(depth, 10) + 1):
+            try:
+                price = float(out.get(f"{price_key}{i}", 0) or 0)
+                qty = int(float(out.get(f"{qty_key}{i}", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                levels.append((price, qty))
+        return levels
+
+    return {
+        "매도호가": _levels("askp", "askp_rsqn"),
+        "매수호가": _levels("bidp", "bidp_rsqn"),
+    }
+
+
+def get_orderable_cash(
+    stock_code: str = "005930",
+    price: float = 0,
+    market_order: bool = True,
+) -> dict:
+    """**실제** 주문 가능 현금과 최대 매수 수량 (매수가능조회, `inquire-psbl-order`).
+
+    잔고 API 의 `nxdy_excc_amt`(익일정산금액)를 주문가능금액으로 쓰면 두 군데가 어긋난다.
+
+    1. **미결제 매수 미반영** — 매수 대금은 D+2 결제라 오늘 체결분이 D+1 필드에서 아직
+       빠지지 않는다. 이미 쓴 돈을 또 쓸 수 있다고 오판한다(실측: 잔고 API 3,387,580원
+       vs 실제 주문가능현금 478,180원 — 차액이 정확히 당일 매수 체결액).
+    2. **시장가 증거금** — 시장가 매수는 체결가가 미확정이라 KIS 가 **상한가(현재가 +30%)**
+       기준으로 주문금액을 계산한다. 현재가로 나눈 수량은 주문금액이 가용 현금의 약 77%
+       를 넘는 순간 `APBK0952 주문가능금액을 초과 했습니다` 로 거부된다.
+
+    이 API 는 둘 다 반영한 계좌의 실제 여력을 돌려주므로, 매수 수량은 반드시
+    `최대매수수량` 으로 상한을 씌워야 한다.
+
+    Args:
+        stock_code: 조회 기준 종목코드. `주문가능현금` 은 계좌 단위 값이라 종목과 무관하지만,
+            `최대매수수량` 은 이 종목의 계산단가 기준이므로 실제 매수할 종목을 넘겨야 한다.
+        price: 지정가 주문 시 주문 단가. 시장가면 무시된다.
+        market_order: True 면 시장가(ORD_DVSN=01) 기준으로 계산 — 계산단가에 상한가가 잡힌다.
+
+    Returns:
+        {주문가능현금, 최대매수금액, 최대매수수량, 계산단가}
+    """
+    url = f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-psbl-order"
+    tr_id = "VTTC8908R" if IS_MOCK else "TTTC8908R"
+    params = {
+        "CANO": ACCT_PREFIX,
+        "ACNT_PRDT_CD": ACCT_SUFFIX,
+        "PDNO": stock_code,
+        "ORD_UNPR": "0" if market_order else str(int(price or 0)),
+        "ORD_DVSN": "01" if market_order else "00",
+        "CMA_EVLU_AMT_ICLD_YN": "N",
+        "OVRS_ICLD_YN": "N",
+    }
+    data = _request("GET", url, tr_id, params=params)
+    out = data.get("output") or {}
+
+    def _f(key: str) -> float:
+        try:
+            return float(out.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    return {
+        "주문가능현금": _f("ord_psbl_cash"),
+        # 미수 없이 살 수 있는 금액·수량 (신용/미수 미사용 계좌 기준 실질 한도)
+        "최대매수금액": _f("nrcvb_buy_amt"),
+        "최대매수수량": int(_f("nrcvb_buy_qty")),
+        "계산단가": _f("psbl_qty_calc_unpr"),
+    }
+
+
 def get_current_price(stock_code):
     """현재가 조회"""
     url = f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
@@ -744,6 +837,66 @@ def sell_market_order(stock_code, qty):
 
     result = _request("POST", url, tr_id, json_body=body)
     _invalidate_balance_cache()  # 보유·예수금이 바뀌므로 다음 조회는 캐시 우회.
+    return result
+
+
+def buy_limit_order(stock_code: str, qty: int, price: float) -> dict:
+    """지정가 매수 주문.
+
+    시장가 대비 두 가지 이점이 있다.
+      1. **증거금** — 시장가는 체결가 미확정이라 KIS 가 상한가(+30%) 기준으로 주문금액을
+         검증하지만, 지정가는 주문 단가 그대로 계산한다. 같은 현금으로 약 30% 더 살 수 있다.
+      2. **체결가 확정** — 슬리피지가 없어 진입가가 예측 가능하다.
+
+    대신 미체결 위험이 있으므로, 단가는 호가창의 매도호가(즉시 체결 가능한 가격)에서 고르고
+    체결 확인 후 잔량은 취소하는 흐름과 함께 써야 한다.
+    """
+    url = f"{BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+    tr_id = "VTTC0802U" if IS_MOCK else "TTTC0802U"
+
+    body = {
+        "CANO": ACCT_PREFIX,
+        "ACNT_PRDT_CD": ACCT_SUFFIX,
+        "PDNO": stock_code,
+        "ORD_DVSN": "00",   # 00 = 지정가
+        "ORD_QTY": str(int(qty)),
+        "ORD_UNPR": str(int(price)),
+    }
+
+    result = _request("POST", url, tr_id, json_body=body)
+    _invalidate_balance_cache()
+    return result
+
+
+def cancel_order(order_no: str, org_no: str, qty: int = 0, all_remaining: bool = True) -> dict:
+    """미체결 주문 취소 (`order-rvsecncl`, 정정취소주문).
+
+    지정가 주문이 부분 체결로 남으면 잔량이 계속 살아 있어 (1) 현금이 묶이고 (2) 나중에
+    체결되면 원장에 없는 유령 포지션이 생긴다. 진입 확인 후 잔량은 반드시 취소한다.
+
+    Args:
+        order_no: 원주문번호 (`ODNO`).
+        org_no: 주문 응답의 `KRX_FWDG_ORD_ORGNO` (한국거래소전송주문조직번호).
+        qty: 취소 수량. `all_remaining=True` 면 무시되고 잔량 전부 취소된다.
+        all_remaining: 잔량 전부 취소 여부.
+    """
+    url = f"{BASE_URL}/uapi/domestic-stock/v1/trading/order-rvsecncl"
+    tr_id = "VTTC0803U" if IS_MOCK else "TTTC0803U"
+
+    body = {
+        "CANO": ACCT_PREFIX,
+        "ACNT_PRDT_CD": ACCT_SUFFIX,
+        "KRX_FWDG_ORD_ORGNO": str(org_no or ""),
+        "ORGN_ODNO": str(order_no),
+        "ORD_DVSN": "00",
+        "RVSE_CNCL_DVSN_CD": "02",              # 02 = 취소
+        "ORD_QTY": "0" if all_remaining else str(int(qty)),
+        "ORD_UNPR": "0",
+        "QTY_ALL_ORD_YN": "Y" if all_remaining else "N",
+    }
+
+    result = _request("POST", url, tr_id, json_body=body)
+    _invalidate_balance_cache()
     return result
 
 

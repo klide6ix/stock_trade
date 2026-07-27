@@ -8,6 +8,10 @@ from core.kis_api import (
     get_holdings,
     get_current_price,
     get_order_execution,
+    get_orderable_cash,
+    get_orderbook,
+    buy_limit_order,
+    cancel_order,
     get_quote_snapshot,
     sell_market_order,
     buy_market_order,
@@ -283,6 +287,49 @@ def build_short_term_strategy() -> EtfDayTradeStrategy:
     )
 
 
+def plan_market_buy_qty(
+    code: str,
+    current_price: float,
+    budget: float,
+    tag: str,
+    market_order: bool = True,
+) -> tuple[int, str]:
+    """매수 수량 = min(예산 // 주문단가, KIS 최대매수수량).
+
+    `예산 // 현재가` 만으로 수량을 정하면 KIS 가 **시장가** 주문을 상한가(현재가 +30%)
+    기준으로 검증하기 때문에, 주문금액이 가용 현금의 약 77% 를 넘는 순간
+    `APBK0952 주문가능금액을 초과 했습니다` 로 거부된다. 매수가능조회로 계좌의 실제
+    여력(미결제 매수까지 반영)을 받아 상한을 씌운다.
+
+    지정가(`market_order=False`)면 계산단가가 주문 단가 그대로라 같은 현금으로
+    약 30% 더 살 수 있다.
+
+    Returns:
+        (수량, 산출 근거 문자열). 조회 실패 시엔 보수적으로 추정한다.
+    """
+    if current_price <= 0:
+        return 0, "현재가 0"
+
+    want = int(budget // current_price)
+    try:
+        psbl = get_orderable_cash(code, price=current_price, market_order=market_order)
+    except Exception as e:
+        # 조회 실패 — 시장가면 상한가(+30%) 기준으로 보수 추정. 거부되느니 적게 산다.
+        divisor = current_price * 1.3 if market_order else current_price
+        safe = int(budget // divisor)
+        log(f"[{tag}] 매수가능조회 실패({e}) — 보수 추정 {safe}주")
+        return max(0, safe), f"보수 추정 (예산 {budget:,.0f}원 ÷ {divisor:,.0f}원)"
+
+    cap = psbl["최대매수수량"]
+    qty = min(want, cap) if cap > 0 else 0
+    reason = (
+        f"min(예산 {budget:,.0f}원 ÷ 현재가 = {want}주, "
+        f"KIS 최대 {cap}주 [주문가능현금 {psbl['주문가능현금']:,.0f}원 · "
+        f"계산단가 {psbl['계산단가']:,.0f}원])"
+    )
+    return max(0, qty), reason
+
+
 # 체결 조회 재시도 — 시장가는 즉시 체결되지만 원장 반영에 약간의 지연이 있을 수 있다.
 _SETTLE_ATTEMPTS = 3
 _SETTLE_RETRY_DELAY = 1.0
@@ -324,6 +371,7 @@ def settle_order(
                     "price": exec_info["체결평균가"] or fallback_price,
                     "amount": amount,
                     "fee": fee,
+                    "remaining": exec_info["미체결수량"],
                     "exact": True,
                 }
             if attempt < _SETTLE_ATTEMPTS:
@@ -338,8 +386,55 @@ def settle_order(
         "price": float(fallback_price),
         "amount": float(fallback_price) * int(fallback_qty),
         "fee": 0.0,
+        "remaining": 0,
         "exact": False,
     }
+
+
+# 매수 주문 유형 — settings.json 의 `buy_order_type` ("limit" | "market").
+# 기본 지정가: 시장가는 상한가(+30%) 기준 증거금이라 같은 현금으로 살 수 있는 수량이
+# 30% 줄고 체결가도 예측 불가다. 지정가를 매도호가에 걸면 즉시 체결되면서 두 문제가 없다.
+DEFAULT_BUY_ORDER_TYPE = "limit"
+
+
+def use_limit_buy() -> bool:
+    """매수를 지정가로 낼지 여부 (settings.json::buy_order_type)."""
+    return str(get_setting("buy_order_type") or DEFAULT_BUY_ORDER_TYPE).lower() != "market"
+
+
+def pick_limit_buy_price(code: str, qty: int, fallback_price: float) -> tuple[float, str]:
+    """지정가 매수 단가 — 주문 수량을 덮는 매도호가를 고른다.
+
+    매도호가(내가 사려면 상대가 팔겠다고 내놓은 가격)에 지정가를 걸면 즉시 체결된다.
+    거래소가 준 호가를 그대로 쓰므로 **호가 단위를 계산할 필요가 없다** — 종목·가격대마다
+    호가 단위가 달라(실측: 인버스 ETF 1원, KODEX 200 5원) 현재가에 임의 버퍼를 더하면
+    유효하지 않은 단가가 될 수 있다.
+
+    누적 잔량이 주문 수량을 덮는 첫 호가를 고르므로, 1호가 잔량이 부족해도 한 번에
+    체결될 가격을 잡는다. 호가 조회 실패 시 현재가로 fallback 한다.
+
+    Returns:
+        (주문 단가, 근거 문자열).
+    """
+    try:
+        book = get_orderbook(code)
+    except Exception as e:
+        log(f"[지정가] {code} 호가 조회 실패({e}) — 현재가 {fallback_price:,.0f}원으로 주문")
+        return fallback_price, f"현재가 {fallback_price:,.0f}원 (호가 조회 실패)"
+
+    asks = book.get("매도호가") or []
+    if not asks:
+        return fallback_price, f"현재가 {fallback_price:,.0f}원 (호가 없음)"
+
+    cumulative = 0
+    for level, (price, rest) in enumerate(asks, start=1):
+        cumulative += rest
+        if cumulative >= qty:
+            return price, f"매도{level}호가 {price:,.0f}원 (누적잔량 {cumulative:,}주 ≥ {qty:,}주)"
+
+    # 호가창 전체로도 수량을 못 덮으면 가장 높은 매도호가로 — 나머지는 미체결 후 취소된다.
+    price = asks[-1][0]
+    return price, f"매도{len(asks)}호가 {price:,.0f}원 (잔량 부족 — 누적 {cumulative:,}주 < {qty:,}주)"
 
 
 class Trader:
@@ -476,11 +571,23 @@ class Trader:
 
     # ── 매수 실행 ──────────────────────────────────────────────────────────────
 
-    def _place_buy(self, code: str, name: str, qty: int) -> bool:
-        """시장가 매수 주문 실행. 성공 시 True."""
+    def _place_buy(self, code: str, name: str, qty: int, price: float = 0) -> bool:
+        """매수 주문 실행 (기본 지정가). 성공 시 True.
+
+        지정가 단가는 주문 수량을 덮는 매도호가로 잡아 즉시 체결을 노린다. 미체결 잔량은
+        다음 주기 후보 재평가에 맡긴다 — 단기 매매와 달리 일반 매수는 슬롯·원장 개념이
+        없어 잔량이 나중에 체결돼도 보유 종목으로 정상 편입되기 때문이다.
+        """
+        limit = use_limit_buy() and price > 0
         try:
-            result = buy_market_order(code, qty)
-            log(f"[매수] {name}({code}) {qty}주 시장가 주문 완료: {result.get('msg1', '')}")
+            if limit:
+                order_price, price_reason = pick_limit_buy_price(code, qty, price)
+                result = buy_limit_order(code, qty, order_price)
+                log(f"[매수] {name}({code}) {qty}주 지정가 {order_price:,.0f}원 주문 완료 "
+                    f"({price_reason}): {result.get('msg1', '')}")
+            else:
+                result = buy_market_order(code, qty)
+                log(f"[매수] {name}({code}) {qty}주 시장가 주문 완료: {result.get('msg1', '')}")
             return True
         except Exception as e:
             log(f"[매수] {name}({code}) 실패: {e}")
@@ -521,8 +628,20 @@ class Trader:
             f"(보유 {len(owned)} → 매수 후 {len(owned) + len(plan)} / 한도 {max_holdings})"
         )
         for item in plan:
-            log(f"[초기매수] {item['종목명']}({item['종목코드']}) {item['수량']}주 × {item['현재가']:,.0f}원 ≈ {item['예상금액']:,.0f}원")
-            self._place_buy(item["종목코드"], item["종목명"], item["수량"])
+            code, name, price = item["종목코드"], item["종목명"], item["현재가"]
+            # 계획 수량은 잔고 API 기준이라 시장가 증거금·미결제 매수를 모르므로,
+            # 주문 직전 계좌의 실제 여력으로 상한을 씌운다(주문마다 재조회 — 앞선
+            # 주문이 이미 현금을 소모했을 수 있다).
+            qty, qty_reason = plan_market_buy_qty(
+                code, price, price * item["수량"], "초기매수", market_order=not use_limit_buy()
+            )
+            if qty <= 0:
+                log(f"[초기매수] {name}({code}) 매수 여력 부족 — {qty_reason} - 스킵")
+                continue
+            if qty < item["수량"]:
+                log(f"[초기매수] {name}({code}) 수량 하향 {item['수량']}주 → {qty}주 ({qty_reason})")
+            log(f"[초기매수] {name}({code}) {qty}주 × {price:,.0f}원 ≈ {qty * price:,.0f}원")
+            self._place_buy(code, name, qty, price)
 
     def execute_post_sell_buy(self, sold_code: str) -> None:
         """매도 발생 시 후보 재탐색 후 미보유 최상위 1종목을 남은 예수금으로 매수.
@@ -555,25 +674,25 @@ class Trader:
             if code == sold_code or code in effective_owned:
                 continue
 
+            price = c["현재가"]
+            if price <= 0:
+                continue
+
             try:
                 cash = get_cash_balance()["주문가능금액"]
             except Exception as e:
                 log(f"[매도후재매수] 주문가능금액 조회 실패: {e}")
                 return
 
-            price = c["현재가"]
-            if price <= 0:
-                continue
-
-            qty = max(1, int(cash // price))
-            if price * qty > cash:
-                qty = int(cash // price)
+            qty, qty_reason = plan_market_buy_qty(
+                code, price, float(cash), "매도후재매수", market_order=not use_limit_buy()
+            )
             if qty <= 0:
-                log(f"[매도후재매수] 주문가능금액 부족 ({cash:,.0f}원 < {price:,.0f}원) - 스킵")
+                log(f"[매도후재매수] 매수 여력 부족 — {qty_reason} - 스킵")
                 return
 
-            log(f"[매도후재매수] 선정: {c['종목명']}({code}) {qty}주 × {price:,.0f}원 ≈ {price*qty:,.0f}원")
-            self._place_buy(code, c["종목명"], qty)
+            log(f"[매도후재매수] 선정: {c['종목명']}({code}) {qty}주 × {price:,.0f}원 ≈ {price*qty:,.0f}원 ({qty_reason})")
+            self._place_buy(code, c["종목명"], qty, price)
             return
 
         log("[매도후재매수] 미보유 후보 없음 - 스킵")
@@ -705,56 +824,86 @@ class Trader:
 
     # ── 단기 매매: 진입 ────────────────────────────────────────────────────────
 
-    def _short_term_enter(self, slot: dict, current_price: float, reason: str) -> None:
-        """시장가 진입 + 자체 원장 기록.
+    def _cancel_remainder(self, result: dict, fill: dict, code: str, name: str) -> None:
+        """지정가 주문의 미체결 잔량을 취소한다 (없으면 no-op)."""
+        remaining = int(fill.get("remaining") or 0)
+        if remaining <= 0:
+            return
+        output = (result or {}).get("output") or {}
+        order_no, org_no = output.get("ODNO", ""), output.get("KRX_FWDG_ORD_ORGNO", "")
+        if not order_no:
+            log(f"[단기매매][{name}({code})] 미체결 {remaining}주 — 주문번호 없어 취소 불가")
+            return
+        try:
+            cancel_order(order_no, org_no)
+            log(f"[단기매매][{name}({code})] 미체결 {remaining}주 취소 완료 (주문번호 {order_no})")
+        except Exception as e:
+            log(f"[단기매매][{name}({code})] 미체결 {remaining}주 취소 실패: {e} — 수동 확인 필요")
 
-        예산 = min(자금 풀 잔액, 주문가능금액). 자금 풀은 배정액(씨드)에서 출발해 청산할
-        때마다 실현손익이 누적되므로, **번 만큼 다음 진입 금액이 커지고 잃은 만큼 작아진다**.
-        일반 매수 자금에서 손실을 보충하거나 이익을 빼내지 않고 풀 안에서만 굴린다.
-        주문가능금액으로 한 번 더 자르는 이유는 실제 현금보다 많이 주문할 수 없기 때문이다.
+
+    def _short_term_enter(self, slot: dict, current_price: float, reason: str) -> None:
+        """진입 주문 + 자체 원장 기록.
+
+        예산 = 자금 풀 잔액. 자금 풀은 배정액(씨드)에서 출발해 청산할 때마다 실현손익이
+        누적되므로, **번 만큼 다음 진입 금액이 커지고 잃은 만큼 작아진다**. 일반 매수
+        자금에서 손실을 보충하거나 이익을 빼내지 않고 풀 안에서만 굴린다.
+
+        주문 유형은 기본 **지정가**(`buy_order_type`)다. 단가는 주문 수량을 덮는 매도호가로
+        잡아 즉시 체결을 노리되, KIS 증거금이 주문 단가 기준이라 시장가보다 약 30% 더 살 수
+        있다. 미체결 잔량이 남으면 즉시 취소해 현금이 묶이거나 원장 밖 포지션이 생기지 않게 한다.
         """
         code = slot["code"]
         name = slot.get("name") or code
 
-        try:
-            cash = get_cash_balance()["주문가능금액"]
-        except Exception as e:
-            log(f"[단기매매][{name}({code})] 주문가능금액 조회 실패: {e}")
-            return
-
         pool = short_term_pool()
-        budget = min(pool, float(cash))
+        limit = use_limit_buy()
 
-        if budget < current_price:
+        # 지정가 단가는 수량에 따라 달라지고(호가 잔량), 수량은 단가에 따라 달라진다.
+        # 현재가 기준 잠정 수량으로 단가를 먼저 잡은 뒤, 그 단가로 수량을 확정한다.
+        order_price, price_reason = (
+            pick_limit_buy_price(code, max(1, int(pool // current_price)), current_price)
+            if limit else (current_price, "시장가")
+        )
+
+        qty, qty_reason = plan_market_buy_qty(
+            code, order_price, pool, f"단기매매][{name}({code})", market_order=not limit
+        )
+        if qty <= 0:
             log(
-                f"[단기매매][{name}({code})] 예산 부족 (예산 {budget:,.0f}원 = "
-                f"min(자금풀 {pool:,.0f}, 주문가능 {cash:,.0f}) "
-                f"< 현재가 {current_price:,.0f}원) - 스킵"
+                f"[단기매매][{name}({code})] 매수 여력 부족 — {qty_reason} · "
+                f"주문단가 {order_price:,.0f}원 - 스킵"
             )
             return
 
-        qty = int(budget // current_price)
-        if qty <= 0:
-            return
-
         log(
-            f"[단기매매][{name}({code})] ★ 진입 ({reason}) → {qty}주 × {current_price:,.0f}원 "
-            f"≈ {qty * current_price:,.0f}원 (예산 {budget:,.0f}원 = "
-            f"min(자금풀 {pool:,.0f}, 주문가능 {cash:,.0f}))"
+            f"[단기매매][{name}({code})] ★ 진입 ({reason}) → "
+            f"{'지정가' if limit else '시장가'} {qty}주 × {order_price:,.0f}원 "
+            f"≈ {qty * order_price:,.0f}원 (자금풀 {pool:,.0f}원 · {price_reason} · {qty_reason})"
         )
         try:
-            result = buy_market_order(code, qty)
+            result = (
+                buy_limit_order(code, qty, order_price) if limit
+                else buy_market_order(code, qty)
+            )
         except Exception as e:
             log(f"[단기매매][{name}({code})] 매수 실패: {e}")
             return
 
         # 실제 체결가·체결수량·지출액을 확정 — 이후 손익 계산이 전부 이 값을 따른다.
-        fill = settle_order(result, code, "buy", current_price, qty)
+        fill = settle_order(result, code, "buy", order_price, qty)
         log(
             f"[단기매매][{name}({code})] 체결 {fill['qty']}주 @ {fill['price']:,.0f}원 "
             f"· 지출 {fill['amount']:,.0f}원 (제비용 {fill['fee']:,.0f}원)"
             + ("" if fill["exact"] else " ※ 주문 시점 근사치")
         )
+
+        # 지정가는 부분 체결로 잔량이 남을 수 있다. 살려두면 현금이 묶이고 나중에 체결되면
+        # 원장에 없는 유령 포지션이 되므로 즉시 취소한다.
+        self._cancel_remainder(result, fill, code, name)
+
+        if fill["qty"] <= 0:
+            log(f"[단기매매][{name}({code})] 미체결 — 진입 취소, 다음 주기 재시도")
+            return
         self.log_trade("buy", code, name, fill["price"], fill["qty"], reason=f"[단기매매] {reason}")
         set_setting(
             "short_term_trade",

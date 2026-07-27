@@ -6,7 +6,7 @@ from datetime import datetime, time as dtime
 from streamlit_autorefresh import st_autorefresh
 
 from config import CHECK_INTERVAL, PRE_MARKET_OPEN
-from core.kis_api import get_holdings, get_current_price, get_cash_balance
+from core.kis_api import get_holdings, get_current_price, get_cash_balance, get_orderable_cash
 from core.logger import current_log_file, latest_log_file
 from core.etf_universe import DIRECTION_DOWN, DIRECTION_NEUTRAL, DIRECTION_UP
 from core.market_direction import direction_label
@@ -134,6 +134,20 @@ def get_row_status(drop_pct: float | None, stop_loss_pct: float) -> str:
 
 # ── 렌더 레이어 ────────────────────────────────────────────────────────────────
 
+def fetch_orderable_cash() -> float | None:
+    """실제 주문 가능 현금 (매수가능조회). 실패 시 None.
+
+    잔고 API 의 `주문가능금액`(익일정산금액)은 당일 매수 체결분이 D+2 결제라 아직
+    빠지지 않아 실제 여력보다 크게 나온다. 매수 판단·표시는 이 값을 기준으로 한다.
+    """
+    try:
+        value = get_orderable_cash()["주문가능현금"]
+        st.session_state.orderable_cash = value
+        return value
+    except Exception:
+        return st.session_state.get("orderable_cash")
+
+
 def render_cash_balance() -> None:
     """계좌 잔액을 대시보드 최상단에 표시"""
     try:
@@ -147,13 +161,25 @@ def render_cash_balance() -> None:
         return
 
     stale = balance is st.session_state.last_cash_balance and st.session_state.last_cash_balance is not None
+    orderable = fetch_orderable_cash()
 
     b1, b2, b3, b4 = st.columns(4)
     b1.metric("💰 예수금", f"{balance['예수금']:,.0f}원")
-    b2.metric("🛒 주문가능금액", f"{balance['주문가능금액']:,.0f}원")
+    b2.metric(
+        "🛒 주문가능현금",
+        f"{orderable:,.0f}원" if orderable is not None else "조회 실패",
+        help="매수가능조회(inquire-psbl-order) 기준 실제 주문 가능 현금. "
+             "잔고 API 의 '주문가능금액'(익일정산금액)은 당일 매수 체결분이 아직 빠지지 않아 실제보다 큽니다.",
+    )
     b3.metric("📊 총 평가금액", f"{balance['총평가금액']:,.0f}원")
     b4.metric("🏦 순자산", f"{balance['순자산']:,.0f}원")
 
+    if orderable is not None and balance["주문가능금액"] - orderable > 1:
+        st.caption(
+            f"ℹ️ 잔고 API 표시 주문가능금액은 {balance['주문가능금액']:,.0f}원이지만, "
+            f"당일 미결제 매수분이 빠지지 않은 값입니다 "
+            f"(차액 {balance['주문가능금액'] - orderable:,.0f}원). 매수는 위 주문가능현금 기준으로 실행됩니다."
+        )
     if stale:
         st.caption("⚠️ 잔액은 마지막 조회 기준입니다.")
 
@@ -466,7 +492,8 @@ def render_short_term(market_open: bool) -> None:
             f"추종하는 **대체 ETF**(예: KODEX 200 → TIGER 200)로 자동 회피해 평단이 섞이지 않게 합니다.\n"
             f"- **매수**: {buy_start} 이후"
             + (" (개장 즉시)" if buy_delay == 0 else f" (개장 후 {buy_delay}분)")
-            + f" 시장가 매수. 예산은 **min(자금 풀 잔액, 주문가능금액)**.\n"
+            + f" 시장가 매수. 수량은 **min(자금 풀 ÷ 현재가, KIS 최대매수수량)** — "
+            f"시장가는 KIS 가 상한가(+30%) 기준으로 증거금을 계산하므로 실제 매수 여력으로 상한을 씌웁니다.\n"
             f"- **자금 풀**: 배정액 {seed:,.0f}원에서 출발해 청산할 때마다 **실현손익이 그대로 누적**됩니다. "
             f"번 만큼 다음 진입 금액이 커지고(복리), 잃은 만큼 작아집니다 — 일반 매수 자금에서 손실을 "
             f"보충하거나 이익을 빼내지 않습니다.\n"
@@ -908,7 +935,7 @@ def render_buy_plan_preview() -> None:
         st.warning("예수금을 알 수 없어 미리보기를 생성할 수 없습니다.")
         return
 
-    cash = balance["주문가능금액"]
+    cash = st.session_state.get("orderable_cash") or balance["주문가능금액"]
     try:
         owned = set(get_holdings().keys())
     except Exception:
@@ -936,7 +963,7 @@ def render_buy_plan_preview() -> None:
     slot = cash / len(plan)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("주문가능금액", f"{cash:,.0f}원")
+    c1.metric("주문가능현금", f"{cash:,.0f}원")
     c2.metric("슬롯(종목당 배정)", f"{slot:,.0f}원")
     c3.metric("예상 총 주문액", f"{total:,.0f}원")
     c4.metric("보유/한도", f"{len(owned)} / {max_holdings}")
@@ -1088,6 +1115,9 @@ def _init_sidebar_state(settings: dict) -> None:
             return default
         return value if value >= minimum else default
 
+    st.session_state.buy_order_type_limit = str(
+        load_settings().get("buy_order_type", "limit")
+    ).lower() != "market"
     st.session_state.short_term_budget_input = int(_num("short_term_budget", 3_000_000, 1))
     st.session_state.short_term_stop_loss_input = _num("short_term_stop_loss_pct", 5.0, 0.1)
     st.session_state.short_term_peak_drop_input = _num("short_term_peak_drop_pct", 5.0, 0.1)
@@ -1143,6 +1173,10 @@ def _on_max_holdings_change() -> None:
 
 def _on_short_term_buy_delay_change() -> None:
     set_setting("short_term_buy_delay_min", int(st.session_state.short_term_buy_delay_input))
+
+
+def _on_buy_order_type_change() -> None:
+    set_setting("buy_order_type", "limit" if st.session_state.buy_order_type_limit else "market")
 
 
 def _on_short_term_budget_change() -> None:
@@ -1283,6 +1317,14 @@ def render_sidebar() -> tuple[bool, int, str, str, float]:
 
         st.divider()
         st.subheader("🎯 단기 매매 (ETF 방향 매매)")
+        st.toggle(
+            "지정가로 매수",
+            key="buy_order_type_limit",
+            on_change=_on_buy_order_type_change,
+            help="ON(기본): 매도호가에 지정가 주문 — 즉시 체결되면서 증거금이 주문 단가 기준이라 "
+                 "같은 현금으로 약 30% 더 매수됩니다. OFF: 시장가 — KIS 가 상한가(+30%) 기준으로 "
+                 "증거금을 잡아 수량이 줄고 체결가도 예측할 수 없습니다. 매도(청산)는 속도 우선이라 항상 시장가입니다.",
+        )
         st.number_input(
             "배정 자금 (원)",
             min_value=100_000, max_value=100_000_000,
