@@ -6,13 +6,27 @@
 
   신호                       가중  근거
   ─────────────────────────  ────  ────────────────────────────────────────────
-  이평선 추세 (5MA vs 20MA)  0.35  중기 추세의 방향. 단발 노이즈에 가장 덜 흔들린다.
-  전일 등락률                0.25  직전 세션의 관성 — 한국 시장은 전일 방향이 시가에 이어지는 경향.
-  최근 3일 누적 수익률       0.20  이평선보다 짧은 호흡의 가속/감속.
-  갭 신호 (예상체결/실시간)  0.20  개장 직전 정보. 08:30~09:00 예상체결가, 장중이면 실시간 등락률.
+  갭 신호 (예상체결/실시간)  0.50  개장 직전 정보. 다른 세 신호와 상관 ≈ 0 인 유일한 독립 신호.
+  전일 등락률 (평균회귀)     0.25  **부호를 뒤집어 쓴다** — 전일이 내렸으면 오늘 오를 쪽에 건다.
+  이평선 추세 (5MA vs 20MA)  0.15  중기 추세. 지속성이 커서 표본당 정보량이 적다(아래 참고).
+  최근 3일 누적 수익률       0.10  이평선보다 짧은 호흡의 가속/감속.
+
+**전일 등락률을 왜 평균회귀로 쓰는가** (2026-03~07 KODEX 200 78영업일 실측):
+전일 등락률과 '시가 진입 → 익일 시가 청산' 수익의 상관이 **-0.297**(약 2.6σ)로, 전일이
+오를수록 다음 날 수익이 낮아지는 단조 관계가 확인됐다. 구간별 평균 수익도 전일 -10~-5%
+구간 +2.29% / 전일 +5~+10% 구간 -2.44% 로 방향이 뚜렷하다. 무작위 가중치 1만 개로 부호만
+바꿔 비교했을 때 누적손익 중앙값이 -36.3% → +37.7% 로 역전됐다. 순방향(모멘텀)으로 쓰던
+이전 버전은 이 신호에서 구조적으로 손실을 냈다.
+주의: 평균회귀는 고변동 국면의 특징이므로 시장이 진정되면 재검증이 필요하다
+(`scripts/_check_reversion.py` 재실행).
+
+**이평선 가중치가 낮은 이유**: 78영업일 동안 5MA/20MA 부호가 4번밖에 바뀌지 않아
+(평균 지속 15.6일) 독립 관측이 5개뿐이다. 유효 표준오차 ±22.4%p 로 성능 판정 자체가
+불가능하므로, 검증되지 않은 신호에 큰 가중을 주지 않는다.
 
 갭 신호는 개장 전에만 얻을 수 있고 실패할 수 있으므로(아래 stale 판정), 사용 불가 시
 가중치를 나머지 신호에 재분배한다 — 신호가 빠졌다고 점수가 0 쪽으로 끌려가지 않게 한다.
+다만 갭이 빠지면 나머지 셋만으로는 실측 누적손익이 -2.8% 로 사실상 우위가 사라진다.
 
 **예상체결가 stale 판정**: `inquire-asking-price-exp-ccn` 은 장 시간 외에도 직전 세션의
 잔존값을 그대로 반환한다(일요일 호출 시 금요일 데이터 확인). 응답의 `기준가` 는 그 세션의
@@ -20,6 +34,7 @@
 """
 from __future__ import annotations
 
+import statistics
 from datetime import datetime
 from typing import Any
 
@@ -35,17 +50,31 @@ from core.logger import log
 from core.strategy.buy._indicators import sma
 
 # 신호 가중치 (합 1.0). 갭 신호를 못 쓰면 나머지 가중치로 재정규화한다.
-W_MA_TREND = 0.35
-W_PREV_DAY = 0.25
-W_MOMENTUM_3D = 0.20
-W_GAP = 0.20
+# 배분 근거는 모듈 docstring 참고 — 실측 검증된 순서대로 갭 > 전일(평균회귀) > 이평선 > 3일.
+W_GAP = 0.50
+W_PREV_DAY_REVERSION = 0.25
+W_MA_TREND = 0.15
+W_MOMENTUM_3D = 0.10
 
-# 정규화 기준 — 각 신호가 이 값(%)에 도달하면 점수 ±1 로 포화(saturate)한다.
-# 코스피200 의 일반적 일간 변동폭을 기준으로 잡았다. 값이 작을수록 신호가 예민해진다.
-NORM_MA_TREND_PCT = 1.5     # 5MA 가 20MA 보다 1.5% 위 → 추세 신호 만점
-NORM_PREV_DAY_PCT = 1.5     # 전일 +1.5% → 만점
-NORM_MOMENTUM_PCT = 3.0     # 3일 누적 +3% → 만점
-NORM_GAP_PCT = 1.0          # 갭 +1.0% → 만점
+# 정규화 기준 — 각 신호가 `일간 실현변동성 × 배수` 에 도달하면 점수 ±1 로 포화(saturate)한다.
+#
+# 절대 %(이전 방식: 1.0~3.0%)로 고정하면 변동성 국면이 바뀔 때마다 어긋난다. 실제로 2026년
+# 상반기 KODEX 200 은 일간 σ 가 4% 수준인데 기준이 1.5% 여서 이평선 신호의 **92%가 포화**됐고,
+# 점수가 신호 강도를 잃고 사실상 '부호 투표' 로 붕괴했다. 배수(무차원)로 두면 시장이 진정돼도
+# 포화율이 유지된다.
+#
+# 각 배수 = (신호 자체의 표준편차 ÷ 일간 vol) × 여유계수. 78영업일 실측 기준 포화율 10~20%.
+# 3일/전일 배수비가 1.69 로 확률보행 스케일링 √3(≈1.73) 과 일치해, 임의 curve-fit 이 아님이
+# 교차 확인된다.
+NORM_MA_TREND_MULT = 3.5    # 이평선 스프레드는 지속성이 커 일간 vol 대비 분산이 크다
+NORM_PREV_DAY_MULT = 1.6    # 1일 수익률 — vol 정의 그 자체에 가깝다
+NORM_MOMENTUM_MULT = 2.7    # 3일 누적 ≈ vol × √3
+NORM_GAP_MULT = 1.2         # 갭은 야간 구간만이라 전일 등락률보다 분산이 작다
+
+# 실현변동성 산출 기간(영업일) 과 하한. 하한이 없으면 초저변동 구간에서 정규화가 발산해
+# 모든 신호가 즉시 포화된다.
+VOL_WINDOW = 20
+VOL_FLOOR_PCT = 0.3
 
 MA_SHORT = 5
 MA_LONG = 20
@@ -64,6 +93,25 @@ def _norm(pct: float, scale: float) -> float:
     if scale <= 0:
         return 0.0
     return _clip(pct / scale)
+
+
+def realized_vol(closes: list[float], window: int = VOL_WINDOW) -> float:
+    """최근 일간 수익률의 표준편차(%) — 모든 정규화 기준의 스케일.
+
+    Args:
+        closes: 종가 시계열 (최신순, index 0 = 가장 최근).
+
+    Returns:
+        일간 변동성(%). 표본이 부족하거나 0 에 수렴하면 `VOL_FLOOR_PCT`.
+    """
+    rets: list[float] = []
+    for i in range(min(window, len(closes) - 1)):
+        prev = closes[i + 1]
+        if prev > 0:
+            rets.append((closes[i] - prev) / prev * 100)
+    if len(rets) < 2:
+        return VOL_FLOOR_PCT
+    return max(VOL_FLOOR_PCT, statistics.pstdev(rets))
 
 
 def _signal(name: str, raw: str, score: float, weight: float) -> dict[str, Any]:
@@ -130,7 +178,8 @@ def judge_direction(
         now: 판정 기준 시각 (테스트 주입용).
 
     Returns:
-        {direction, score, signals[], summary, prev_close, gap_source, judged_at}
+        {direction, score, signals[], summary, prev_close, vol, gap_source, judged_at}
+        `vol` 은 정규화 스케일로 쓴 일간 실현변동성(%).
         조회 실패 등으로 판정 불가하면 direction=neutral, score=0, summary 에 사유.
 
     호출 수: 일봉 1 + 갭 신호 1 = 2회.
@@ -153,47 +202,45 @@ def judge_direction(
 
     closes = [b["close"] for b in past]
     prev_close = closes[0]
+    # 모든 정규화 기준의 스케일. 이 값이 커지면(변동성 확대) 같은 등락률의 점수가 작아진다.
+    vol = realized_vol(closes)
 
     signals: list[dict[str, Any]] = []
     weighted_sum = 0.0
     weight_total = 0.0
 
-    ma_s = sma(closes, MA_SHORT)
-    ma_l = sma(closes, MA_LONG)
-    if ma_s and ma_l:
-        gap_pct = (ma_s - ma_l) / ma_l * 100
-        score = _norm(gap_pct, NORM_MA_TREND_PCT)
-        signals.append(_signal(
-            f"이평선 추세 ({MA_SHORT}MA vs {MA_LONG}MA)", f"{gap_pct:+.2f}%", score, W_MA_TREND
-        ))
-        weighted_sum += score * W_MA_TREND
-        weight_total += W_MA_TREND
-
-    if len(closes) >= 2 and closes[1] > 0:
-        prev_pct = (closes[0] - closes[1]) / closes[1] * 100
-        score = _norm(prev_pct, NORM_PREV_DAY_PCT)
-        signals.append(_signal("전일 등락률", f"{prev_pct:+.2f}%", score, W_PREV_DAY))
-        weighted_sum += score * W_PREV_DAY
-        weight_total += W_PREV_DAY
-
-    if len(closes) > MOMENTUM_DAYS and closes[MOMENTUM_DAYS] > 0:
-        mom_pct = (closes[0] - closes[MOMENTUM_DAYS]) / closes[MOMENTUM_DAYS] * 100
-        score = _norm(mom_pct, NORM_MOMENTUM_PCT)
-        signals.append(_signal(
-            f"최근 {MOMENTUM_DAYS}일 수익률", f"{mom_pct:+.2f}%", score, W_MOMENTUM_3D
-        ))
-        weighted_sum += score * W_MOMENTUM_3D
-        weight_total += W_MOMENTUM_3D
+    def add(name: str, raw_pct: float, score: float, weight: float) -> None:
+        """신호를 점수 합에 반영. 가중치 절대값으로 누적해 음수 가중치에도 안전하다."""
+        nonlocal weighted_sum, weight_total
+        signals.append(_signal(name, f"{raw_pct:+.2f}%", score, weight))
+        weighted_sum += score * weight
+        weight_total += abs(weight)
 
     gap_pct, gap_source, gap_detail = _gap_signal(proxy, prev_close, has_today_bar, now)
     if gap_pct is not None:
-        score = _norm(gap_pct, NORM_GAP_PCT)
-        signals.append(_signal(f"갭 ({gap_source})", f"{gap_pct:+.2f}%", score, W_GAP))
-        weighted_sum += score * W_GAP
-        weight_total += W_GAP
+        add(f"갭 ({gap_source})", gap_pct, _norm(gap_pct, NORM_GAP_MULT * vol), W_GAP)
     else:
         # 갭을 못 쓰면 남은 신호끼리 재정규화 — 아래 weight_total 나눗셈이 그 역할을 한다.
         log(f"[방향판정] 갭 신호 미사용 — {gap_source}" + (f" ({gap_detail})" if gap_detail else ""))
+
+    if len(closes) >= 2 and closes[1] > 0:
+        prev_pct = (closes[0] - closes[1]) / closes[1] * 100
+        # 평균회귀 — 부호를 뒤집어 쓴다. 전일이 내렸으면 오늘 오를 쪽에 건다.
+        # 근거는 모듈 docstring (상관 -0.297, 구간별 단조 관계) 참고.
+        add("전일 등락률 (평균회귀)", prev_pct,
+            -_norm(prev_pct, NORM_PREV_DAY_MULT * vol), W_PREV_DAY_REVERSION)
+
+    ma_s = sma(closes, MA_SHORT)
+    ma_l = sma(closes, MA_LONG)
+    if ma_s and ma_l:
+        ma_pct = (ma_s - ma_l) / ma_l * 100
+        add(f"이평선 추세 ({MA_SHORT}MA vs {MA_LONG}MA)", ma_pct,
+            _norm(ma_pct, NORM_MA_TREND_MULT * vol), W_MA_TREND)
+
+    if len(closes) > MOMENTUM_DAYS and closes[MOMENTUM_DAYS] > 0:
+        mom_pct = (closes[0] - closes[MOMENTUM_DAYS]) / closes[MOMENTUM_DAYS] * 100
+        add(f"최근 {MOMENTUM_DAYS}일 수익률", mom_pct,
+            _norm(mom_pct, NORM_MOMENTUM_MULT * vol), W_MOMENTUM_3D)
 
     if weight_total <= 0:
         return _unavailable("사용 가능한 신호 없음", now)
@@ -213,6 +260,7 @@ def judge_direction(
         "signals": signals,
         "summary": summary,
         "prev_close": prev_close,
+        "vol": round(vol, 3),
         "gap_source": gap_source if gap_pct is not None else None,
         "gap_detail": gap_detail,
         "judged_at": now.isoformat(),
@@ -220,7 +268,8 @@ def judge_direction(
         "proxy_name": proxy.name,
     }
     log(
-        f"[방향판정] {direction_label(direction)} (점수 {score:+.3f}) — {summary}"
+        f"[방향판정] {direction_label(direction)} (점수 {score:+.3f}) — {summary} "
+        f"| 일간변동성 {vol:.2f}%"
         + (f" | 갭 출처: {gap_source}" if gap_pct is not None else f" | 갭 미사용: {gap_source}")
     )
     return result
@@ -235,6 +284,7 @@ def _unavailable(reason: str, now: datetime) -> dict[str, Any]:
         "signals": [],
         "summary": f"판정 불가 ({reason})",
         "prev_close": 0.0,
+        "vol": 0.0,
         "gap_source": None,
         "gap_detail": "",
         "judged_at": now.isoformat(),

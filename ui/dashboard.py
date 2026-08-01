@@ -410,6 +410,13 @@ def _render_direction_panel(verdict: dict | None) -> None:
                 "가중치": st.column_config.NumberColumn("가중치", format="%.2f"),
             },
         )
+    vol = float(verdict.get("vol", 0) or 0)
+    if vol > 0:
+        st.caption(
+            f"📏 정규화 기준: 일간 실현변동성(20일) **{vol:.2f}%** — 각 신호는 이 값의 "
+            f"일정 배수에서 ±1 로 포화합니다. 변동성이 커지면 같은 등락률의 점수가 작아져 "
+            f"국면이 바뀌어도 신호 민감도가 유지됩니다."
+        )
     gap_source = verdict.get("gap_source")
     if gap_source:
         st.caption(f"🕗 갭 신호 출처: **{gap_source}** {verdict.get('gap_detail', '')}")
