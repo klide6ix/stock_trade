@@ -7,8 +7,8 @@
      일반 매수 슬롯이 이미 보유 중이면 같은 지수를 추종하는 **대체 ETF** 로 자동 회피한다.
   3. **개장(09:00) 과 동시에 시장가 매수**한다 (지연은 사이드바에서 조절 가능, 기본 0분).
   4. 청산은 아래 4가지 — 먼저 충족되는 것으로 나간다.
-       ① 손절: 매수가 대비 -stop_loss_pct (기본 5%)
-       ② 최고가 청산: 매수 이후 최고가 대비 -peak_drop_pct (기본 5%)
+       ① 손절: 매수가 대비 -stop_loss_pct (기본 10%)
+       ② 최고가 청산: 매수 이후 최고가 대비 -peak_drop_pct (기본 10%)
        ③ 보유기간 만료: 매수 다음 거래일 개장 시 전량 청산 → 그날 방향으로 재진입
        ④ (옵션) 당일 마감 강제청산: `close_at_market_end` ON 이면 15:15 전량 청산
 
@@ -29,6 +29,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, NamedTuple
 
+from config import SHORT_TERM_PEAK_DROP_PCT, SHORT_TERM_STOP_LOSS_PCT
 from core.etf_universe import (
     DIRECTION_DOWN,
     DIRECTION_NEUTRAL,
@@ -82,8 +83,8 @@ class EtfDayTradeStrategy:
     """일 단위 ETF 방향 매매 — 상승이면 지수 ETF, 하락이면 인버스 ETF.
 
     Args:
-        stop_loss_pct: 매수가 대비 손절 하락률 % (기본 5.0).
-        peak_drop_pct: 매수 이후 최고가 대비 청산 하락률 % (기본 5.0).
+        stop_loss_pct: 매수가 대비 손절 하락률 % (기본 `config.SHORT_TERM_STOP_LOSS_PCT`).
+        peak_drop_pct: 매수 이후 최고가 대비 청산 하락률 % (기본 `config.SHORT_TERM_PEAK_DROP_PCT`).
         hold_days: 보유 기간(일). 진입일 + 이 일수가 지난 거래일 개장 시 청산 (기본 1).
         close_at_market_end: True 면 당일 `FORCE_CLOSE_TIME` 에 전량 청산 (오버나이트 미보유).
         neutral_band: |방향 점수| 가 이 값 이하이면 중립 → 당일 진입 보류 (기본 0 = 항상 진입).
@@ -92,8 +93,8 @@ class EtfDayTradeStrategy:
 
     def __init__(
         self,
-        stop_loss_pct: float = 5.0,
-        peak_drop_pct: float = 5.0,
+        stop_loss_pct: float = SHORT_TERM_STOP_LOSS_PCT,
+        peak_drop_pct: float = SHORT_TERM_PEAK_DROP_PCT,
         hold_days: int = 1,
         close_at_market_end: bool = False,
         neutral_band: float = 0.0,

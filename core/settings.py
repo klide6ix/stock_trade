@@ -3,7 +3,12 @@ import json
 import os
 from typing import Any
 
-from config import STOP_LOSS_PCT, PRE_MARKET_OPEN
+from config import (
+    PRE_MARKET_OPEN,
+    SHORT_TERM_PEAK_DROP_PCT,
+    SHORT_TERM_STOP_LOSS_PCT,
+    STOP_LOSS_PCT,
+)
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DATA_DIR = os.path.join(_BASE_DIR, "data")
@@ -30,15 +35,15 @@ DEFAULTS: dict[str, Any] = {
     "pre_market_open_time": PRE_MARKET_OPEN,  # 장 전 준비 시작 시각("HH:MM") — 이 시각부터 매매 없이 매수·단기매매 후보를 미리 선정
     # ── 일 단위 단기 매매 (지수/인버스 ETF 방향 매매) ──────────────────────────
     # 장 전에 시장 방향을 판정해 상승이면 지수 ETF, 하락이면 인버스 ETF 를 개장 시 매수하고
-    # 손절 -5% / 최고가 대비 -5% / 1일 보유 만료로 청산한다. 자세한 설계는 core/short_term.py 참고.
+    # 손절 / 최고가 대비 하락 / 1일 보유 만료로 청산한다. 자세한 설계는 core/short_term.py 참고.
     # 배정 자금(씨드, 원) — 이 금액으로 자금 풀을 시작한다. 사이드바에서 바꾸면 풀도 재설정.
     "short_term_budget": 3_000_000,
     # 자금 풀 잔액(원) — 청산할 때마다 실현손익이 누적되는 실제 운용 자금.
     # 이익이 나면 다음 진입 금액이 커지고(복리), 손실이 나면 줄어든 금액으로 들어간다.
     # None = 미초기화 → 배정액으로 시작. 일반 매수 자금과 서로 보충하지 않는다.
     "short_term_pool": None,
-    "short_term_stop_loss_pct": 5.0,         # 매수가 대비 손절 하락률 %
-    "short_term_peak_drop_pct": 5.0,         # 매수 이후 최고가 대비 청산 하락률 %
+    "short_term_stop_loss_pct": SHORT_TERM_STOP_LOSS_PCT,  # 매수가 대비 손절 하락률 %
+    "short_term_peak_drop_pct": SHORT_TERM_PEAK_DROP_PCT,  # 매수 이후 최고가 대비 청산 하락률 %
     "short_term_close_at_market_end": False, # True 면 당일 15:15 강제청산 (오버나이트 미보유)
     # 후보 목록 — 오늘 방향에 맞는 ETF(1순위 + 대체). selected_at 날짜가 오늘과 다르면 재선정.
     "short_term_candidates": {

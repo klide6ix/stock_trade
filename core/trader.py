@@ -3,7 +3,14 @@ import os
 import time
 from datetime import datetime, timedelta
 
-from config import CHECK_INTERVAL, MODE_LABEL, IS_MOCK, PRE_MARKET_OPEN
+from config import (
+    CHECK_INTERVAL,
+    IS_MOCK,
+    MODE_LABEL,
+    PRE_MARKET_OPEN,
+    SHORT_TERM_PEAK_DROP_PCT,
+    SHORT_TERM_STOP_LOSS_PCT,
+)
 from core.kis_api import (
     get_holdings,
     get_current_price,
@@ -281,8 +288,10 @@ def apply_short_term_pnl(invested: float, realized: float) -> float:
 def build_short_term_strategy() -> EtfDayTradeStrategy:
     """settings.json 의 사용자 설정을 반영한 단기 매매 전략 인스턴스."""
     return EtfDayTradeStrategy(
-        stop_loss_pct=_safe_float_setting("short_term_stop_loss_pct", 5.0, minimum=0.1),
-        peak_drop_pct=_safe_float_setting("short_term_peak_drop_pct", 5.0, minimum=0.1),
+        stop_loss_pct=_safe_float_setting(
+            "short_term_stop_loss_pct", SHORT_TERM_STOP_LOSS_PCT, minimum=0.1),
+        peak_drop_pct=_safe_float_setting(
+            "short_term_peak_drop_pct", SHORT_TERM_PEAK_DROP_PCT, minimum=0.1),
         close_at_market_end=bool(get_setting("short_term_close_at_market_end")),
     )
 
@@ -703,8 +712,10 @@ class Trader:
         """단기 매매 파라미터를 settings.json 에서 다시 읽어 반영 (변경 시에만 로그)."""
         s = self.short_term_strategy
         for attr, key, default, label in (
-            ("stop_loss_pct", "short_term_stop_loss_pct", 5.0, "손절 기준"),
-            ("peak_drop_pct", "short_term_peak_drop_pct", 5.0, "최고가 대비 청산"),
+            ("stop_loss_pct", "short_term_stop_loss_pct",
+             SHORT_TERM_STOP_LOSS_PCT, "손절 기준"),
+            ("peak_drop_pct", "short_term_peak_drop_pct",
+             SHORT_TERM_PEAK_DROP_PCT, "최고가 대비 청산"),
         ):
             value = _safe_float_setting(key, default, minimum=0.1)
             if getattr(s, attr) != value:

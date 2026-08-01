@@ -5,7 +5,12 @@ import streamlit as st
 from datetime import datetime, time as dtime
 from streamlit_autorefresh import st_autorefresh
 
-from config import CHECK_INTERVAL, PRE_MARKET_OPEN
+from config import (
+    CHECK_INTERVAL,
+    PRE_MARKET_OPEN,
+    SHORT_TERM_PEAK_DROP_PCT,
+    SHORT_TERM_STOP_LOSS_PCT,
+)
 from core.kis_api import get_holdings, get_current_price, get_cash_balance, get_orderable_cash
 from core.logger import current_log_file, latest_log_file
 from core.etf_universe import DIRECTION_DOWN, DIRECTION_NEUTRAL, DIRECTION_UP
@@ -1126,8 +1131,10 @@ def _init_sidebar_state(settings: dict) -> None:
         load_settings().get("buy_order_type", "limit")
     ).lower() != "market"
     st.session_state.short_term_budget_input = int(_num("short_term_budget", 3_000_000, 1))
-    st.session_state.short_term_stop_loss_input = _num("short_term_stop_loss_pct", 5.0, 0.1)
-    st.session_state.short_term_peak_drop_input = _num("short_term_peak_drop_pct", 5.0, 0.1)
+    st.session_state.short_term_stop_loss_input = _num(
+        "short_term_stop_loss_pct", SHORT_TERM_STOP_LOSS_PCT, 0.1)
+    st.session_state.short_term_peak_drop_input = _num(
+        "short_term_peak_drop_pct", SHORT_TERM_PEAK_DROP_PCT, 0.1)
     st.session_state.short_term_close_end_toggle = bool(
         settings.get("short_term_close_at_market_end", False)
     )
