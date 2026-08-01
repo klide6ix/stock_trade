@@ -290,7 +290,7 @@ def render_holdings(market_open: bool, stop_loss_pct: float) -> None:
     locked_cols = [c for c in df.columns if c != "자동매도"]
     st.data_editor(
         df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         key="holdings_editor",
         on_change=_on_holdings_editor_change,
@@ -408,7 +408,7 @@ def _render_direction_panel(verdict: dict | None) -> None:
                 }
                 for s in signals
             ]),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "점수": st.column_config.NumberColumn("점수", format="%+.3f"),
@@ -544,7 +544,7 @@ def render_short_term(market_open: bool) -> None:
             }
             for i, c in enumerate(items, start=1)
         ]),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "현재가": st.column_config.NumberColumn("현재가", format="%,d원"),
@@ -810,7 +810,7 @@ def _render_candidate_table(items: list[dict]) -> None:
         )
     if "시그널점수" in df.columns:
         styled = styled.map(_signal_score_bg, subset=["시그널점수"])
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(styled, width="stretch", hide_index=True)
 
 
 def render_buy_candidates() -> None:
@@ -995,7 +995,7 @@ def render_buy_plan_preview() -> None:
         "예상금액": "{:,.0f}원",
         "수량": "{:,}주",
     })
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(styled, width="stretch", hide_index=True)
 
 
 def render_trade_history() -> None:
@@ -1049,7 +1049,7 @@ def render_trade_history() -> None:
             subset=["구분"],
         )
     )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(styled, width="stretch", hide_index=True)
 
 
 def render_log() -> None:
@@ -1390,7 +1390,7 @@ def render_sidebar() -> tuple[bool, int, str, str, float]:
             key="refresh_interval_slider",
             on_change=_on_refresh_interval_change,
         )
-        if st.button("지금 새로고침", use_container_width=True):
+        if st.button("지금 새로고침", width="stretch"):
             st.rerun()
 
     buy_label = all_buy_label_by_key.get(current_primary_key, current_primary_key)
