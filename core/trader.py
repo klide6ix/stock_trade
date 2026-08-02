@@ -8,7 +8,12 @@ from config import (
     IS_MOCK,
     MODE_LABEL,
     PRE_MARKET_OPEN,
+    SHORT_TERM_EXIT_MAX_PCT,
+    SHORT_TERM_EXIT_MIN_PCT,
+    SHORT_TERM_EXIT_MODE,
+    SHORT_TERM_PEAK_DROP_MULT,
     SHORT_TERM_PEAK_DROP_PCT,
+    SHORT_TERM_STOP_LOSS_MULT,
     SHORT_TERM_STOP_LOSS_PCT,
 )
 from core.kis_api import (
@@ -304,6 +309,12 @@ def apply_short_term_pnl(invested: float, realized: float) -> float:
     return new_pool
 
 
+def short_term_exit_mode() -> str:
+    """청산선 산출 방식 — "vol"(변동성 배수) | "fixed"(고정 %). 알 수 없는 값은 기본값."""
+    raw = get_setting("short_term_exit_mode")
+    return raw if raw in ("vol", "fixed") else SHORT_TERM_EXIT_MODE
+
+
 def build_short_term_strategy() -> EtfDayTradeStrategy:
     """settings.json 의 사용자 설정을 반영한 단기 매매 전략 인스턴스."""
     return EtfDayTradeStrategy(
@@ -312,6 +323,15 @@ def build_short_term_strategy() -> EtfDayTradeStrategy:
         peak_drop_pct=_safe_float_setting(
             "short_term_peak_drop_pct", SHORT_TERM_PEAK_DROP_PCT, minimum=0.1),
         close_at_market_end=bool(get_setting("short_term_close_at_market_end")),
+        exit_mode=short_term_exit_mode(),
+        stop_loss_mult=_safe_float_setting(
+            "short_term_stop_loss_mult", SHORT_TERM_STOP_LOSS_MULT, minimum=0.1),
+        peak_drop_mult=_safe_float_setting(
+            "short_term_peak_drop_mult", SHORT_TERM_PEAK_DROP_MULT, minimum=0.1),
+        exit_min_pct=_safe_float_setting(
+            "short_term_exit_min_pct", SHORT_TERM_EXIT_MIN_PCT, minimum=0.1),
+        exit_max_pct=_safe_float_setting(
+            "short_term_exit_max_pct", SHORT_TERM_EXIT_MAX_PCT, minimum=0.1),
     )
 
 
@@ -730,16 +750,29 @@ class Trader:
     def _sync_short_term_settings(self) -> None:
         """단기 매매 파라미터를 settings.json 에서 다시 읽어 반영 (변경 시에만 로그)."""
         s = self.short_term_strategy
-        for attr, key, default, label in (
+        for attr, key, default, label, unit in (
             ("stop_loss_pct", "short_term_stop_loss_pct",
-             SHORT_TERM_STOP_LOSS_PCT, "손절 기준"),
+             SHORT_TERM_STOP_LOSS_PCT, "손절 기준(고정)", "%"),
             ("peak_drop_pct", "short_term_peak_drop_pct",
-             SHORT_TERM_PEAK_DROP_PCT, "최고가 대비 청산"),
+             SHORT_TERM_PEAK_DROP_PCT, "최고가 대비 청산(고정)", "%"),
+            ("stop_loss_mult", "short_term_stop_loss_mult",
+             SHORT_TERM_STOP_LOSS_MULT, "손절 배수", "σ"),
+            ("peak_drop_mult", "short_term_peak_drop_mult",
+             SHORT_TERM_PEAK_DROP_MULT, "최고가 청산 배수", "σ"),
+            ("exit_min_pct", "short_term_exit_min_pct",
+             SHORT_TERM_EXIT_MIN_PCT, "청산선 하한", "%"),
+            ("exit_max_pct", "short_term_exit_max_pct",
+             SHORT_TERM_EXIT_MAX_PCT, "청산선 상한", "%"),
         ):
             value = _safe_float_setting(key, default, minimum=0.1)
             if getattr(s, attr) != value:
-                log(f"[단기매매][설정] {label} 변경: {getattr(s, attr):g}% → {value:g}%")
+                log(f"[단기매매][설정] {label} 변경: {getattr(s, attr):g}{unit} → {value:g}{unit}")
                 setattr(s, attr, value)
+
+        mode = short_term_exit_mode()
+        if s.exit_mode != mode:
+            log(f"[단기매매][설정] 청산선 방식 변경: {s.exit_mode} → {mode}")
+            s.exit_mode = mode
 
         close_end = bool(get_setting("short_term_close_at_market_end"))
         if s.close_at_market_end != close_end:

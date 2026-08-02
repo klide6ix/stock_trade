@@ -5,7 +5,8 @@
   - **갭 신호는 09:00 첫 폴링 가격**을 쓴다 — 개장 직후 최종 재판정(`trader.open_rejudge_window`)이
     실시간 등락률로 방향을 확정하므로, 예상체결가(추정)가 아니라 실제 개장가가 판정 근거다.
   - 진입: 판정과 같은 사이클(09:00 첫 폴링)에 그 가격으로 매수, 예산 = 자금 풀 전액
-  - 청산(4중): 손절 -10% / 최고가 대비 -10% / 보유기간 만료(익일 개장) / 마감청산 OFF
+  - 청산(4중): **구현된 `EtfDayTradeStrategy.should_sell` 을 그대로 호출**한다 — 청산선은
+    진입 시점 σ 의 배수(손절 2.5σ / 트레일링 2.0σ, 5~15% 클램프)로 산출된다
   - 손절·최고가 청산이면 그날 재진입 차단, 보유기간 만료는 같은 날 재진입
   - 자금 풀 복리 + 수수료 0.0042% 편도
 
@@ -16,6 +17,7 @@
 조회 전용(주문 없음). 분봉은 `data/.minute_bars_cache.json` 캐시를 재사용한다.
 """
 import statistics as st
+from datetime import datetime
 
 from core.market_direction import (
     MA_LONG,
@@ -33,6 +35,8 @@ from core.market_direction import (
     _norm,
     realized_vol,
 )
+from core.market_direction import realized_vol
+from core.short_term import EtfDayTradeStrategy, mark_entry
 from core.strategy.buy._indicators import sma
 from scripts._check_open_drift import (
     DAILY,
@@ -51,6 +55,7 @@ from scripts._check_open_drift import (
 
 SEED = 3_000_000
 DAYS_BACK = 30
+STRATEGY = EtfDayTradeStrategy()      # 실제 구현체 — 청산 판정을 그대로 위임한다
 LAST_DAY = "20260731"        # 분봉 캐시가 덮는 마지막 거래일
 NAMES = {UP_CODE: "KODEX 200", DOWN_CODE: "KODEX 인버스"}
 
@@ -84,7 +89,15 @@ def judge_at_open(date: str, open_price: float) -> float | None:
 
 def main() -> None:
     _load_cache()
-    days = [d for d in proxy_dates if d <= LAST_DAY][-DAYS_BACK:]
+    days_all = [d for d in proxy_dates if d <= LAST_DAY]
+    days = days_all[-DAYS_BACK:]
+
+    # 각 날짜의 진입 시점 σ — 그날 이전 확정 종가만 사용 (알고리즘과 동일).
+    vols = {}
+    for d in days_all:
+        idx = proxy_dates.index(d)
+        closes = [proxy_bars[x]["close"] for x in reversed(proxy_dates[:idx])]
+        vols[d] = realized_vol(closes) if len(closes) > 2 else 1.0
 
     pool = float(SEED)
     pos = None
@@ -99,10 +112,12 @@ def main() -> None:
             hit = price_at(fetch_minutes(pos["code"], date), "0900")
             if hit:
                 _, price = hit
-                drop_entry = (pos["entry"] - price) / pos["entry"] * 100
-                drop_peak = (pos["peak"] - price) / pos["peak"] * 100
-                kind = ("손절" if drop_entry >= STOP_PCT
-                        else "최고가" if drop_peak >= PEAK_PCT else "보유만료")
+                pos["slot"]["peak"] = pos["peak"]
+                decision = STRATEGY.should_sell(
+                    pos["slot"], price,
+                    now=datetime.strptime(date + " 0900", "%Y%m%d %H%M"))
+                kind = {"stop_loss": "손절", "peak_drop": "최고가"}.get(
+                    decision.kind, "보유만료")
                 proceeds = price * pos["qty"] * (1 - FEE_RATE)
                 pnl = proceeds - pos["invested"]
                 pool += pnl
@@ -133,11 +148,16 @@ def main() -> None:
                 entry_time, entry = hit
                 qty = int(pool // (entry * (1 + FEE_RATE)))
                 if qty > 0:
+                    vol = vols[date]
+                    slot = mark_entry({"code": code, "vol": vol}, entry, qty,
+                                      now=datetime.strptime(date, "%Y%m%d"))
+                    stop_pct, peak_pct, _ = STRATEGY.exit_thresholds(slot)
                     pos = {"code": code, "entry": entry, "qty": qty, "date": date,
                            "invested": qty * entry * (1 + FEE_RATE), "peak": entry,
-                           "row": row}
+                           "row": row, "slot": slot}
                     row.update(종목=NAMES[code], 진입가=entry, 수량=qty,
-                               투입액=pos["invested"])
+                               투입액=pos["invested"], vol=vol,
+                               손절선=stop_pct, 청산선=peak_pct)
 
                     # ── 4. 장중 1분 폴링 — 최고가 갱신 + 청산 판정 ──
                     for t in sorted(bars):
@@ -145,10 +165,12 @@ def main() -> None:
                             continue
                         price = bars[t]
                         pos["peak"] = max(pos["peak"], price)
-                        de = (pos["entry"] - price) / pos["entry"] * 100
-                        dp = (pos["peak"] - price) / pos["peak"] * 100
-                        if de >= STOP_PCT or dp >= PEAK_PCT:
-                            kind = "손절" if de >= STOP_PCT else "최고가"
+                        pos["slot"]["peak"] = pos["peak"]
+                        decision = STRATEGY.should_sell(
+                            pos["slot"], price,
+                            now=datetime.strptime(date + " " + t, "%Y%m%d %H%M"))
+                        if decision.sell and decision.kind in ("stop_loss", "peak_drop"):
+                            kind = "손절" if decision.kind == "stop_loss" else "최고가"
                             proceeds = price * pos["qty"] * (1 - FEE_RATE)
                             pnl = proceeds - pos["invested"]
                             pool += pnl
@@ -178,9 +200,10 @@ def main() -> None:
 
     # ── 출력 ──
     print(f"시드 {SEED:,}원 · {days[0]} ~ {days[-1]} ({len(days)}거래일) · "
-          f"손절 -{STOP_PCT:g}% · 최고가 -{PEAK_PCT:g}% · 수수료 {FEE_RATE * 100:.4f}% 편도\n")
+          f"청산선 {STRATEGY.display_name.split(' · ', 2)[-1]} · "
+          f"수수료 {FEE_RATE * 100:.4f}% 편도\n")
     head = (f"{'#':>2} {'날짜':>11} {'방향':>7} {'점수':>7} {'매수 종목':>13} {'매수가':>9} "
-            f"{'수량':>6} {'투입액':>11} {'청산일':>8} {'청산가':>9} {'사유':>11} "
+            f"{'수량':>6} {'σ':>6} {'손절선':>7} {'청산선':>7} {'청산일':>8} {'청산가':>9} {'사유':>11} "
             f"{'손익':>11} {'수익률':>8} {'평가자산':>12} {'누적':>8}")
     print(head)
     print("─" * len(head))
@@ -190,7 +213,8 @@ def main() -> None:
         print(
             f"{r['n']:>2} {d[:4]}-{d[4:6]}-{d[6:]:>2} {r.get('방향', '판정불가'):>6} "
             f"{r.get('score', 0):>+7.3f} {r.get('종목', '—'):>12} "
-            f"{r.get('진입가', 0):>9,.0f} {r.get('수량', 0):>6,} {r.get('투입액', 0):>11,.0f} "
+            f"{r.get('진입가', 0):>9,.0f} {r.get('수량', 0):>6,} "
+            f"{r.get('vol', 0):>5.2f}% {r.get('손절선', 0):>6.1f}% {r.get('청산선', 0):>6.1f}% "
             f"{(cd[4:6] + '-' + cd[6:]) if cd else (r.get('비고') or '—'):>8} "
             f"{r.get('청산가', 0):>9,.0f} {r.get('사유', '보유 중' if r.get('종목') else '—'):>10} "
             f"{r.get('손익', 0):>+11,.0f} {r.get('수익률', 0):>+7.2f}% {r['자산']:>12,.0f} "

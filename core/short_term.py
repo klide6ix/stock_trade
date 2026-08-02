@@ -29,7 +29,15 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, NamedTuple
 
-from config import SHORT_TERM_PEAK_DROP_PCT, SHORT_TERM_STOP_LOSS_PCT
+from config import (
+    SHORT_TERM_EXIT_MAX_PCT,
+    SHORT_TERM_EXIT_MIN_PCT,
+    SHORT_TERM_EXIT_MODE,
+    SHORT_TERM_PEAK_DROP_MULT,
+    SHORT_TERM_PEAK_DROP_PCT,
+    SHORT_TERM_STOP_LOSS_MULT,
+    SHORT_TERM_STOP_LOSS_PCT,
+)
 from core.etf_universe import (
     DIRECTION_DOWN,
     DIRECTION_NEUTRAL,
@@ -99,6 +107,11 @@ class EtfDayTradeStrategy:
         close_at_market_end: bool = False,
         neutral_band: float = 0.0,
         proxy: EtfSpec = INDEX_PROXY,
+        exit_mode: str = SHORT_TERM_EXIT_MODE,
+        stop_loss_mult: float = SHORT_TERM_STOP_LOSS_MULT,
+        peak_drop_mult: float = SHORT_TERM_PEAK_DROP_MULT,
+        exit_min_pct: float = SHORT_TERM_EXIT_MIN_PCT,
+        exit_max_pct: float = SHORT_TERM_EXIT_MAX_PCT,
     ) -> None:
         self.stop_loss_pct = stop_loss_pct
         self.peak_drop_pct = peak_drop_pct
@@ -106,13 +119,49 @@ class EtfDayTradeStrategy:
         self.close_at_market_end = close_at_market_end
         self.neutral_band = neutral_band
         self.proxy = proxy
+        self.exit_mode = exit_mode
+        self.stop_loss_mult = stop_loss_mult
+        self.peak_drop_mult = peak_drop_mult
+        self.exit_min_pct = exit_min_pct
+        self.exit_max_pct = exit_max_pct
 
     @property
     def display_name(self) -> str:
         hold = "당일 마감 청산" if self.close_at_market_end else f"{self.hold_days}일 보유"
+        if self.exit_mode == "vol":
+            exits = (f"손절 {self.stop_loss_mult:g}σ · 최고가 {self.peak_drop_mult:g}σ "
+                     f"({self.exit_min_pct:g}~{self.exit_max_pct:g}%)")
+        else:
+            exits = f"손절 -{self.stop_loss_pct:g}% · 최고가 -{self.peak_drop_pct:g}%"
+        return f"지수/인버스 ETF 방향매매 · {hold} · {exits}"
+
+    # ── 청산선 산출 ────────────────────────────────────────────────────────────
+
+    def exit_thresholds(self, slot: dict[str, Any] | None) -> tuple[float, float, str]:
+        """이 포지션에 적용할 (손절%, 트레일링%, 근거 라벨).
+
+        `exit_mode == "vol"` 이면 **진입 시점에 기록된 일간 실현변동성**(`slot["vol"]`)의
+        배수로 산출하고 하한·상한으로 자른다. 진입 후 σ 가 변해도 청산선이 흔들리지
+        않도록 슬롯에 박제된 값을 쓴다 — 보유 중에 기준선이 움직이면 같은 가격이 어제는
+        청산, 오늘은 유지가 되어 판단을 재현할 수 없다.
+
+        σ 를 못 구했으면(판정 실패·구버전 슬롯) 고정 % 로 되돌아간다. 청산은 안전장치라
+        근거가 없다고 비워둘 수 없기 때문이다.
+        """
+        if self.exit_mode != "vol":
+            return self.stop_loss_pct, self.peak_drop_pct, "고정"
+
+        vol = slot_vol(slot)
+        if vol is None:
+            return self.stop_loss_pct, self.peak_drop_pct, "고정(변동성 없음)"
+
+        def clamp(value: float) -> float:
+            return max(self.exit_min_pct, min(self.exit_max_pct, value))
+
         return (
-            f"지수/인버스 ETF 방향매매 · {hold} · "
-            f"손절 -{self.stop_loss_pct:g}% · 최고가 -{self.peak_drop_pct:g}%"
+            clamp(self.stop_loss_mult * vol),
+            clamp(self.peak_drop_mult * vol),
+            f"σ {vol:.2f}%",
         )
 
     # ── 종목 선정 ──────────────────────────────────────────────────────────────
@@ -175,6 +224,7 @@ class EtfDayTradeStrategy:
                 "방향": direction,
                 "방향라벨": direction_label(direction),
                 "시그널점수": signal_score,
+                "변동성(%)": round(float(verdict.get("vol") or 0), 3),
                 "우선순위": rank,
                 "선정사유": (
                     f"{direction_label(direction)} 판정 (점수 {score:+.2f}) · "
@@ -246,13 +296,15 @@ class EtfDayTradeStrategy:
         if not entry or entry <= 0 or current_price <= 0:
             return SellDecision(False)
 
+        stop_pct, peak_pct, basis = self.exit_thresholds(slot)
+
         # 1. 하드 손절 — 매수가 대비 하락
         drop_from_entry = (entry - current_price) / entry * 100
-        if drop_from_entry >= self.stop_loss_pct:
+        if drop_from_entry >= stop_pct:
             return SellDecision(
                 True,
                 f"손절: 매수가 {entry:,.0f}원 대비 -{drop_from_entry:.2f}% "
-                f"(기준 -{self.stop_loss_pct:g}%)",
+                f"(기준 -{stop_pct:.2f}% · {basis})",
                 SELL_STOP_LOSS,
             )
 
@@ -260,11 +312,11 @@ class EtfDayTradeStrategy:
         peak = float(slot.get("peak") or 0)
         if peak > 0:
             drop_from_peak = (peak - current_price) / peak * 100
-            if drop_from_peak >= self.peak_drop_pct:
+            if drop_from_peak >= peak_pct:
                 return SellDecision(
                     True,
                     f"최고가 청산: 최고가 {peak:,.0f}원 대비 -{drop_from_peak:.2f}% "
-                    f"(기준 -{self.peak_drop_pct:g}%)",
+                    f"(기준 -{peak_pct:.2f}% · {basis})",
                     SELL_PEAK_DROP,
                 )
 
@@ -302,6 +354,7 @@ EMPTY_TARGET: dict[str, Any] = {
     "selected_at": None,
     "selection_reason": None,
     "direction": None,              # "up" | "down" — 선정 당시 시장 방향
+    "vol": None,                    # 선정 시점 일간 실현변동성(%) — 청산선 배수의 기준
     "auto_enabled": False,
     # ── 자체 원장 (포지션) ──
     "entry_price": None,            # 단기 매매가 실제로 진입한 체결 평균가 (증권사 평단과 독립)
@@ -346,6 +399,7 @@ def target_to_settings(
         "selected_at": datetime.now().isoformat(),
         "selection_reason": target.get("선정사유"),
         "direction": target.get("방향"),
+        "vol": target.get("변동성(%)"),
     }
 
 
@@ -364,6 +418,17 @@ def position_qty(slot: dict[str, Any] | None) -> int:
 
 def has_position(slot: dict[str, Any] | None) -> bool:
     return position_qty(slot) > 0 and bool(slot.get("code"))
+
+
+def slot_vol(slot: dict[str, Any] | None) -> float | None:
+    """슬롯에 기록된 일간 실현변동성(%). 없거나 비정상이면 None (→ 고정 % fallback)."""
+    if not isinstance(slot, dict):
+        return None
+    try:
+        value = float(slot.get("vol") or 0)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def entry_price(slot: dict[str, Any] | None) -> float | None:

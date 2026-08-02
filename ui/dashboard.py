@@ -8,7 +8,12 @@ from streamlit_autorefresh import st_autorefresh
 from config import (
     CHECK_INTERVAL,
     PRE_MARKET_OPEN,
+    SHORT_TERM_EXIT_MAX_PCT,
+    SHORT_TERM_EXIT_MIN_PCT,
+    SHORT_TERM_EXIT_MODE,
+    SHORT_TERM_PEAK_DROP_MULT,
     SHORT_TERM_PEAK_DROP_PCT,
+    SHORT_TERM_STOP_LOSS_MULT,
     SHORT_TERM_STOP_LOSS_PCT,
 )
 from core.kis_api import get_holdings, get_current_price, get_cash_balance, get_orderable_cash
@@ -509,9 +514,16 @@ def render_short_term(market_open: bool) -> None:
             f"- **자금 풀**: 배정액 {seed:,.0f}원에서 출발해 청산할 때마다 **실현손익이 그대로 누적**됩니다. "
             f"번 만큼 다음 진입 금액이 커지고(복리), 잃은 만큼 작아집니다 — 일반 매수 자금에서 손실을 "
             f"보충하거나 이익을 빼내지 않습니다.\n"
-            f"- **청산(4중)**: ① 손절 매수가 대비 **-{strategy.stop_loss_pct:g}%** · "
-            f"② 매수 후 **최고가 대비 -{strategy.peak_drop_pct:g}%** · ③ {hold_desc}.\n"
-            f"- **손절·최고가 청산이 나면 그날은 재진입하지 않습니다** (다음 거래일 개장부터 재개). "
+            + (
+                f"- **청산(4중)**: ① 손절 매수가 대비 **-{strategy.stop_loss_mult:g}σ** · "
+                f"② 매수 후 **최고가 대비 -{strategy.peak_drop_mult:g}σ** "
+                f"(σ = 진입 시점 일간 실현변동성, {strategy.exit_min_pct:g}~{strategy.exit_max_pct:g}% 로 제한) · "
+                f"③ {hold_desc}.\n"
+                if strategy.exit_mode == "vol" else
+                f"- **청산(4중)**: ① 손절 매수가 대비 **-{strategy.stop_loss_pct:g}%** · "
+                f"② 매수 후 **최고가 대비 -{strategy.peak_drop_pct:g}%** · ③ {hold_desc}.\n"
+            )
+            + f"- **손절·최고가 청산이 나면 그날은 재진입하지 않습니다** (다음 거래일 개장부터 재개). "
             f"보유기간 만료 청산만 같은 날 재진입합니다.\n"
             f"- **별도 슬롯**: 진입가·수량·최고가를 자체 원장에 기록해 일반 보유와 손익을 분리 추적하고, "
             f"매도할 때도 이 수량만 팝니다. 일반 매도 전략은 단기 매매 물량을 건드리지 않습니다."
@@ -622,8 +634,9 @@ def render_short_term(market_open: bool) -> None:
     m5.metric("수익률", f"{profit_pct:+.2f}%" if profit_pct is not None else "—")
 
     if qty > 0 and entry:
-        stop_price = entry * (1 - strategy.stop_loss_pct / 100)
-        peak_exit = peak * (1 - strategy.peak_drop_pct / 100) if peak else 0
+        stop_pct, peak_pct, basis = strategy.exit_thresholds(slot)
+        stop_price = entry * (1 - stop_pct / 100)
+        peak_exit = peak * (1 - peak_pct / 100) if peak else 0
         drop_from_peak = ((peak - price) / peak * 100) if (peak and price) else 0
         exit_plan = (
             f"오늘 {FORCE_CLOSE_TIME} 강제청산"
@@ -631,9 +644,10 @@ def render_short_term(market_open: bool) -> None:
             else f"다음 거래일 개장 시 청산 (진입일 {(_entry_date_label(slot))})"
         )
         st.caption(
-            f"🛡 손절선 **{stop_price:,.0f}원**(-{strategy.stop_loss_pct:g}%) · "
+            f"🛡 손절선 **{stop_price:,.0f}원**(-{stop_pct:.1f}%) · "
             f"최고가 **{peak:,.0f}원** → 청산선 **{peak_exit:,.0f}원**"
-            f"(현재 최고가 대비 -{drop_from_peak:.2f}%) · ⏱ {exit_plan}"
+            f"(-{peak_pct:.1f}%, 현재 최고가 대비 -{drop_from_peak:.2f}%) · "
+            f"기준 {basis} · ⏱ {exit_plan}"
         )
 
     if is_blocked(slot):
@@ -1138,6 +1152,18 @@ def _init_sidebar_state(settings: dict) -> None:
     st.session_state.short_term_close_end_toggle = bool(
         settings.get("short_term_close_at_market_end", False)
     )
+    st.session_state.short_term_exit_mode_radio = (
+        "변동성 배수 (σ)" if str(settings.get("short_term_exit_mode", SHORT_TERM_EXIT_MODE)) == "vol"
+        else "고정 %"
+    )
+    st.session_state.short_term_stop_mult_input = _num(
+        "short_term_stop_loss_mult", SHORT_TERM_STOP_LOSS_MULT, 0.1)
+    st.session_state.short_term_peak_mult_input = _num(
+        "short_term_peak_drop_mult", SHORT_TERM_PEAK_DROP_MULT, 0.1)
+    st.session_state.short_term_exit_min_input = _num(
+        "short_term_exit_min_pct", SHORT_TERM_EXIT_MIN_PCT, 0.1)
+    st.session_state.short_term_exit_max_input = _num(
+        "short_term_exit_max_pct", SHORT_TERM_EXIT_MAX_PCT, 0.1)
 
     st.session_state.buy_enabled_toggle = bool(settings.get("buy_enabled", False))
     st.session_state.primary_buy_select = primary_key
@@ -1210,6 +1236,29 @@ def _on_short_term_stop_loss_change() -> None:
 
 def _on_short_term_peak_drop_change() -> None:
     set_setting("short_term_peak_drop_pct", float(st.session_state.short_term_peak_drop_input))
+
+
+def _on_short_term_exit_mode_change() -> None:
+    set_setting(
+        "short_term_exit_mode",
+        "vol" if st.session_state.short_term_exit_mode_radio.startswith("변동성") else "fixed",
+    )
+
+
+def _on_short_term_stop_mult_change() -> None:
+    set_setting("short_term_stop_loss_mult", float(st.session_state.short_term_stop_mult_input))
+
+
+def _on_short_term_peak_mult_change() -> None:
+    set_setting("short_term_peak_drop_mult", float(st.session_state.short_term_peak_mult_input))
+
+
+def _on_short_term_exit_min_change() -> None:
+    set_setting("short_term_exit_min_pct", float(st.session_state.short_term_exit_min_input))
+
+
+def _on_short_term_exit_max_change() -> None:
+    set_setting("short_term_exit_max_pct", float(st.session_state.short_term_exit_max_input))
 
 
 def _on_short_term_close_end_change() -> None:
@@ -1347,22 +1396,64 @@ def render_sidebar() -> tuple[bool, int, str, str, float]:
             on_change=_on_short_term_budget_change,
             help="단기 매매에 배정할 자금(씨드). 청산할 때마다 실현손익이 누적되며, 이 값을 바꾸면 자금 풀이 새 금액으로 재설정됩니다.",
         )
-        st.number_input(
-            "손절 기준 (%) — 매수가 대비",
-            min_value=0.5, max_value=30.0,
-            step=0.5,
-            key="short_term_stop_loss_input",
-            on_change=_on_short_term_stop_loss_change,
-            help="진입가 대비 이 비율 이상 하락하면 전량 시장가 청산. 청산 후 그날은 재진입하지 않습니다.",
+        st.radio(
+            "청산선 산출 방식",
+            options=["변동성 배수 (σ)", "고정 %"],
+            key="short_term_exit_mode_radio",
+            on_change=_on_short_term_exit_mode_change,
+            horizontal=True,
+            help="변동성 배수: 청산선 = 배수 × 진입 시점 일간 실현변동성(σ). 시장이 조용하면 "
+                 "자동으로 좁아지고 거칠어지면 넓어집니다. 고정 %: 국면과 무관하게 같은 비율.",
         )
-        st.number_input(
-            "최고가 대비 청산 (%)",
-            min_value=0.5, max_value=30.0,
-            step=0.5,
-            key="short_term_peak_drop_input",
-            on_change=_on_short_term_peak_drop_change,
-            help="매수 이후 기록된 최고가 대비 이 비율 이상 되밀리면 전량 시장가 청산.",
-        )
+        if st.session_state.short_term_exit_mode_radio.startswith("변동성"):
+            st.number_input(
+                "손절 배수 (σ) — 매수가 대비",
+                min_value=0.5, max_value=6.0, step=0.1,
+                key="short_term_stop_mult_input",
+                on_change=_on_short_term_stop_mult_change,
+                help="손절선 = 이 배수 × 진입 시점 σ. 검증 권장값 2.5σ.",
+            )
+            st.number_input(
+                "최고가 청산 배수 (σ)",
+                min_value=0.5, max_value=6.0, step=0.1,
+                key="short_term_peak_mult_input",
+                on_change=_on_short_term_peak_mult_change,
+                help="트레일링 청산선 = 이 배수 × 진입 시점 σ. 검증 권장값 2.0σ. "
+                     "좁힐수록 급락은 빨리 끊지만 눌림에 털릴 위험(whipsaw)이 커집니다.",
+            )
+            c_min, c_max = st.columns(2)
+            with c_min:
+                st.number_input(
+                    "하한 (%)", min_value=0.5, max_value=30.0, step=0.5,
+                    key="short_term_exit_min_input",
+                    on_change=_on_short_term_exit_min_change,
+                    help="배수 산출 결과가 이보다 작으면 이 값을 씁니다.",
+                )
+            with c_max:
+                st.number_input(
+                    "상한 (%)", min_value=0.5, max_value=40.0, step=0.5,
+                    key="short_term_exit_max_input",
+                    on_change=_on_short_term_exit_max_change,
+                    help="배수 산출 결과가 이보다 크면 이 값을 씁니다. 급등락 하루가 σ 를 "
+                         "밀어올려 청산선이 과도하게 넓어지는 것을 막습니다.",
+                )
+        else:
+            st.number_input(
+                "손절 기준 (%) — 매수가 대비",
+                min_value=0.5, max_value=30.0,
+                step=0.5,
+                key="short_term_stop_loss_input",
+                on_change=_on_short_term_stop_loss_change,
+                help="진입가 대비 이 비율 이상 하락하면 전량 시장가 청산. 청산 후 그날은 재진입하지 않습니다.",
+            )
+            st.number_input(
+                "최고가 대비 청산 (%)",
+                min_value=0.5, max_value=30.0,
+                step=0.5,
+                key="short_term_peak_drop_input",
+                on_change=_on_short_term_peak_drop_change,
+                help="매수 이후 기록된 최고가 대비 이 비율 이상 되밀리면 전량 시장가 청산.",
+            )
         st.toggle(
             "당일 마감 강제청산",
             key="short_term_close_end_toggle",

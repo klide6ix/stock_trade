@@ -5,7 +5,12 @@ from typing import Any
 
 from config import (
     PRE_MARKET_OPEN,
+    SHORT_TERM_EXIT_MAX_PCT,
+    SHORT_TERM_EXIT_MIN_PCT,
+    SHORT_TERM_EXIT_MODE,
+    SHORT_TERM_PEAK_DROP_MULT,
     SHORT_TERM_PEAK_DROP_PCT,
+    SHORT_TERM_STOP_LOSS_MULT,
     SHORT_TERM_STOP_LOSS_PCT,
     STOP_LOSS_PCT,
 )
@@ -42,8 +47,13 @@ DEFAULTS: dict[str, Any] = {
     # 이익이 나면 다음 진입 금액이 커지고(복리), 손실이 나면 줄어든 금액으로 들어간다.
     # None = 미초기화 → 배정액으로 시작. 일반 매수 자금과 서로 보충하지 않는다.
     "short_term_pool": None,
-    "short_term_stop_loss_pct": SHORT_TERM_STOP_LOSS_PCT,  # 매수가 대비 손절 하락률 %
-    "short_term_peak_drop_pct": SHORT_TERM_PEAK_DROP_PCT,  # 매수 이후 최고가 대비 청산 하락률 %
+    "short_term_exit_mode": SHORT_TERM_EXIT_MODE,          # "vol"(변동성 배수) | "fixed"(고정 %)
+    "short_term_stop_loss_mult": SHORT_TERM_STOP_LOSS_MULT,  # 손절 = 이 배수 × 진입 시점 σ
+    "short_term_peak_drop_mult": SHORT_TERM_PEAK_DROP_MULT,  # 트레일링 = 이 배수 × 진입 시점 σ
+    "short_term_exit_min_pct": SHORT_TERM_EXIT_MIN_PCT,    # 배수 산출 결과의 하한 %
+    "short_term_exit_max_pct": SHORT_TERM_EXIT_MAX_PCT,    # 배수 산출 결과의 상한 %
+    "short_term_stop_loss_pct": SHORT_TERM_STOP_LOSS_PCT,  # 고정 모드 손절 % (배수 모드에선 fallback)
+    "short_term_peak_drop_pct": SHORT_TERM_PEAK_DROP_PCT,  # 고정 모드 최고가 대비 청산 %
     "short_term_close_at_market_end": False, # True 면 당일 15:15 강제청산 (오버나이트 미보유)
     # 후보 목록 — 오늘 방향에 맞는 ETF(1순위 + 대체). selected_at 날짜가 오늘과 다르면 재선정.
     "short_term_candidates": {
