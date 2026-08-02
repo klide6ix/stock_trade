@@ -37,6 +37,7 @@ from core.short_term import (
     has_pending,
     has_position,
     is_blocked,
+    keeps_previous_verdict,
     mark_entry,
     position_qty,
     set_position_qty,
@@ -212,6 +213,24 @@ def short_term_buy_start_label(now: datetime | None = None) -> str:
         minutes=short_term_buy_delay_min()
     )
     return start.strftime("%H:%M")
+
+
+# 개장 직후 '최종 방향 재판정' 을 허용하는 마감 시각. 이 창 안에서 하루 1회만 수행한다.
+# 09:00 을 넘기면 오늘 일봉이 생기면서 갭 신호가 예상체결가(추정) → 실시간 등락률(실측)로
+# 바뀌므로, 여기서 한 번 더 판정하면 예상체결가의 추정 오차가 방향 판정에서 사라진다.
+# 지금까지의 검증(_simulate_july·_check_open_drift)이 모두 '실제 시가 기준 갭' 을 쓴 것과도
+# 일치한다. 창을 좁게 둔 이유는 장중에 트레이더를 재시작해도 오후에 방향이 뒤집히지
+# 않게 하기 위함이다 — 이 전략은 어디까지나 '개장 시점의 방향' 에 하루를 건다.
+OPEN_REJUDGE_UNTIL = "09:05"
+
+
+def open_rejudge_window(now: datetime | None = None) -> bool:
+    """개장 직후 최종 방향 재판정 허용 시간 여부 — 평일 09:00 ~ `OPEN_REJUDGE_UNTIL`."""
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return _parse_hhmm("09:00", "09:00") <= t <= _parse_hhmm(OPEN_REJUDGE_UNTIL, "09:05")
 
 
 def short_term_buy_window_open(now: datetime | None = None) -> bool:
@@ -1085,12 +1104,17 @@ class Trader:
         self._prepare_short_term(force=force_short_term)
         return candidates
 
-    def _prepare_short_term(self, force: bool = False) -> None:
+    def _prepare_short_term(self, force: bool = False, quiet: bool = False) -> None:
         """오늘의 시장 방향을 판정해 ETF 후보·활성 슬롯을 미리 준비 (주문 없음).
 
-        개장 30분 전(장 전 준비 시각)에 호출되며, 평소에는 일단위 날짜 가드
-        (`candidates_need_refresh`)가 있어 하루 1회만 실제 판정한다. `force=True` 면
-        가드를 건너뛰고 재판정한다.
+        장전 창(08:30~09:00)에서는 **매 사이클** 호출되고, 개장 직후에 한 번 더 호출된다.
+        평소에는 일단위 날짜 가드(`candidates_need_refresh`)가 있어 하루 1회만 실제
+        판정하므로, 다시 판정하려면 `force=True` 로 가드를 건너뛴다.
+
+        Args:
+            force: 일단위 가드를 무시하고 다시 판정한다.
+            quiet: 상태가 그대로일 때의 반복 로그를 억제한다 (매분 재판정용).
+                   방향·종목이 실제로 바뀌면 quiet 여부와 무관하게 기록한다.
         """
         slot = get_setting("short_term_trade")
         if not isinstance(slot, dict):
@@ -1103,22 +1127,37 @@ class Trader:
             return
         slot = self._reconcile_short_term_ledger(slot, holdings)
         general, _ = split_holdings(holdings, slot)
-        self._short_term_refresh_candidates(slot, general, force=force)
+        self._short_term_refresh_candidates(slot, general, force=force, quiet=quiet)
 
-    def _short_term_refresh_candidates(self, slot: dict, general: dict, force: bool = False) -> dict:
-        """후보 목록 일단위 갱신 + 활성 슬롯 처리.
+    def _short_term_refresh_candidates(
+        self,
+        slot: dict,
+        general: dict,
+        force: bool = False,
+        quiet: bool = False,
+    ) -> dict:
+        """후보 목록 갱신 + 활성 슬롯 처리.
 
         후보 목록(`short_term_candidates`)의 selected_at 날짜가 오늘과 다르면 오늘의 시장
         방향을 판정해 ETF 후보를 새로 세운다. 일반 매수로 이미 보유 중인 종목은 후보에서
         제외해(`exclude_codes`) 대체 ETF 가 선택되게 한다 — 평단 혼입 회피.
 
+        재판정이 잦아지면서(장전 매분 + 개장 직후) 지켜야 할 규칙이 셋 생겼다.
+          1. **갭을 쓴 판정 우선** — 갭 없이 나온 판정이 이미 갭을 반영한 판정을 덮지
+             않는다 (`keeps_previous_verdict`).
+          2. **사용자 선택 보존** — 미보유 슬롯이라도 사용자가 대시보드에서 고른 종목이
+             새 후보 목록에 여전히 있으면 그 종목을 유지한다. 무조건 #1 로 덮으면 매분
+             재판정이 사용자의 선택을 1분 만에 되돌린다.
+          3. **오늘의 진입 차단 유지** — 어제의 차단은 해제하되, 오늘 손절로 걸린 차단은
+             재판정으로 풀리면 안 된다.
+
         활성 슬롯:
           - 포지션 **보유 중** → 유지 (보호). 청산은 `should_sell` 이 판단한다.
-          - **미보유** → 새 후보 #1 을 활성으로 지정하고 진입 차단(blocked_date)을 해제한다
-            (날짜가 바뀌었으므로 어제의 손절 차단은 더 이상 유효하지 않다).
+          - **미보유** → 위 규칙대로 종목을 정해 활성 슬롯을 갱신한다.
 
         Args:
-            force: True 면 일단위 날짜 가드를 무시하고 다시 판정한다 (장 전 준비 창).
+            force: True 면 일단위 날짜 가드를 무시하고 다시 판정한다.
+            quiet: 상태 불변 시 반복 로그를 억제한다 (매분 재판정용).
 
         Returns:
             이후 로직에서 사용할 (갱신됐을 수 있는) 활성 슬롯 dict.
@@ -1131,29 +1170,48 @@ class Trader:
         items, verdict = self.short_term_strategy.find_targets(
             n=SHORT_TERM_CANDIDATE_COUNT, exclude_codes=exclude
         )
+        # 갭(가중치 0.50)이 빠진 판정으로 오늘의 갭 판정을 덮지 않는다.
+        if keeps_previous_verdict(container, verdict):
+            return slot
         set_setting("short_term_candidates", candidates_to_settings(items, verdict))
 
         if not items:
-            log("[단기매매] 후보 재선정 — 진입 대상 없음 (중립 판정이거나 가용 ETF 없음)")
+            if not quiet:
+                log("[단기매매] 후보 재선정 — 진입 대상 없음 (중립 판정이거나 가용 ETF 없음)")
             return slot
 
         if has_position(slot):
-            log(
-                f"[단기매매] 활성 종목 {slot.get('name')}({slot.get('code')}) 보유 중 — 유지 "
-                f"(후보 목록만 갱신, 청산은 보유기간·손절 판정에 위임)"
-            )
+            if not quiet:
+                log(
+                    f"[단기매매] 활성 종목 {slot.get('name')}({slot.get('code')}) 보유 중 — 유지 "
+                    f"(후보 목록만 갱신, 청산은 보유기간·손절 판정에 위임)"
+                )
             return slot
 
-        new_slot = target_to_settings(
+        # 사용자가 고른 종목이 아직 후보면 그대로, 방향이 뒤집혀 사라졌으면 새 #1 로.
+        chosen = next(
+            (i for i in items if i.get("종목코드") == slot.get("code")),
             items[0],
+        )
+        if (
+            chosen.get("종목코드") == slot.get("code")
+            and chosen.get("선정사유") == slot.get("selection_reason")
+        ):
+            return slot     # 종목·근거 모두 그대로 — 불필요한 쓰기·로그 생략
+
+        changed_code = chosen.get("종목코드") != slot.get("code")
+        new_slot = target_to_settings(
+            chosen,
             auto_enabled=bool(slot.get("auto_enabled", False)),
-            blocked_date=None,  # 날짜가 바뀌었으므로 어제의 재진입 차단 해제
+            # 어제 차단은 날짜가 바뀌었으니 해제, 오늘 차단은 재판정으로 풀지 않는다.
+            blocked_date=slot.get("blocked_date") if is_blocked(slot) else None,
         )
         set_setting("short_term_trade", new_slot)
-        log(
-            f"[단기매매] 오늘의 매매 대상: {new_slot['name']}({new_slot['code']}) - "
-            f"{new_slot.get('selection_reason', '')}"
-        )
+        if changed_code or not quiet:
+            log(
+                f"[단기매매] 오늘의 매매 대상: {new_slot['name']}({new_slot['code']}) - "
+                f"{new_slot.get('selection_reason', '')}"
+            )
         return new_slot
 
     def _short_term_switch(self, slot: dict, general: dict, auto_enabled: bool) -> None:
@@ -1319,6 +1377,8 @@ class Trader:
         # 방금 prepare_market_open 으로 끝낸 셈이라 오늘 날짜로 마킹한다. 그 이전(예: 새벽)에
         # 시작했다면 None 으로 두어, 장전 시작 시각이 되면 신선한 데이터로 다시 선정한다.
         prep_date = now.date() if (is_trading_time() or is_pre_market(now)) else None
+        # 개장 직후 최종 재판정을 마친 날짜 — 실측 갭으로 하루 1회만 다시 판정한다.
+        open_judge_date = None
 
         if is_trading_time():
             self.execute_initial_buy(candidates)
@@ -1331,6 +1391,17 @@ class Trader:
             self._sync_sell_settings()
             now = datetime.now()
             if is_trading_time():
+                # 개장 직후 1회 — 실측 갭(실시간 등락률)으로 오늘 방향을 최종 확정한 뒤 진입한다.
+                # 장전 예상체결가는 어디까지나 추정이라, 확정 시가가 나온 직후의 판정이
+                # 가장 정확하다. 진입은 다음 몇십 초 뒤로 밀리지만 실측 비용은 +0.03% 수준
+                # (scripts/_check_open_drift.py) 이라 정보량 개선이 훨씬 크다.
+                if open_judge_date != now.date() and open_rejudge_window(now):
+                    log("[개장판정] 실측 갭(실시간 등락률)으로 오늘 방향 최종 재판정")
+                    try:
+                        self._prepare_short_term(force=True)
+                    except Exception as e:
+                        log(f"[개장판정] 재판정 실패 — 장전 판정 유지: {e}")
+                    open_judge_date = now.date()
                 if not did_initial_buy:
                     self.execute_initial_buy(candidates)
                     did_initial_buy = True
@@ -1343,7 +1414,7 @@ class Trader:
                 except Exception as e:
                     log(f"[단기매매] 처리 중 오류: {e}")
             elif is_pre_market(now):
-                # 장 전 준비: 매매 없이 후보만 하루 1회 사전 선정. 개장 시 신선한 후보로 진입.
+                # 장 전 준비: 매매 없이 후보만 사전 선정. 개장 시 신선한 후보로 진입.
                 if prep_date != now.date():
                     log(f"[장전준비] 매수 후보·시장 방향 사전 선정 시작 (매매는 개장 후 — 현재 {now.strftime('%H:%M')})")
                     # force: 장전 창 이전에 기동해 오늘 날짜로 판정 기록이 남았더라도,
@@ -1351,6 +1422,13 @@ class Trader:
                     candidates = self.prepare_market_open(force_short_term=True)
                     prep_date = now.date()
                     did_initial_buy = False  # 사전 선정된 후보로 개장 후 초기매수 실행
+                else:
+                    # 방향만 매 사이클 재판정한다. 동시호가는 08:30 에 막 열려 호가가 가장
+                    # 얇고 예상체결가도 그때가 가장 부정확하며, 예상체결가가 언제 형성될지
+                    # (또는 stale 이 언제 풀릴지) 미리 알 수 없다. 매분 다시 보면 갭을 쓸 수
+                    # 있게 된 시점부터 자동으로 반영되고, 개장에 가까운 값일수록 정확해진다.
+                    # 무거운 매수 후보 스캔(scan_buy_candidates)은 위에서 하루 1회만 돈다.
+                    self._prepare_short_term(force=True, quiet=True)
             else:
                 log("장 운영 시간 외 - 대기 중")
 

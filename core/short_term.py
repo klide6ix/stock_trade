@@ -592,6 +592,41 @@ def candidates_to_settings(
     }
 
 
+def keeps_previous_verdict(
+    container: dict[str, Any] | None,
+    verdict: dict[str, Any] | None,
+    now: datetime | None = None,
+) -> bool:
+    """새 판정을 버리고 저장된 판정을 유지해야 하면 True.
+
+    장전 창에서는 1분마다 방향을 다시 판정한다. 그런데 갭 신호(가중치 0.50)는 예상체결가
+    조회 실패·stale·동시호가 미형성으로 빠질 수 있고, 그렇게 나온 **갭 없는 판정이 이미
+    갭을 반영한 판정을 덮으면** 그날 정보량의 절반을 스스로 버리는 셈이 된다.
+
+    그래서 규칙은 하나다 — **갭을 쓴 판정이 갭을 못 쓴 판정보다 우선한다.** 오늘 이미 갭을
+    반영한 판정이 저장돼 있는데 새 판정이 갭 없이 나왔다면 새 판정을 버린다. 새 판정이 갭을
+    썼다면(장전 예상체결가든 개장 후 실시간 등락률이든) 항상 최신 값으로 갱신한다.
+
+    Args:
+        container: 저장된 후보 컨테이너 (`short_term_candidates`).
+        verdict: 방금 나온 방향 판정 결과.
+        now: 판정 기준 시각 (테스트 주입용).
+    """
+    if isinstance(verdict, dict) and verdict.get("gap_source"):
+        return False        # 새 판정이 갭을 썼다 → 항상 갱신
+    if not isinstance(container, dict):
+        return False
+    previous = container.get("direction")
+    if not isinstance(previous, dict) or not previous.get("gap_source"):
+        return False        # 저장된 판정도 갭이 없다 → 최신으로 갱신
+    # 저장된 갭 판정이 '오늘' 것일 때만 우선한다 (어제 갭은 오늘 방향의 근거가 아니다).
+    try:
+        stored = datetime.fromisoformat(str(container.get("selected_at"))).date()
+    except (TypeError, ValueError):
+        return False
+    return stored == (now or datetime.now()).date()
+
+
 def candidates_need_refresh(
     container: dict[str, Any] | None,
     today: datetime | None = None,
