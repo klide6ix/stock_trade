@@ -37,6 +37,11 @@ from scripts._simulate_recent import SEED, daily_vols, judge_at_open, run
 FIRST_DAY = "20260310"      # 분봉 캐시가 덮는 첫 거래일
 LAST_DAY = "20260731"
 
+# 변동성이 극단적이라 결론을 왜곡할 수 있는 구간 — 이 날짜부터 표본에서 뺀 결과를 함께 낸다.
+# 이 5거래일(07-27~31)은 표본의 **마지막 주**라 제외 = 단순 절단이다. 중간 구간을 도려내면
+# 그 앞뒤가 이어붙어 존재하지 않던 오버나이트가 생기므로, 그 경우엔 이 방식을 쓸 수 없다.
+EXCLUDE_FROM = "20260727"
+
 
 def sharpe_from_curve(rows: list[dict]) -> float:
     """평가자산 곡선의 **일별** 수익률 기준 연환산 Sharpe.
@@ -79,13 +84,16 @@ def report(name: str, result: dict) -> None:
     print(f"  청산 사유   {' '.join(f'{k}{v}' for k, v in sorted(kinds.items()))}")
 
 
-def main() -> None:
-    _load_cache()
-    days_all = [d for d in proxy_dates if d <= LAST_DAY]
-    days = [d for d in days_all if d >= FIRST_DAY]
-    vols = daily_vols(days_all)
+def analyze(days: list[str], vols: dict[str, float], title: str) -> dict:
+    """한 표본에 대해 A/B 비교 + 구간 분해 + train/test 분할을 출력.
 
+    Returns:
+        {"A": result, "B": result} — 호출자가 표본 간 비교에 쓴다.
+    """
     base = EtfDayTradeStrategy()
+    print("\n" + "#" * 78)
+    print(f"# {title}")
+    print("#" * 78)
     print(f"분석 구간 {days[0]} ~ {days[-1]} ({len(days)}영업일) · 시드 {SEED:,}원")
     print(f"청산선 {base.display_name.split(' · ', 2)[-1]} — 두 모드 동일 적용")
     print("=" * 78)
@@ -96,7 +104,6 @@ def main() -> None:
         strategy = EtfDayTradeStrategy(close_at_market_end=flag)
         results[label] = run(days, vols, strategy)
         report(label, results[label])
-    _save_cache()
 
     # ── 구간 분해: 수익이 장중에서 나오나, 밤사이에 나오나 ──
     print("\n" + "=" * 78)
@@ -163,6 +170,64 @@ def main() -> None:
     scale = st.stdev(rb) / st.stdev(ra)
     print(f"\n동일 변동성 환산: A 를 ×{scale:.3f} 로 축소하면 거래당 σ 가 B 와 같아진다 → "
           f"기대수익 {st.mean(ra) * scale:+.2f}% vs B {st.mean(rb):+.2f}%")
+    return {"A": results["A. 1일 보유 (현행 — 오버나이트 보유)"],
+            "B": results["B. 당일 마감 청산 (15:15, 오버나이트 미보유)"]}
+
+
+def main() -> None:
+    _load_cache()
+    days_all = [d for d in proxy_dates if d <= LAST_DAY]
+    full = [d for d in days_all if d >= FIRST_DAY]
+    trimmed = [d for d in full if d < EXCLUDE_FROM]
+    vols = daily_vols(days_all)
+
+    # 제외 구간이 표본 끝에 붙어 있어야 절단으로 처리할 수 있다.
+    assert trimmed == full[:len(trimmed)], "제외 구간이 표본 중간이면 절단이 성립하지 않는다"
+
+    describe_excluded(days_all)
+    out = {
+        "제외 후": analyze(trimmed, vols,
+                        f"제외 후 — {EXCLUDE_FROM}~{LAST_DAY} 5거래일 제외 ({len(trimmed)}영업일)"),
+        "전체": analyze(full, vols, f"전체 {len(full)}영업일 (참고 — 제외 전)"),
+    }
+    _save_cache()
+
+    print("\n" + "=" * 78)
+    print("표본 간 비교 — 제외 구간이 결론을 만들고 있었나")
+    print("=" * 78)
+    print(f"{'표본':>10} {'영업일':>6} {'A. 1일 보유':>13} {'B. 마감 청산':>13} {'차이':>10} "
+          f"{'A Sharpe':>9} {'B Sharpe':>9}")
+    for label, res in out.items():
+        ra_ = (res["A"]["equity"] / SEED - 1) * 100
+        rb_ = (res["B"]["equity"] / SEED - 1) * 100
+        n = len(res["A"]["rows"])
+        print(f"{label:>10} {n:>6} {ra_:>+12.2f}% {rb_:>+12.2f}% {ra_ - rb_:>+9.2f}%p "
+              f"{sharpe_from_curve(res['A']['rows']):>+9.2f} "
+              f"{sharpe_from_curve(res['B']['rows']):>+9.2f}")
+
+
+def describe_excluded(days_all: list[str]) -> None:
+    """제외 구간이 실제로 얼마나 격했는지 — '변동성이 심하다' 는 전제를 수치로 확인."""
+    print("=" * 78)
+    print(f"제외 구간 {EXCLUDE_FROM} ~ {LAST_DAY} 실측 (KODEX 200 일봉)")
+    print("=" * 78)
+    body = [d for d in days_all if d >= EXCLUDE_FROM]
+    rest = [d for d in days_all if FIRST_DAY <= d < EXCLUDE_FROM]
+
+    def moves(ds):
+        out = []
+        for d in ds:
+            i = proxy_dates.index(d)
+            prev = proxy_bars[proxy_dates[i - 1]]["close"]
+            out.append((proxy_bars[d]["close"] - prev) / prev * 100)
+        return out
+
+    ex, keep = moves(body), moves(rest)
+    for d, m in zip(body, ex):
+        print(f"  {d[:4]}-{d[4:6]}-{d[6:]}  전일대비 {m:+7.2f}%")
+    print(f"  제외 5일 평균 |등락| {st.mean(map(abs, ex)):.2f}% · σ {st.stdev(ex):.2f}%")
+    print(f"  나머지 {len(keep)}일 평균 |등락| {st.mean(map(abs, keep)):.2f}% · "
+          f"σ {st.stdev(keep):.2f}%  → 제외 구간이 {st.stdev(ex) / st.stdev(keep):.1f}배 격함")
 
 
 if __name__ == "__main__":
