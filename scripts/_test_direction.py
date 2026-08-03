@@ -94,6 +94,43 @@ s_wild = next(s for s in judge(wild)["signals"] if "전일" in s["신호"])["점
 check("동일 등락률 → 고변동 국면에서 점수 절대값 감소", abs(s_wild) < abs(s_calm),
       f"저변동 {s_calm:+.3f} vs 고변동 {s_wild:+.3f}")
 
+print("\n── 5-b. MAD 기반 변동성 (realized_vol_mad) ──")
+import random as _random
+
+
+def _series(returns):
+    """등락률 리스트(%)로 최신순 종가 시계열 생성."""
+    px = [100.0]
+    for r in returns:
+        px.append(px[-1] * (1 + r / 100))
+    return list(reversed(px))
+
+
+_rng = _random.Random(0)
+_normal = _series([_rng.gauss(0, 1.0) for _ in range(30)])   # 정규분포 ±1%
+_closes = _normal
+check("등락 없으면 하한 적용", md.realized_vol_mad(FLAT) == md.VOL_FLOOR_PCT)
+check("표본 부족 시 하한", md.realized_vol_mad([100.0]) == md.VOL_FLOOR_PCT)
+_v_std, _v_mad = md.realized_vol(_closes), md.realized_vol_mad(_closes)
+check("정규분포 표본에서는 표준편차와 근사", abs(_v_mad - _v_std) / _v_std < 0.25,
+      f"σ {_v_std:.2f}% vs MAD {_v_mad:.2f}%")
+
+# 1.4826 은 정규분포 전제 상수다. 등락폭이 고르게 큰(양봉단조·꼬리 얇은) 표본에서는
+# MAD 기반이 오히려 **과대** 추정된다 — 2026-07 실데이터에서 MAD 가 표준편차보다
+# 30~39% 크게 나온 원인이므로 성질로 못박아 둔다.
+_bimodal = _series([1.0, -1.0] * 15)
+check("꼬리 얇은 표본에서는 MAD 가 과대 추정",
+      md.realized_vol_mad(_bimodal) > md.realized_vol(_bimodal) * 1.3,
+      f"σ {md.realized_vol(_bimodal):.2f}% vs MAD {md.realized_vol_mad(_bimodal):.2f}%")
+
+# 이상치 1개 주입 — 표준편차는 크게 흔들리고 MAD 는 거의 그대로여야 한다.
+_spiked = list(_closes)
+_spiked[0] = _spiked[0] * 1.25              # 최근 하루 +25%
+_s_std, _s_mad = md.realized_vol(_spiked), md.realized_vol_mad(_spiked)
+check("이상치에 표준편차는 크게 반응", _s_std / _v_std > 1.5, f"{_v_std:.2f}% → {_s_std:.2f}%")
+check("이상치에 MAD 는 거의 불변", _s_mad / _v_mad < 1.2, f"{_v_mad:.2f}% → {_s_mad:.2f}%")
+check("MAD 도 하한을 지킨다", md.realized_vol_mad([100.0, 100.0, 100.0]) >= md.VOL_FLOOR_PCT)
+
 print("\n── 6. 방향 분기 · 중립 밴드 ──")
 v = judge(drop, gap=5.0)
 check("종합 상승 → DIRECTION_UP", v["direction"] == DIRECTION_UP, f"{v['score']:+.3f}")

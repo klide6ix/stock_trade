@@ -114,6 +114,38 @@ def realized_vol(closes: list[float], window: int = VOL_WINDOW) -> float:
     return max(VOL_FLOOR_PCT, statistics.pstdev(rets))
 
 
+# MAD(중앙값 절대편차)를 표준편차와 같은 척도로 맞추는 상수.
+# 정규분포에서 MAD ≈ 0.6745σ 이므로 1/0.6745 = 1.4826 을 곱하면 σ 와 직접 비교된다.
+_MAD_TO_SIGMA = 1.4826
+
+
+def realized_vol_mad(closes: list[float], window: int = VOL_WINDOW) -> float:
+    """MAD 기반 일간 변동성(%) — 급등락 하루에 덜 흔들리는 강건(robust) 추정치.
+
+    표준편차는 편차를 **제곱**해서 평균하므로 이상치 하나가 결과를 지배한다. 실측:
+    2026-07-31 의 +24.17% 하루가 σ 를 5.16% → 7.50%(+45%) 로 밀어올렸고, 그 값이 20거래일
+    동안 유지되면서 청산선을 그만큼 넓힌 채 방치했다. MAD 는 편차의 **중앙값**이라 표본의
+    절반이 오염돼야 무너지므로(breakdown point 50%), 그런 하루는 순위 하나로만 반영된다.
+
+    Args:
+        closes: 종가 시계열 (최신순, index 0 = 가장 최근).
+
+    Returns:
+        일간 변동성(%). `realized_vol()` 과 같은 척도가 되도록 1.4826 을 곱한다.
+        표본이 부족하거나 0 에 수렴하면 `VOL_FLOOR_PCT`.
+    """
+    rets: list[float] = []
+    for i in range(min(window, len(closes) - 1)):
+        prev = closes[i + 1]
+        if prev > 0:
+            rets.append((closes[i] - prev) / prev * 100)
+    if len(rets) < 2:
+        return VOL_FLOOR_PCT
+    center = statistics.median(rets)
+    mad = statistics.median([abs(r - center) for r in rets])
+    return max(VOL_FLOOR_PCT, mad * _MAD_TO_SIGMA)
+
+
 def _signal(name: str, raw: str, score: float, weight: float) -> dict[str, Any]:
     return {"신호": name, "값": raw, "점수": round(score, 3), "가중치": weight}
 

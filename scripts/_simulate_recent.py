@@ -35,7 +35,6 @@ from core.market_direction import (
     _norm,
     realized_vol,
 )
-from core.market_direction import realized_vol
 from core.short_term import EtfDayTradeStrategy, mark_entry
 from core.strategy.buy._indicators import sma
 from scripts._check_open_drift import (
@@ -87,18 +86,23 @@ def judge_at_open(date: str, open_price: float) -> float | None:
     return _clip(wsum / total) if total else None
 
 
-def main() -> None:
-    _load_cache()
-    days_all = [d for d in proxy_dates if d <= LAST_DAY]
-    days = days_all[-DAYS_BACK:]
-
-    # 각 날짜의 진입 시점 σ — 그날 이전 확정 종가만 사용 (알고리즘과 동일).
+def daily_vols(days_all: list[str], vol_fn=realized_vol) -> dict[str, float]:
+    """각 날짜의 진입 시점 σ — 그날 이전 확정 종가만 사용 (알고리즘과 동일)."""
     vols = {}
     for d in days_all:
         idx = proxy_dates.index(d)
         closes = [proxy_bars[x]["close"] for x in reversed(proxy_dates[:idx])]
-        vols[d] = realized_vol(closes) if len(closes) > 2 else 1.0
+        vols[d] = vol_fn(closes) if len(closes) > 2 else 1.0
+    return vols
 
+
+def run(days: list[str], vols: dict[str, float], strategy=None) -> dict:
+    """시뮬레이션 본체 — 청산 판정은 `strategy.should_sell` 에 그대로 위임한다.
+
+    Returns:
+        {rows, trades, pool, equity} — rows 는 일자별 표, pool 은 실현 자금 풀.
+    """
+    strategy = strategy or STRATEGY
     pool = float(SEED)
     pos = None
     blocked = None
@@ -113,7 +117,7 @@ def main() -> None:
             if hit:
                 _, price = hit
                 pos["slot"]["peak"] = pos["peak"]
-                decision = STRATEGY.should_sell(
+                decision = strategy.should_sell(
                     pos["slot"], price,
                     now=datetime.strptime(date + " 0900", "%Y%m%d %H%M"))
                 kind = {"stop_loss": "손절", "peak_drop": "최고가"}.get(
@@ -151,7 +155,7 @@ def main() -> None:
                     vol = vols[date]
                     slot = mark_entry({"code": code, "vol": vol}, entry, qty,
                                       now=datetime.strptime(date, "%Y%m%d"))
-                    stop_pct, peak_pct, _ = STRATEGY.exit_thresholds(slot)
+                    stop_pct, peak_pct, _ = strategy.exit_thresholds(slot)
                     pos = {"code": code, "entry": entry, "qty": qty, "date": date,
                            "invested": qty * entry * (1 + FEE_RATE), "peak": entry,
                            "row": row, "slot": slot}
@@ -166,7 +170,7 @@ def main() -> None:
                         price = bars[t]
                         pos["peak"] = max(pos["peak"], price)
                         pos["slot"]["peak"] = pos["peak"]
-                        decision = STRATEGY.should_sell(
+                        decision = strategy.should_sell(
                             pos["slot"], price,
                             now=datetime.strptime(date + " " + t, "%Y%m%d %H%M"))
                         if decision.sell and decision.kind in ("stop_loss", "peak_drop"):
@@ -196,6 +200,17 @@ def main() -> None:
         row["자산"] = equity
         rows.append(row)
 
+    return {"rows": rows, "trades": trades, "pool": pool,
+            "equity": rows[-1]["자산"] if rows else float(SEED), "pos": pos}
+
+
+def main() -> None:
+    _load_cache()
+    days_all = [d for d in proxy_dates if d <= LAST_DAY]
+    days = days_all[-DAYS_BACK:]
+    result = run(days, daily_vols(days_all))
+    rows, trades, pool, pos = (result["rows"], result["trades"],
+                               result["pool"], result["pos"])
     _save_cache()
 
     # ── 출력 ──
