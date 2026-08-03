@@ -107,8 +107,14 @@ def daily_vols(days_all: list[str], vol_fn=realized_vol) -> dict[str, float]:
     return vols
 
 
-def run(days: list[str], vols: dict[str, float], strategy=None) -> dict:
+def run(days: list[str], vols: dict[str, float], strategy=None,
+        entry_at: str = "0900") -> dict:
     """시뮬레이션 본체 — 청산 판정은 `strategy.should_sell` 에 그대로 위임한다.
+
+    Args:
+        entry_at: 진입 폴링 시각 "HHMM" (개장 후 매수 지연 검증용).
+            **청산은 지연과 무관하게 09:00 첫 폴링**이다 — 실제 트레이더도
+            `short_term_buy_window_open()` 이 매수만 막고 매도는 막지 않는다.
 
     Returns:
         {rows, trades, pool, equity} — rows 는 일자별 표, pool 은 실현 자금 풀.
@@ -158,7 +164,7 @@ def run(days: list[str], vols: dict[str, float], strategy=None) -> dict:
         if score and blocked != date and pool > 0:
             code = UP_CODE if score > 0 else DOWN_CODE
             bars = fetch_minutes(code, date)
-            hit = price_at(bars, "0900")
+            hit = price_at(bars, entry_at)
             if hit:
                 entry_time, entry = hit
                 qty = int(pool // (entry * (1 + FEE_RATE)))

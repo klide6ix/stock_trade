@@ -43,8 +43,9 @@ UP_CODE, DOWN_CODE = "069500", "114800"     # KODEX 200 / KODEX 인버스
 START, END = "20260302", "20260731"
 SEED = 3_000_000
 FEE_RATE = 0.000042                          # 0.0042% 편도 (실측 위탁수수료)
-STOP_PCT, PEAK_PCT = 10.0, 10.0              # 현행 기본값
+STOP_PCT, PEAK_PCT = 10.0, 10.0              # 구(舊) 고정 청산선 — 아래 `simulate()` 전용
 DELAYS = [0, 1, 3, 5, 10, 15, 30]            # 개장 후 진입 지연(분)
+EXCLUDE_FROM = "20260727"                    # 극단 변동 구간(07-27~31) 제외 기준일
 CACHE_PATH = "data/.minute_bars_cache.json"
 
 # 한 번에 120행 → 09:00~15:30(391분)을 덮는 조회 기준시각.
@@ -326,23 +327,51 @@ def main() -> None:
         print(f"  첫 10분 상승한 날({len(up)}일) 이후 평균 {st.mean(up):+.2f}% · "
               f"하락한 날({len(dn)}일) 이후 평균 {st.mean(dn):+.2f}%")
 
-    # ── ④ 지연별 자금 곡선 ──
+    # ── ④ 지연별 자금 곡선 (현행 규칙) ──
+    # 구현체 `EtfDayTradeStrategy.should_sell` 에 청산을 위임하는 `_simulate_recent.run()` 을
+    # 쓴다 — 이 파일의 `simulate()` 는 고정 10/10 청산선을 하드코딩하고 있어 σ 배수로 바뀐
+    # 현행 규칙을 반영하지 못한다(아래 대조 참조). 방향 판정도 09:00 실측 갭으로 통일한다.
+    # import 가 함수 안에 있는 이유: `_simulate_recent` 가 이 모듈을 import 하므로
+    # 모듈 최상단에 두면 순환 import 가 된다.
+    import statistics as stx
+
+    from core.short_term import EtfDayTradeStrategy
+    from scripts._simulate_recent import daily_vols, judge_at_open, run
+
+    days_all = [d for d in proxy_dates if d <= END]
+    vols = daily_vols(days_all)
+    strategy = EtfDayTradeStrategy()
+    samples = {
+        f"제외 후 {len([d for d in days if d < EXCLUDE_FROM])}일":
+            [d for d in days if d < EXCLUDE_FROM],
+        f"전체 {len(days)}일": days,
+    }
+
     print()
     print("=" * 78)
-    print(f"④ 지연별 자금 곡선 (시드 {SEED:,}원 · 손절 -{STOP_PCT:g}% · 최고가 -{PEAK_PCT:g}%)")
+    print(f"④ 지연별 자금 곡선 — 현행 청산선({strategy.display_name.split(' · ', 2)[-1]}) "
+          f"· 시드 {SEED:,}원")
     print("=" * 78)
-    print(f"{'지연':>6} {'실현풀':>13} {'평가포함':>13} {'수익률':>9} {'거래':>5} {'승률':>6} {'청산사유'}")
-    for delay in DELAYS:
-        pool, equity, trades = simulate(delay, days, trade_code)
-        exits = [t for t in trades if t[1] == "청산"]
-        wins = sum(1 for t in exits if t[3] > 0)
-        kinds: dict[str, int] = {}
-        for t in exits:
-            kinds[t[2]] = kinds.get(t[2], 0) + 1
-        kind_str = " ".join(f"{k}{v}" for k, v in sorted(kinds.items()))
-        print(f"{minute_label(delay):>6} {pool:13,.0f} {equity:13,.0f} "
-              f"{(equity / SEED - 1) * 100:+8.2f}% {len(exits):5d} "
-              f"{(wins / len(exits) * 100 if exits else 0):5.0f}% {kind_str}")
+    print("   방향 판정은 09:00 실측 갭으로 고정하고 **진입 시각만** 옮긴다 — 실제 트레이더도")
+    print("   개장 직후 재판정(09:00)과 매수 지연 게이트가 분리돼 있다. 청산은 지연과 무관.")
+    for sname, sdays in samples.items():
+        print(f"\n  [{sname}]  {'지연':>6} {'평가자산':>13} {'수익률':>9} {'거래':>5} "
+              f"{'승률':>6} {'Sharpe':>7} {'MDD':>8}")
+        for delay in DELAYS:
+            r = run(sdays, vols, strategy, entry_at=f"09{delay:02d}")
+            rets = [t["수익률"] for t in r["trades"]]
+            curve = [x["자산"] for x in r["rows"]]
+            drets = [(b - a) / a for a, b in zip(curve, curve[1:]) if a > 0]
+            sharpe = (stx.mean(drets) / stx.stdev(drets) * (250 ** 0.5)
+                      if len(drets) > 2 and stx.stdev(drets) else 0)
+            peak, worst = -1e18, 0.0
+            for v in curve:
+                peak = max(peak, v)
+                worst = min(worst, (v - peak) / peak * 100) if peak > 0 else worst
+            print(f"  {'':>{len(sname) + 2}} {minute_label(delay):>6} {r['equity']:>13,.0f} "
+                  f"{(r['equity'] / SEED - 1) * 100:>+8.2f}% {len(rets):>5d} "
+                  f"{sum(1 for x in rets if x > 0) / len(rets) * 100:>5.0f}% "
+                  f"{sharpe:>+7.2f} {worst:>7.2f}%")
 
     _save_cache()
 
