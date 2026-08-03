@@ -16,6 +16,7 @@
 한계: 지정가 매수의 호가 스프레드(약 1틱)와 시장가 매도의 슬리피지는 반영하지 않는다.
 조회 전용(주문 없음). 분봉은 `data/.minute_bars_cache.json` 캐시를 재사용한다.
 """
+import argparse
 import statistics as st
 from datetime import datetime
 
@@ -221,17 +222,30 @@ def run(days: list[str], vols: dict[str, float], strategy=None,
             "equity": rows[-1]["자산"] if rows else float(SEED), "pos": pos}
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description="단기 매매 일자별 시뮬레이션")
+    ap.add_argument("--start", help="시작일 YYYYMMDD (지정 시 --days 무시)")
+    ap.add_argument("--end", default=LAST_DAY, help=f"종료일 YYYYMMDD (기본 {LAST_DAY})")
+    ap.add_argument("--days", type=int, default=DAYS_BACK,
+                    help=f"최근 N거래일 (기본 {DAYS_BACK})")
+    ap.add_argument("--entry", default="0900",
+                    help="진입 폴링 시각 HHMM (기본 0900 = 개장 즉시, 0905 = 5분 지연)")
+    args = ap.parse_args(argv)
+
     _load_cache()
-    days_all = [d for d in proxy_dates if d <= LAST_DAY]
-    days = days_all[-DAYS_BACK:]
-    result = run(days, daily_vols(days_all))
+    days_all = [d for d in proxy_dates if d <= args.end]
+    days = ([d for d in days_all if d >= args.start] if args.start
+            else days_all[-args.days:])
+    result = run(days, daily_vols(days_all), entry_at=args.entry)
     rows, trades, pool, pos = (result["rows"], result["trades"],
                                result["pool"], result["pos"])
     _save_cache()
 
     # ── 출력 ──
-    print(f"시드 {SEED:,}원 · {days[0]} ~ {days[-1]} ({len(days)}거래일) · "
+    delay = int(args.entry[2:]) - 0 if args.entry.startswith("09") else None
+    entry_label = (f"09:{args.entry[2:]} 진입"
+                   + (f" (개장 후 {delay}분 지연)" if delay else " (개장 즉시)"))
+    print(f"시드 {SEED:,}원 · {days[0]} ~ {days[-1]} ({len(days)}거래일) · {entry_label} · "
           f"청산선 {STRATEGY.display_name.split(' · ', 2)[-1]} · "
           f"수수료 {FEE_RATE * 100:.4f}% 편도\n")
     head = (f"{'#':>2} {'날짜':>11} {'방향':>7} {'점수':>7} {'매수 종목':>13} {'매수가':>9} "
@@ -264,6 +278,35 @@ def main() -> None:
         k = t["사유"].split("(")[0]
         kinds[k] = kinds.get(k, 0) + 1
     print(f"청산 사유: {' · '.join(f'{k} {v}회' for k, v in sorted(kinds.items()))}")
+
+    # 위험 지표 — 일별 자산곡선 기준(거래 빈도에 중립적)
+    curve = [r["자산"] for r in rows]
+    drets = [(b - a) / a for a, b in zip(curve, curve[1:]) if a > 0]
+    if len(drets) > 2 and st.stdev(drets):
+        peak, mdd_ = -1e18, 0.0
+        for v in curve:
+            peak = max(peak, v)
+            mdd_ = min(mdd_, (v - peak) / peak * 100) if peak > 0 else mdd_
+        print(f"연환산 Sharpe {st.mean(drets) / st.stdev(drets) * (250 ** 0.5):+.2f} · "
+              f"MDD {mdd_:.2f}% · 거래당 σ {st.stdev(t['수익률'] for t in trades):.2f}% · "
+              f"최고 {max(t['수익률'] for t in trades):+.2f}% / "
+              f"최악 {min(t['수익률'] for t in trades):+.2f}%")
+
+    # 월별 집계 — 구간이 길면 일자별 표만으로는 흐름이 안 보인다
+    if len({d[:6] for d in days}) > 1:
+        print("\n[월별]")
+        print(f"{'월':>9} {'거래일':>6} {'거래':>5} {'승률':>6} {'월수익률':>9} {'월말자산':>13}")
+        prev = float(SEED)
+        for ym in sorted({d[:6] for d in days}):
+            sub = [r for r in rows if r["date"].startswith(ym)]
+            tr = [t for t in trades if t["청산일"].startswith(ym)]
+            end_eq = sub[-1]["자산"]
+            w = sum(1 for t in tr if t["손익"] > 0)
+            print(f"{ym[:4]}-{ym[4:]:>2} {len(sub):>6} {len(tr):>5} "
+                  f"{(w / len(tr) * 100 if tr else 0):>5.0f}% "
+                  f"{(end_eq / prev - 1) * 100:>+8.2f}% {end_eq:>13,.0f}")
+            prev = end_eq
+
     if pos:
         print(f"※ {days[-1]} 종가 기준 {NAMES[pos['code']]} {pos['qty']:,}주 보유 중 "
               f"(다음 거래일 개장에 청산 예정) — 위 평가자산에 반영됨")
