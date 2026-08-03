@@ -35,7 +35,13 @@ from core.market_direction import (
     _norm,
     realized_vol,
 )
-from core.short_term import EtfDayTradeStrategy, mark_entry
+from core.short_term import (
+    SELL_MARKET_END,
+    SELL_PEAK_DROP,
+    SELL_STOP_LOSS,
+    EtfDayTradeStrategy,
+    mark_entry,
+)
 from core.strategy.buy._indicators import sma
 from scripts._check_open_drift import (
     DAILY,
@@ -57,6 +63,11 @@ DAYS_BACK = 30
 STRATEGY = EtfDayTradeStrategy()      # 실제 구현체 — 청산 판정을 그대로 위임한다
 LAST_DAY = "20260731"        # 분봉 캐시가 덮는 마지막 거래일
 NAMES = {UP_CODE: "KODEX 200", DOWN_CODE: "KODEX 인버스"}
+
+# 장중 폴링에서 포지션을 닫는 청산 사유 → 표시 라벨. `market_end` 는 `close_at_market_end`
+# 가 켜진 전략에서만 나오며, 빠뜨리면 그 옵션이 시뮬레이션에서 통째로 무시된다.
+INTRADAY_EXITS = {SELL_STOP_LOSS: "손절", SELL_PEAK_DROP: "최고가",
+                  SELL_MARKET_END: "마감청산"}
 
 
 def judge_at_open(date: str, open_price: float) -> float | None:
@@ -173,8 +184,8 @@ def run(days: list[str], vols: dict[str, float], strategy=None) -> dict:
                         decision = strategy.should_sell(
                             pos["slot"], price,
                             now=datetime.strptime(date + " " + t, "%Y%m%d %H%M"))
-                        if decision.sell and decision.kind in ("stop_loss", "peak_drop"):
-                            kind = "손절" if decision.kind == "stop_loss" else "최고가"
+                        if decision.sell and decision.kind in INTRADAY_EXITS:
+                            kind = INTRADAY_EXITS[decision.kind]
                             proceeds = price * pos["qty"] * (1 - FEE_RATE)
                             pnl = proceeds - pos["invested"]
                             pool += pnl
