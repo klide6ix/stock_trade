@@ -131,6 +131,70 @@ check("이상치에 표준편차는 크게 반응", _s_std / _v_std > 1.5, f"{_v
 check("이상치에 MAD 는 거의 불변", _s_mad / _v_mad < 1.2, f"{_v_mad:.2f}% → {_s_mad:.2f}%")
 check("MAD 도 하한을 지킨다", md.realized_vol_mad([100.0, 100.0, 100.0]) >= md.VOL_FLOOR_PCT)
 
+print("\n── 5-c. 장전 placeholder 봉 판별 (갭 신호 경로 선택) ──")
+# KIS 는 개장 전에도 오늘 날짜 봉을 전일 종가·거래량 0 으로 채워서 준다.
+# 이걸 장중으로 오인하면 갭(가중치 0.50)이 +0.00% 로 들어가 판정이 절반으로 희석된다.
+_TODAY = "20260803"
+_NOW_PRE = datetime(2026, 8, 3, 8, 40)      # 장전
+_NOW_OPEN = datetime(2026, 8, 3, 10, 0)     # 장중
+
+
+_walk_rng = _random.Random(7)
+_walk = [100.0]
+for _ in range(25):                      # 일간 σ 약 2% 인 임의보행 — 신호가 포화되지 않게
+    _walk.append(_walk[-1] * (1 + _walk_rng.gauss(0, 2.0) / 100))
+_WALK_CLOSES = list(reversed(_walk))     # 최신순
+
+
+def _bars_with_today(volume):
+    """오늘 봉(거래량 지정) + 확정 과거봉 25개. 최신순."""
+    past = [{"date": f"202607{28 - i:02d}" if i < 28 else f"202606{56 - i:02d}",
+             "open": c, "high": c, "low": c, "close": c, "volume": 1000}
+            for i, c in enumerate(_WALK_CLOSES)]
+    return [{"date": _TODAY, "open": past[0]["close"], "high": past[0]["close"],
+             "low": past[0]["close"], "close": past[0]["close"],
+             "volume": volume}] + past
+
+
+def _judge_with(bars, now):
+    """실제 `_gap_signal` 을 태워 어느 경로로 갔는지 본다."""
+    calls = []
+    def fake_snapshot(code):
+        calls.append("realtime")
+        return {"전일대비등락률(%)": 0.0}
+    def fake_expected(code):
+        calls.append("expected")
+        return {"예상체결가": 0, "기준가": 0, "예상거래량": 0}
+    with patch.object(md, "get_daily_ohlcv", return_value=bars), \
+         patch.object(md, "get_quote_snapshot", side_effect=fake_snapshot), \
+         patch.object(md, "get_expected_open_quote", side_effect=fake_expected):
+        v = md.judge_direction(now=now)
+    return v, calls
+
+
+check("오늘 봉 거래량 0 + 장전 → 예상체결가 경로",
+      _judge_with(_bars_with_today(0), _NOW_PRE)[1] == ["expected"])
+check("오늘 봉 거래량 0 + 장중 시각 → 예상체결가 경로 (휴장일 대응)",
+      _judge_with(_bars_with_today(0), _NOW_OPEN)[1] == ["expected"])
+check("오늘 봉 거래량 > 0 + 장전 → 예상체결가 경로 (시각 보강)",
+      _judge_with(_bars_with_today(5000), _NOW_PRE)[1] == ["expected"])
+check("오늘 봉 거래량 > 0 + 장중 → 실시간 등락률 경로",
+      _judge_with(_bars_with_today(5000), _NOW_OPEN)[1] == ["realtime"])
+check("오늘 봉 자체가 없으면 예상체결가 경로",
+      _judge_with(_bars_with_today(0)[1:], _NOW_PRE)[1] == ["expected"])
+
+# placeholder 를 장중으로 오인하면 갭이 0.00% 로 편입되어 분모만 2배가 된다.
+# 갭을 미사용 처리하면 나머지 가중치(0.50)로 재정규화되므로 점수가 정확히 2배가 되어야 한다.
+_v_fixed, _ = _judge_with(_bars_with_today(0), _NOW_PRE)      # 갭 미사용 → 재정규화
+_v_bug, _ = _judge_with(_bars_with_today(5000), _NOW_OPEN)    # 갭 0.00% 로 편입
+check("0% 갭 편입은 확신도를 정확히 절반으로 희석시킨다",
+      abs(_v_bug["score"]) > 0.01 and abs(_v_fixed["score"] - 2 * _v_bug["score"]) < 1e-6,
+      f"수정 후 {_v_fixed['score']:+.4f} = 2 × {_v_bug['score']:+.4f}(0% 편입)")
+check("갭 미사용이면 gap_source 가 None", _v_fixed["gap_source"] is None)
+check("placeholder 봉은 과거봉에서 제외되어 전일 종가가 어긋나지 않는다",
+      _v_fixed["prev_close"] == _WALK_CLOSES[0],
+      f"{_v_fixed['prev_close']:.2f} (직전 확정 종가 {_WALK_CLOSES[0]:.2f})")
+
 print("\n── 6. 방향 분기 · 중립 밴드 ──")
 v = judge(drop, gap=5.0)
 check("종합 상승 → DIRECTION_UP", v["direction"] == DIRECTION_UP, f"{v['score']:+.3f}")

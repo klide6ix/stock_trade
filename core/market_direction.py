@@ -150,6 +150,34 @@ def _signal(name: str, raw: str, score: float, weight: float) -> dict[str, Any]:
     return {"신호": name, "값": raw, "점수": round(score, 3), "가중치": weight}
 
 
+# 정규장 개장 시각 — 오늘 일봉을 '장중 봉' 으로 인정하는 시간 조건.
+_MARKET_OPEN = "09:00"
+
+
+def _today_bar_is_live(bars: list[dict], today_str: str, now: datetime) -> bool:
+    """오늘 일봉이 **실제로 거래가 시작된** 봉인지 판정.
+
+    KIS 는 개장 전에도 오늘 날짜 봉을 **전일 종가로 채워서** 돌려준다 (2026-08-03 08:25
+    실측: `stck_bsop_date`=오늘 · 종가=전일종가 · 거래량 0). 이걸 장중으로 오인하면
+    `_gap_signal` 이 장전 예상체결가 대신 **실시간 등락률 경로**를 타는데, 개장 전 등락률은
+    +0.00% 이므로 **가중치 0.50 짜리 갭 신호가 '0' 이라는 값으로 점수에 들어가** 판정을 0 쪽으로
+    희석시킨다. 실측된 점수 -0.247 은 갭을 빼고 재정규화하면 -0.493 으로, 확신도가 정확히
+    절반이었다. 갭이 '미사용' 되는 것보다 나쁘다 — 미사용이면 나머지 신호로 재정규화되지만,
+    0 으로 들어가면 그 0 이 전체 가중치의 절반을 차지하며 신호를 지워버리기 때문이다.
+
+    그래서 **거래량 > 0** 과 **정규장 개장 이후**를 함께 요구한다. 거래량은 장전·휴장일의
+    placeholder 봉을 모두 걸러내고, 시각 조건은 거래량 필드에 직전 세션 값이 남아 있는
+    경우에 대한 보강이다.
+    """
+    if not bars or bars[0].get("date") != today_str:
+        return False
+    try:
+        volume = int(bars[0].get("volume") or 0)
+    except (TypeError, ValueError):
+        volume = 0
+    return volume > 0 and now.time() >= datetime.strptime(_MARKET_OPEN, "%H:%M").time()
+
+
 def _gap_signal(
     proxy: EtfSpec,
     prev_close: float,
@@ -225,9 +253,11 @@ def judge_direction(
         return _unavailable(f"일봉 조회 실패: {e}", now)
 
     today_str = now.strftime("%Y%m%d")
-    has_today_bar = bool(bars) and bars[0].get("date") == today_str
+    # 개장 전에도 오늘 날짜 봉이 전일 종가로 채워져 오므로 거래량·시각까지 확인한다.
+    has_today_bar = _today_bar_is_live(bars, today_str, now)
     # 오늘 봉은 아직 진행 중이라 '확정 종가' 가 아니다. 추세·전일등락·모멘텀은 모두
     # 확정된 과거 봉으로만 계산하고, 오늘의 움직임은 갭 신호가 담당한다.
+    # (placeholder 봉이어도 날짜 기준으로 제외해야 전일 종가가 어긋나지 않는다.)
     past = [b for b in bars if b.get("date") != today_str]
     if len(past) < MA_LONG:
         return _unavailable(f"일봉 부족 ({len(past)}개 < {MA_LONG}개)", now)
