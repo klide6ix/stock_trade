@@ -21,8 +21,12 @@ def check(name, cond, detail=""):
         fails.append(name)
 
 
+# 창 경계·요일 검증은 고정 평일(2026-08-03 월요일)을 기준으로 한다 — 실행 요일에
+# 따라 결과가 달라지면 안 되기 때문이다. 반면 실제 `datetime.now()` 를 타는 경로는
+# `REAL_TODAY` 를 써야 한다(아래 3절 주석 참조).
 NOW = datetime(2026, 8, 3, 8, 45)
 TODAY = NOW.date().isoformat()
+REAL_TODAY = datetime.now().date().isoformat()
 
 
 def container(gap_source, selected_at=TODAY + "T08:30:00"):
@@ -117,8 +121,12 @@ check("보유 중이면 활성 슬롯 유지", result.get("code") == "069500")
 check("보유 중에도 후보 목록은 갱신", "short_term_candidates" in written)
 
 # 갭 없는 새 판정은 오늘의 갭 판정을 덮지 못한다 (후보 목록까지 그대로).
+# `_short_term_refresh_candidates` 는 내부에서 실제 `datetime.now()` 를 쓰므로, 저장된
+# 판정도 **실행 시점 기준 오늘**이어야 한다. 위 `keeps_previous_verdict` 블록은 `NOW` 를
+# 명시로 넘겨 자기완결적이지만 이 경로는 아니다 — 고정 날짜를 쓰면 그 날짜가 지나는
+# 순간 '어제 판정' 이 되어 테스트가 달력에 따라 깨진다(2026-08-04 실측).
 gap_strategy_items = [inv]
-stored_today = container("장전 예상체결가")
+stored_today = container("장전 예상체결가", REAL_TODAY + "T08:30:00")
 written_holder = {}
 strategy = type("S", (), {"find_targets": lambda self, n, exclude_codes: (gap_strategy_items, verdict(None))})()
 trader = tr.Trader.__new__(tr.Trader)
