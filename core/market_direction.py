@@ -74,6 +74,9 @@ NORM_GAP_MULT = 1.2         # 갭은 야간 구간만이라 전일 등락률보�
 # 실현변동성 산출 기간(영업일) 과 하한. 하한이 없으면 초저변동 구간에서 정규화가 발산해
 # 모든 신호가 즉시 포화된다.
 VOL_WINDOW = 20
+# 청산선 전용 단기 창 — `realized_vol_adaptive` 가 장기 창과 비교해 **작은 쪽**을 쓴다.
+# 1거래주(5일). 실측 plateau 가 4~10일로 넓어 in-sample 최대값(7~8일)을 피해 중앙을 택했다.
+VOL_SHORT_WINDOW = 5
 VOL_FLOOR_PCT = 0.3
 
 MA_SHORT = 5
@@ -112,6 +115,37 @@ def realized_vol(closes: list[float], window: int = VOL_WINDOW) -> float:
     if len(rets) < 2:
         return VOL_FLOOR_PCT
     return max(VOL_FLOOR_PCT, statistics.pstdev(rets))
+
+
+def realized_vol_adaptive(
+    closes: list[float],
+    window: int = VOL_WINDOW,
+    short_window: int = VOL_SHORT_WINDOW,
+) -> float:
+    """청산선 산출용 일간 변동성(%) — 장기·단기 창 중 **작은 쪽**.
+
+    20일 표준편차는 극단 하루에 오염되고 그 효과가 **20거래일 유지**된다. 실측(2026-08):
+    07-28(-11.19%)·07-31(+24.17%) 두 날이 σ 를 5.16% → 7.50% 로 밀어올려, 일간 등락이
+    평균 2.81% 로 조용했던 8월 내내 청산선이 손절 15%(상한 클램프)·트레일링 12.8~14.3% 에
+    붙박였다. 그 결과 **장중 청산이 20건 중 0건** — 국면 적응을 목표로 한 배수 방식이
+    정확히 그 목적에서 실패했다.
+
+    `min` 을 쓰는 것은 **비대칭이 의도된 것**이다.
+      - 최근 5일이 조용하면 → 즉시 좁혀 보호장치를 되살린다 (지연 해소).
+      - 최근 5일이 격하면 → 짧은 표본의 큰 값에 휘둘려 청산선을 **넓히지 않는다**.
+        표본 5개짜리 추정치로 안전장치를 느슨하게 푸는 것은 근거가 약하기 때문이다.
+
+    **신호 정규화에는 쓰지 않는다.** 정규화 배수(`NORM_*_MULT`)는 20일 σ 를 전제로
+    보정된 값이라 스케일을 바꾸면 방향 판정 자체가 달라진다 — `judge_direction` 은
+    정규화에 `realized_vol`, 청산선에 이 함수를 각각 쓴다.
+
+    Args:
+        closes: 종가 시계열 (최신순, index 0 = 가장 최근).
+
+    Returns:
+        일간 변동성(%). 두 창 모두 `VOL_FLOOR_PCT` 하한이 걸린 뒤 작은 쪽이 선택된다.
+    """
+    return min(realized_vol(closes, window), realized_vol(closes, short_window))
 
 
 # MAD(중앙값 절대편차)를 표준편차와 같은 척도로 맞추는 상수.
@@ -266,6 +300,9 @@ def judge_direction(
     prev_close = closes[0]
     # 모든 정규화 기준의 스케일. 이 값이 커지면(변동성 확대) 같은 등락률의 점수가 작아진다.
     vol = realized_vol(closes)
+    # 청산선 배수의 기준은 **별도**다 — 정규화 배수는 20일 σ 를 전제로 보정돼 있어 스케일을
+    # 바꾸면 방향 판정이 달라지지만, 청산선은 국면 전환에 빨리 반응해야 한다.
+    exit_vol = realized_vol_adaptive(closes)
 
     signals: list[dict[str, Any]] = []
     weighted_sum = 0.0
@@ -323,6 +360,7 @@ def judge_direction(
         "summary": summary,
         "prev_close": prev_close,
         "vol": round(vol, 3),
+        "exit_vol": round(exit_vol, 3),
         "gap_source": gap_source if gap_pct is not None else None,
         "gap_detail": gap_detail,
         "judged_at": now.isoformat(),
@@ -347,6 +385,7 @@ def _unavailable(reason: str, now: datetime) -> dict[str, Any]:
         "summary": f"판정 불가 ({reason})",
         "prev_close": 0.0,
         "vol": 0.0,
+        "exit_vol": 0.0,
         "gap_source": None,
         "gap_detail": "",
         "judged_at": now.isoformat(),

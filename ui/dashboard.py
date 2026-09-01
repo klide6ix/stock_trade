@@ -421,11 +421,19 @@ def _render_direction_panel(verdict: dict | None) -> None:
             },
         )
     vol = float(verdict.get("vol", 0) or 0)
+    exit_vol = float(verdict.get("exit_vol", 0) or 0)
     if vol > 0:
+        # 정규화용 σ 와 청산선용 σ 는 **다른 값**이다. 정규화 배수는 20일 σ 를 전제로
+        # 보정돼 있어 스케일을 못 바꾸지만, 청산선은 국면 전환에 빨리 반응해야 하므로
+        # min(20일, 5일) 을 쓴다. 두 값이 갈릴 때 화면에서 헷갈리지 않도록 함께 보인다.
+        gap_note = (
+            f" · 청산선 기준 σ 는 **{exit_vol:.2f}%**(min(20일, 5일))로 따로 산출합니다"
+            if exit_vol > 0 and abs(exit_vol - vol) >= 0.005 else ""
+        )
         st.caption(
             f"📏 정규화 기준: 일간 실현변동성(20일) **{vol:.2f}%** — 각 신호는 이 값의 "
             f"일정 배수에서 ±1 로 포화합니다. 변동성이 커지면 같은 등락률의 점수가 작아져 "
-            f"국면이 바뀌어도 신호 민감도가 유지됩니다."
+            f"국면이 바뀌어도 신호 민감도가 유지됩니다." + gap_note
         )
     gap_source = verdict.get("gap_source")
     if gap_source:

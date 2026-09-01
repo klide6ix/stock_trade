@@ -209,10 +209,48 @@ check("일봉 부족 → 중립", v["direction"] == DIRECTION_NEUTRAL)
 check("판정 불가 시 vol 필드 존재", "vol" in v, f"vol={v.get('vol')}")
 check("판정 불가 시 점수 0", v["score"] == 0.0)
 
+print("\n── 9. 청산선 전용 σ (realized_vol_adaptive) — 오염·지연 대응 ──")
+# 최신순: 최근 5일 조용(±0.5%) + 그 앞에 극단 2일. 20일 창은 오염되고 5일 창은 깨끗하다.
+calm = [100.0, 100.4, 100.0, 100.5, 100.1]
+shock = [100.0, 125.0, 100.0, 88.0]          # +25% / -12% 급등락
+tail = [100.0] * 14
+contaminated = calm + shock + tail
+
+long_v = md.realized_vol(contaminated)
+short_v = md.realized_vol(contaminated, window=md.VOL_SHORT_WINDOW)
+adaptive = md.realized_vol_adaptive(contaminated)
+check("오염 구간에서 단기 σ 가 장기 σ 보다 작다", short_v < long_v,
+      f"단기 {short_v:.2f}% < 장기 {long_v:.2f}%")
+check("adaptive 는 작은 쪽을 택한다", abs(adaptive - min(long_v, short_v)) < 1e-9,
+      f"{adaptive:.2f}%")
+check("adaptive 가 오염된 장기 σ 보다 낮다 — 청산선이 되살아난다", adaptive < long_v,
+      f"{adaptive:.2f}% < {long_v:.2f}%")
+
+# 비대칭 확인: 최근이 격하면 청산선을 넓히지 않는다 (표본 5개로 안전장치를 풀지 않는다).
+recent_shock = shock + calm + tail
+check("최근이 격해도 장기 σ 보다 넓어지지 않는다",
+      md.realized_vol_adaptive(recent_shock) <= md.realized_vol(recent_shock),
+      f"adaptive {md.realized_vol_adaptive(recent_shock):.2f}% "
+      f"vs 장기 {md.realized_vol(recent_shock):.2f}%")
+
+check("평온 구간에서는 장기 σ 를 넘지 않는다",
+      md.realized_vol_adaptive([100.0 * (1.01 ** i) for i in range(21)])
+      <= md.realized_vol([100.0 * (1.01 ** i) for i in range(21)]) + 1e-9)
+check("하한 아래로는 내려가지 않는다",
+      md.realized_vol_adaptive([100.0] * 21) >= md.VOL_FLOOR_PCT)
+check("표본 부족이어도 하한 반환", md.realized_vol_adaptive([100.0]) >= md.VOL_FLOOR_PCT)
+
+# judge_direction 이 정규화용 vol 과 청산용 exit_vol 을 분리해 싣는가.
+v = judge(drop, gap=2.0)
+check("결과에 exit_vol 필드", "exit_vol" in v, f"exit_vol={v.get('exit_vol')}")
+check("정규화용 vol 은 그대로 존재", v.get("vol", 0) > 0)
+check("판정 불가에도 exit_vol 존재", "exit_vol" in judge([100.0] * 5))
+
 print("\n── 8. 결과 계약 (대시보드 소비 필드) ──")
 v = judge(drop, gap=2.0)
 for key in ("direction", "score", "signals", "summary", "prev_close", "vol",
-            "gap_source", "gap_detail", "judged_at", "proxy_code", "proxy_name"):
+            "exit_vol", "gap_source", "gap_detail", "judged_at",
+            "proxy_code", "proxy_name"):
     check(f"필드 {key}", key in v)
 
 print()

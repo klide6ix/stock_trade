@@ -224,7 +224,10 @@ class EtfDayTradeStrategy:
                 "방향": direction,
                 "방향라벨": direction_label(direction),
                 "시그널점수": signal_score,
-                "변동성(%)": round(float(verdict.get("vol") or 0), 3),
+                # 청산선 기준 σ — 정규화용 `vol` 이 아니라 청산 전용 `exit_vol` 을 쓴다
+                # (구버전 판정 결과에는 없으므로 `vol` 로 fallback).
+                "변동성(%)": round(
+                    float(verdict.get("exit_vol") or verdict.get("vol") or 0), 3),
                 "우선순위": rank,
                 "선정사유": (
                     f"{direction_label(direction)} 판정 (점수 {score:+.2f}) · "
