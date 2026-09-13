@@ -53,7 +53,7 @@ TICK = {"069500": 5.0, "114800": 1.0}
 
 def simulate(days: list[str], vols: dict[str, float], strategy,
              entry_at: str = ENTRY_AT, carry: bool = False,
-             spread: bool = False) -> dict:
+             spread: bool = False, size_fn=None) -> dict:
     """일자별 시뮬레이션. `carry=True` 면 오늘 방향이 보유 종목과 같을 때 청산을 건너뛴다.
 
     `hold_days > 1` 인 전략도 정확히 다룬다 — 보유가 하루를 넘기는 날에도 장중 폴링을
@@ -61,6 +61,9 @@ def simulate(days: list[str], vols: dict[str, float], strategy,
 
     `spread=True` 면 호가 스프레드를 반영한다(매수 +틱/2, 매도 -틱/2). 기본은 꺼져 있어
     기존 결과와 비교 가능하다.
+
+    `size_fn(score) -> 0~1` 을 주면 그날 자금 풀의 그 비율만 투입한다(확신 비례 사이징).
+    미투입분은 현금으로 남아 손익에 영향을 주지 않는다. 기본은 전액 투입.
 
     `carry=False · spread=False` 는 `_simulate_recent.run()` 과 동일한 규칙이다(검증으로 확인).
     청산 판정은 `strategy.should_sell` 에 위임하고, 이 함수는 **보유기간 만료를
@@ -137,7 +140,8 @@ def simulate(days: list[str], vols: dict[str, float], strategy,
             if hit:
                 entry_time, entry = hit
                 entry += half_tick(today_code)      # 지정가 매수 = 매도호가
-                qty = int(pool // (entry * (1 + FEE_RATE)))
+                frac = 1.0 if size_fn is None else max(0.0, min(1.0, size_fn(score)))
+                qty = int(pool * frac // (entry * (1 + FEE_RATE)))
                 if qty > 0:
                     slot = mark_entry({"code": today_code, "vol": vols[date]}, entry, qty,
                                       now=datetime.strptime(date, "%Y%m%d"))
