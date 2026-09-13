@@ -102,6 +102,37 @@ check("배수 모드 표기", "σ" in S.display_name, S.display_name)
 check("고정 모드 표기", "%" in FIXED.display_name and "σ" not in FIXED.display_name,
       FIXED.display_name)
 
+print("\n── 7. 손절/트레일링 배수 관계 불변식 ──")
+# peak_drop_mult <= stop_loss_mult 인 한 하드 손절은 정상 경로에서 발동할 수 없다.
+# 이 성질이 깨지면(트레일링을 손절보다 넓히면) 청산 성격이 조용히 뒤바뀌므로 못박아 둔다.
+_now = datetime(2026, 9, 11, 10, 0)
+_s = EtfDayTradeStrategy(stop_loss_mult=2.5, peak_drop_mult=2.0)
+_viol = []
+for _vol in (1.0, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.5, 10.0):
+    for _gain in (0.0, 0.02, 0.10):
+        _slot = mark_entry({"code": "069500", "vol": _vol}, 10000.0, 10, now=_now)
+        _slot["peak"] = 10000.0 * (1 + _gain)
+        _stop_pct, _peak_pct, _ = _s.exit_thresholds(_slot)
+        if 10000.0 * (1 - _stop_pct / 100) > _slot["peak"] * (1 - _peak_pct / 100):
+            _viol.append((_vol, _gain))
+check("현행 배수(2.5/2.0)에서 손절선이 트레일링선보다 위로 올라오지 않음",
+      not _viol, f"위반 {_viol}")
+
+# peak 유실 시에는 손절이 유일한 안전장치로 살아난다 — fallback 역할 확인.
+_slot = mark_entry({"code": "069500", "vol": 5.0}, 10000.0, 10, now=_now)
+_slot["peak"] = 0
+_d = _s.should_sell(_slot, 8000.0, now=_now)
+check("peak 유실 시 손절이 fallback 으로 작동", _d.sell and _d.kind == SELL_STOP_LOSS,
+      f"{_d.kind}")
+
+# 반대로 트레일링을 손절보다 넓히면 손절이 실제로 먼저 걸린다 (성격 반전 확인).
+_wide = EtfDayTradeStrategy(stop_loss_mult=2.0, peak_drop_mult=3.0)
+_slot = mark_entry({"code": "069500", "vol": 4.0}, 10000.0, 10, now=_now)
+_slot["peak"] = 10000.0
+_d = _wide.should_sell(_slot, 10000.0 * (1 - 0.081), now=_now)
+check("트레일링 > 손절 로 뒤집으면 손절이 먼저 걸린다",
+      _d.sell and _d.kind == SELL_STOP_LOSS, f"{_d.kind}")
+
 print()
 if fails:
     print(f"❌ 실패 {len(fails)}건: {fails}")

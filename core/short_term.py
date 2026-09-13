@@ -302,6 +302,18 @@ class EtfDayTradeStrategy:
         stop_pct, peak_pct, basis = self.exit_thresholds(slot)
 
         # 1. 하드 손절 — 매수가 대비 하락
+        #
+        # ⚠️ `peak_drop_pct <= stop_loss_pct` 인 한(현행 2.0σ < 2.5σ) 이 분기는 **정상
+        # 경로에서 발동하지 않는다**. peak 은 진입가로 초기화돼 위로만 갱신되므로
+        # `peak >= entry` 이고, 따라서
+        #     트레일링 발동가 = peak × (1 - p) >= entry × (1 - p) >= entry × (1 - s) = 손절 발동가
+        # 즉 트레일링이 항상 먼저(또는 동시에) 걸린다. 실측에서도 손절 배수를 2.5 → 10.0
+        # 으로 바꿔 사실상 비활성화해도 수익률이 한 푼도 달라지지 않았고, 청산 사유
+        # 라벨만 '손절' → '최고가' 로 바뀌었다(갭으로 두 선을 한 번에 통과한 경우).
+        #
+        # 그래도 남겨 두는 이유는 **원장의 `peak` 이 비었을 때의 유일한 안전장치**이기
+        # 때문이다(아래 2번은 `peak > 0` 을 요구한다). 외부 체결·파일 손상으로 peak 이
+        # 유실되면 이 분기만 남는다. 즉 손절 배수는 성능 파라미터가 아니라 fallback 이다.
         drop_from_entry = (entry - current_price) / entry * 100
         if drop_from_entry >= stop_pct:
             return SellDecision(
