@@ -35,6 +35,7 @@ from core.market_direction import (
     _clip,
     _norm,
     realized_vol,
+    realized_vol_adaptive,
 )
 from core.short_term import (
     SELL_MARKET_END,
@@ -98,8 +99,14 @@ def judge_at_open(date: str, open_price: float) -> float | None:
     return _clip(wsum / total) if total else None
 
 
-def daily_vols(days_all: list[str], vol_fn=realized_vol) -> dict[str, float]:
-    """각 날짜의 진입 시점 σ — 그날 이전 확정 종가만 사용 (알고리즘과 동일)."""
+def daily_vols(days_all: list[str], vol_fn=realized_vol_adaptive) -> dict[str, float]:
+    """각 날짜의 진입 시점 σ — 그날 이전 확정 종가만 사용 (알고리즘과 동일).
+
+    기본값은 **청산선 전용 σ**(`realized_vol_adaptive` = min(20일, 5일))다. 운영 코드에서
+    슬롯에 박히는 값이 `judge_direction` 의 `exit_vol` 이고 그게 이 함수이기 때문이다.
+    신호 정규화용 20일 σ(`realized_vol`)와 혼동하면 안 된다 — 그건 `judge_at_open` 이
+    내부에서 따로 계산한다.
+    """
     vols = {}
     for d in days_all:
         idx = proxy_dates.index(d)
@@ -109,7 +116,7 @@ def daily_vols(days_all: list[str], vol_fn=realized_vol) -> dict[str, float]:
 
 
 def run(days: list[str], vols: dict[str, float], strategy=None,
-        entry_at: str = "0900") -> dict:
+        entry_at: str = "0900", seed: float = SEED) -> dict:
     """시뮬레이션 본체 — 청산 판정은 `strategy.should_sell` 에 그대로 위임한다.
 
     Args:
@@ -121,7 +128,7 @@ def run(days: list[str], vols: dict[str, float], strategy=None,
         {rows, trades, pool, equity} — rows 는 일자별 표, pool 은 실현 자금 풀.
     """
     strategy = strategy or STRATEGY
-    pool = float(SEED)
+    pool = float(seed)
     pos = None
     blocked = None
     rows, trades = [], []
@@ -219,7 +226,7 @@ def run(days: list[str], vols: dict[str, float], strategy=None,
         rows.append(row)
 
     return {"rows": rows, "trades": trades, "pool": pool,
-            "equity": rows[-1]["자산"] if rows else float(SEED), "pos": pos}
+            "equity": rows[-1]["자산"] if rows else float(seed), "pos": pos}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -228,6 +235,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--end", default=LAST_DAY, help=f"종료일 YYYYMMDD (기본 {LAST_DAY})")
     ap.add_argument("--days", type=int, default=DAYS_BACK,
                     help=f"최근 N거래일 (기본 {DAYS_BACK})")
+    ap.add_argument("--seed", type=float, default=SEED,
+                    help=f"시드 금액 (기본 {SEED:,.0f}원)")
     ap.add_argument("--entry", default="0900",
                     help="진입 폴링 시각 HHMM (기본 0900 = 개장 즉시, 0905 = 5분 지연)")
     args = ap.parse_args(argv)
@@ -236,7 +245,7 @@ def main(argv: list[str] | None = None) -> None:
     days_all = [d for d in proxy_dates if d <= args.end]
     days = ([d for d in days_all if d >= args.start] if args.start
             else days_all[-args.days:])
-    result = run(days, daily_vols(days_all), entry_at=args.entry)
+    result = run(days, daily_vols(days_all), entry_at=args.entry, seed=args.seed)
     rows, trades, pool, pos = (result["rows"], result["trades"],
                                result["pool"], result["pos"])
     _save_cache()
@@ -245,7 +254,7 @@ def main(argv: list[str] | None = None) -> None:
     delay = int(args.entry[2:]) - 0 if args.entry.startswith("09") else None
     entry_label = (f"09:{args.entry[2:]} 진입"
                    + (f" (개장 후 {delay}분 지연)" if delay else " (개장 즉시)"))
-    print(f"시드 {SEED:,}원 · {days[0]} ~ {days[-1]} ({len(days)}거래일) · {entry_label} · "
+    print(f"시드 {args.seed:,.0f}원 · {days[0]} ~ {days[-1]} ({len(days)}거래일) · {entry_label} · "
           f"청산선 {STRATEGY.display_name.split(' · ', 2)[-1]} · "
           f"수수료 {FEE_RATE * 100:.4f}% 편도\n")
     head = (f"{'#':>2} {'날짜':>11} {'방향':>7} {'점수':>7} {'매수 종목':>13} {'매수가':>9} "
@@ -264,12 +273,12 @@ def main(argv: list[str] | None = None) -> None:
             f"{(cd[4:6] + '-' + cd[6:]) if cd else (r.get('비고') or '—'):>8} "
             f"{r.get('청산가', 0):>9,.0f} {r.get('사유', '보유 중' if r.get('종목') else '—'):>10} "
             f"{r.get('손익', 0):>+11,.0f} {r.get('수익률', 0):>+7.2f}% {r['자산']:>12,.0f} "
-            f"{(r['자산'] / SEED - 1) * 100:>+7.2f}%"
+            f"{(r['자산'] / args.seed - 1) * 100:>+7.2f}%"
         )
 
     final = rows[-1]["자산"]
     wins = [t for t in trades if t["손익"] > 0]
-    print(f"\n최종 평가자산 {final:,.0f}원 ({(final / SEED - 1) * 100:+.2f}%) · "
+    print(f"\n최종 평가자산 {final:,.0f}원 ({(final / args.seed - 1) * 100:+.2f}%) · "
           f"실현 자금 풀 {pool:,.0f}원")
     print(f"거래 {len(trades)}회 · 승 {len(wins)}회 ({len(wins) / len(trades) * 100:.0f}%) · "
           f"거래당 평균 {st.mean(t['수익률'] for t in trades):+.2f}%")
@@ -296,7 +305,7 @@ def main(argv: list[str] | None = None) -> None:
     if len({d[:6] for d in days}) > 1:
         print("\n[월별]")
         print(f"{'월':>9} {'거래일':>6} {'거래':>5} {'승률':>6} {'월수익률':>9} {'월말자산':>13}")
-        prev = float(SEED)
+        prev = float(args.seed)
         for ym in sorted({d[:6] for d in days}):
             sub = [r for r in rows if r["date"].startswith(ym)]
             tr = [t for t in trades if t["청산일"].startswith(ym)]

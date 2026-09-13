@@ -53,7 +53,7 @@ TICK = {"069500": 5.0, "114800": 1.0}
 
 def simulate(days: list[str], vols: dict[str, float], strategy,
              entry_at: str = ENTRY_AT, carry: bool = False,
-             spread: bool = False, size_fn=None) -> dict:
+             spread: bool = False, size_fn=None, seed: float = SEED) -> dict:
     """일자별 시뮬레이션. `carry=True` 면 오늘 방향이 보유 종목과 같을 때 청산을 건너뛴다.
 
     `hold_days > 1` 인 전략도 정확히 다룬다 — 보유가 하루를 넘기는 날에도 장중 폴링을
@@ -69,7 +69,7 @@ def simulate(days: list[str], vols: dict[str, float], strategy,
     청산 판정은 `strategy.should_sell` 에 위임하고, 이 함수는 **보유기간 만료를
     건너뛸지만** 결정한다 — 손절·트레일링은 이월 중에도 그대로 작동해야 한다.
     """
-    pool = float(SEED)
+    pool = float(seed)
     pos = None
     blocked = None
     rows, trades = [], []
@@ -184,7 +184,7 @@ def simulate(days: list[str], vols: dict[str, float], strategy,
         rows.append(row)
 
     return {"rows": rows, "trades": trades, "pool": pool,
-            "equity": rows[-1]["자산"] if rows else float(SEED), "pos": pos}
+            "equity": rows[-1]["자산"] if rows else float(seed), "pos": pos}
 
 
 def stats(result: dict) -> dict:
