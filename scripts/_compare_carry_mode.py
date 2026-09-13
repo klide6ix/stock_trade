@@ -45,12 +45,24 @@ from scripts._simulate_recent import (
 FIRST_DAY, LAST_DAY = "20260310", "20260724"     # 07-27~31(극단 변동 5일) 제외
 ENTRY_AT = "0905"                                 # 현재 운영값 = 개장 후 5분
 
+# 호가 단위(틱) — 실호가 조회 실측값. 분봉 종가를 mid 로 보고 매수는 매도호가(+틱/2),
+# 매도는 매수호가(-틱/2)에 체결된다고 본다. 왕복이면 스프레드 1틱 전부를 부담한다.
+# 매수는 지정가(매도호가), 매도는 시장가(매수호가)라 실제로 그렇게 움직인다.
+TICK = {"069500": 5.0, "114800": 1.0}
+
 
 def simulate(days: list[str], vols: dict[str, float], strategy,
-             entry_at: str = ENTRY_AT, carry: bool = False) -> dict:
+             entry_at: str = ENTRY_AT, carry: bool = False,
+             spread: bool = False) -> dict:
     """일자별 시뮬레이션. `carry=True` 면 오늘 방향이 보유 종목과 같을 때 청산을 건너뛴다.
 
-    `carry=False` 는 `_simulate_recent.run()` 과 동일한 규칙이다(검증으로 확인).
+    `hold_days > 1` 인 전략도 정확히 다룬다 — 보유가 하루를 넘기는 날에도 장중 폴링을
+    돌리기 때문이다(`run()` 은 진입 직후만 폴링해 다일 보유를 지원하지 못한다).
+
+    `spread=True` 면 호가 스프레드를 반영한다(매수 +틱/2, 매도 -틱/2). 기본은 꺼져 있어
+    기존 결과와 비교 가능하다.
+
+    `carry=False · spread=False` 는 `_simulate_recent.run()` 과 동일한 규칙이다(검증으로 확인).
     청산 판정은 `strategy.should_sell` 에 위임하고, 이 함수는 **보유기간 만료를
     건너뛸지만** 결정한다 — 손절·트레일링은 이월 중에도 그대로 작동해야 한다.
     """
@@ -59,8 +71,12 @@ def simulate(days: list[str], vols: dict[str, float], strategy,
     blocked = None
     rows, trades = [], []
 
+    def half_tick(code: str) -> float:
+        return TICK.get(code, 0.0) / 2 if spread else 0.0
+
     def close_out(price: float, date: str, kind: str) -> None:
         nonlocal pool, pos
+        price = price - half_tick(pos["code"])      # 시장가 매도 = 매수호가
         proceeds = price * pos["qty"] * (1 - FEE_RATE)
         pnl = proceeds - pos["invested"]
         pool += pnl
@@ -82,6 +98,10 @@ def simulate(days: list[str], vols: dict[str, float], strategy,
         # ── 오늘 방향 판정 (09:00 실측 갭) — 이월 판단에 필요하므로 청산보다 먼저 ──
         proxy_open = price_at(bars_of(UP_CODE), "0900")
         score = judge_at_open(date, proxy_open[1]) if proxy_open else None
+        # `neutral_band` 안이면 확신이 낮은 날로 보고 진입하지 않는다 — 실제 전략의
+        # `find_targets` 도 같은 판정을 하므로 여기서도 반영해야 등가가 된다.
+        if score is not None and abs(score) <= getattr(strategy, "neutral_band", 0.0):
+            score = None
         today_code = (UP_CODE if score > 0 else DOWN_CODE) if score else None
         if score is not None:
             row["score"] = score
@@ -116,6 +136,7 @@ def simulate(days: list[str], vols: dict[str, float], strategy,
             hit = price_at(bars_of(today_code), entry_at)
             if hit:
                 entry_time, entry = hit
+                entry += half_tick(today_code)      # 지정가 매수 = 매도호가
                 qty = int(pool // (entry * (1 + FEE_RATE)))
                 if qty > 0:
                     slot = mark_entry({"code": today_code, "vol": vols[date]}, entry, qty,
