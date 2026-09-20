@@ -212,6 +212,14 @@ def _today_bar_is_live(bars: list[dict], today_str: str, now: datetime) -> bool:
     return volume > 0 and now.time() >= datetime.strptime(_MARKET_OPEN, "%H:%M").time()
 
 
+# 갭 신호 출처 라벨. 단순 표시용 문자열이 아니라 **판정 상태를 읽는 계약**이다 —
+# `trader.run()` 의 개장 직후 재판정은 저장된 판정의 이 값이 `GAP_SOURCE_LIVE` 인지로
+# '실측 갭이 반영됐는가' 를 판별한다(`short_term.today_gap_source`). 문자열을 바꾸면
+# 그 판별이 조용히 깨지므로 상수로 고정한다.
+GAP_SOURCE_LIVE = "장중 실시간 등락률"
+GAP_SOURCE_EXPECTED = "장전 예상체결가"
+
+
 def _gap_signal(
     proxy: EtfSpec,
     prev_close: float,
@@ -230,7 +238,7 @@ def _gap_signal(
         except Exception as e:
             return None, "장중 등락률 조회 실패", str(e)
         chg = float(snap.get("전일대비등락률(%)", 0) or 0)
-        return chg, "장중 실시간 등락률", f"{proxy.name} {chg:+.2f}%"
+        return chg, GAP_SOURCE_LIVE, f"{proxy.name} {chg:+.2f}%"
 
     try:
         exp = get_expected_open_quote(proxy.code)
@@ -252,7 +260,7 @@ def _gap_signal(
         return None, "예상체결 거래량 0 (동시호가 미형성)", ""
 
     gap_pct = (expected - prev_close) / prev_close * 100
-    return gap_pct, "장전 예상체결가", (
+    return gap_pct, GAP_SOURCE_EXPECTED, (
         f"예상 {expected:,.0f}원 (전일종가 {prev_close:,.0f}원 대비 {gap_pct:+.2f}%, "
         f"예상거래량 {volume:,}주)"
     )

@@ -4,13 +4,15 @@
   1. `keeps_previous_verdict` — 갭을 쓴 판정이 갭 없는 판정에 덮이지 않는가
   2. `open_rejudge_window`   — 개장 직후 재판정 창(평일 09:00~09:05) 경계
   3. `_short_term_refresh_candidates` — 사용자 선택 보존 · 오늘 차단 유지 · 불필요한 쓰기 생략
+  4. `today_gap_source` + 메인 루프 — 실측 갭이 반영될 때까지 창 안에서 재시도하는가
 """
 import sys
 from datetime import datetime
 from unittest.mock import patch
 
 from core import trader as tr
-from core.short_term import keeps_previous_verdict
+from core.market_direction import GAP_SOURCE_EXPECTED, GAP_SOURCE_LIVE
+from core.short_term import keeps_previous_verdict, today_gap_source
 
 fails = []
 
@@ -137,13 +139,26 @@ with patch.object(tr, "get_setting", side_effect=lambda k: stored_today if k == 
 check("갭 없는 판정은 오늘 갭 판정을 덮지 않음", written_holder == {}, list(written_holder))
 check("이때 슬롯도 그대로", result.get("code") == "102110")
 
-print("\n── 4. 메인 루프 배선 (08:29 기동 → 09:02 까지 가상 시계) ──")
+print("\n── 3.5 today_gap_source — '오늘 갭이 반영됐는가' 판별 ──")
+check("오늘 실측 갭 → 라벨 반환",
+      today_gap_source(container(GAP_SOURCE_LIVE), NOW) == GAP_SOURCE_LIVE)
+check("오늘 장전 갭 → 라벨 반환 (실측과 구분은 호출부 몫)",
+      today_gap_source(container(GAP_SOURCE_EXPECTED), NOW) == GAP_SOURCE_EXPECTED)
+check("어제 갭 판정 → 빈 문자열",
+      today_gap_source(container(GAP_SOURCE_LIVE, "2026-08-02T09:00:00"), NOW) == "")
+check("갭 없는 판정 → 빈 문자열", today_gap_source(container(None), NOW) == "")
+check("컨테이너 없음 → 빈 문자열", today_gap_source(None, NOW) == "")
+check("selected_at 형식 불량 → 빈 문자열",
+      today_gap_source(container(GAP_SOURCE_LIVE, "not-a-date"), NOW) == "")
+
+print("\n── 4. 메인 루프 배선 (08:29 기동 → 09:06 까지 가상 시계) ──")
 
 
 class FakeDT(datetime):
     """`datetime.now()` 만 테스트가 제어하는 시계 (strptime 등은 그대로)."""
 
-    current = datetime(2026, 8, 3, 8, 29, 30)   # 월요일, 장전 시작 직전
+    start = datetime(2026, 8, 3, 8, 29, 30)     # 월요일, 장전 시작 직전
+    current = start
 
     @classmethod
     def now(cls, tz=None):
@@ -154,7 +169,9 @@ class _Stop(Exception):
     pass
 
 
-def run_loop(cycles=34):
+def run_loop(cycles=38, gap_at=None):
+    # 시계는 클래스 변수라 이전 호출의 끝 시각이 남는다 — 매번 장전 직전으로 되감는다.
+    FakeDT.current = FakeDT.start
     calls = []
     trader = tr.Trader.__new__(tr.Trader)
     trader.buy_strategy = trader.sell_strategy = trader.short_term_strategy = object()
@@ -173,8 +190,17 @@ def run_loop(cycles=34):
 
     trader.prepare_market_open = lambda force_short_term=False: (
         rec("prepare_market_open", force=force_short_term) or [])
-    trader._prepare_short_term = lambda force=False, quiet=False: rec(
-        "_prepare_short_term", force=force, quiet=quiet)
+    def prepare_short(force=False, quiet=False):
+        rec("_prepare_short_term", force=force, quiet=quiet)
+        # 실측 갭이 반영되는 시각을 테스트가 지정한다. 그 시각부터 저장된 판정의
+        # gap_source 가 GAP_SOURCE_LIVE 가 되어 루프가 '오늘 완료' 로 마킹한다.
+        if gap_at and FakeDT.current.strftime("%H:%M") >= gap_at:
+            settings["short_term_candidates"] = {
+                "selected_at": FakeDT.current.isoformat(),
+                "direction": {"gap_source": GAP_SOURCE_LIVE},
+            }
+
+    trader._prepare_short_term = prepare_short
     trader.execute_initial_buy = lambda c: rec("execute_initial_buy")
     trader.check_and_sell = lambda: rec("check_and_sell")
     trader.check_short_term = lambda: rec("check_short_term")
@@ -208,11 +234,25 @@ check("장전 나머지는 방향만 재판정(quiet)", len(quiet_judges) == 29,
 check("장전 재판정은 08:31~08:59",
       quiet_judges[0][0] == "08:31" and quiet_judges[-1][0] == "08:59",
       f"{quiet_judges[0][0]}~{quiet_judges[-1][0]}")
-check("개장 직후 최종 재판정 1회", len(open_judges) == 1, str([c[0] for c in open_judges]))
-check("최종 재판정은 09:00", open_judges and open_judges[0][0] == "09:00")
+check("최종 재판정은 09:00 에 시작", open_judges and open_judges[0][0] == "09:00")
 check("최종 재판정이 진입 판정보다 먼저",
       calls.index(open_judges[0]) < calls.index(short_term[0]))
-check("09:01 이후엔 재판정 없음", all(c[0] == "09:00" for c in open_judges))
+
+# 실측 갭이 반영되지 않는 한 창 안에서 계속 다시 시도한다. 성공 여부와 무관하게
+# 하루치를 끝내버리면 그날 개장 갭이 영영 판정에 안 들어간다 (2026-08-12 실측 -13.56%p).
+check("갭 미반영이면 창(09:00~09:05) 안에서 매 주기 재시도",
+      len(open_judges) == 5 and open_judges[-1][0] == "09:04",
+      str([c[0] for c in open_judges]))
+check("창을 넘기면 재시도 중단", all(c[0] <= "09:05" for c in open_judges))
+
+open_hit = [c for c in run_loop(gap_at="09:00")
+            if c[1] == "_prepare_short_term" and not c[2]["quiet"]]
+check("실측 갭이 첫 시도에 반영되면 1회로 끝", len(open_hit) == 1, str([c[0] for c in open_hit]))
+
+open_late = [c for c in run_loop(gap_at="09:02")
+             if c[1] == "_prepare_short_term" and not c[2]["quiet"]]
+check("반영된 주기까지만 재시도하고 멈춤",
+      len(open_late) == 3 and open_late[-1][0] == "09:02", str([c[0] for c in open_late]))
 check("장전에는 매매 판정 없음", all(c[0] >= "09:00" for c in short_term), str(short_term[:1]))
 
 print()

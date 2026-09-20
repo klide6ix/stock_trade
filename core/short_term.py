@@ -672,6 +672,41 @@ def candidates_to_settings(
     }
 
 
+def today_gap_source(
+    container: dict[str, Any] | None,
+    now: datetime | None = None,
+) -> str:
+    """저장된 **오늘자** 방향 판정이 실제로 쓴 갭 출처 라벨. 없으면 빈 문자열.
+
+    두 곳에서 같은 질문을 한다.
+      - `keeps_previous_verdict` — "덮어도 되는가" (오늘 갭 판정이 있으면 지킨다)
+      - `trader.run()` 의 개장 직후 재판정 — "실측 갭이 반영됐는가"
+        (`GAP_SOURCE_LIVE` 인지까지 따진다 — 장전 예상체결가는 추정이라 불충분)
+
+    어제 판정은 오늘 방향의 근거가 아니므로 날짜가 다르면 없는 것으로 본다.
+
+    Args:
+        container: 저장된 후보 컨테이너 (`short_term_candidates`).
+        now: 판정 기준 시각 (테스트 주입용).
+
+    Returns:
+        `market_direction.GAP_SOURCE_*` 중 하나, 또는 "" (갭 없음·어제 판정·형식 불량).
+    """
+    if not isinstance(container, dict):
+        return ""
+    verdict = container.get("direction")
+    if not isinstance(verdict, dict):
+        return ""
+    source = str(verdict.get("gap_source") or "")
+    if not source:
+        return ""
+    try:
+        stored = datetime.fromisoformat(str(container.get("selected_at"))).date()
+    except (TypeError, ValueError):
+        return ""
+    return source if stored == (now or datetime.now()).date() else ""
+
+
 def keeps_previous_verdict(
     container: dict[str, Any] | None,
     verdict: dict[str, Any] | None,
@@ -694,17 +729,7 @@ def keeps_previous_verdict(
     """
     if isinstance(verdict, dict) and verdict.get("gap_source"):
         return False        # 새 판정이 갭을 썼다 → 항상 갱신
-    if not isinstance(container, dict):
-        return False
-    previous = container.get("direction")
-    if not isinstance(previous, dict) or not previous.get("gap_source"):
-        return False        # 저장된 판정도 갭이 없다 → 최신으로 갱신
-    # 저장된 갭 판정이 '오늘' 것일 때만 우선한다 (어제 갭은 오늘 방향의 근거가 아니다).
-    try:
-        stored = datetime.fromisoformat(str(container.get("selected_at"))).date()
-    except (TypeError, ValueError):
-        return False
-    return stored == (now or datetime.now()).date()
+    return bool(today_gap_source(container, now))
 
 
 def candidates_need_refresh(

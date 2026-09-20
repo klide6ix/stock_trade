@@ -30,6 +30,7 @@ from core.kis_api import (
     get_cash_balance,
 )
 from core.logger import log
+from core.market_direction import GAP_SOURCE_LIVE
 from core.settings import get as get_setting, set_value as set_setting
 from core.short_term import (
     SHORT_TERM_CANDIDATE_COUNT,
@@ -48,6 +49,7 @@ from core.short_term import (
     set_position_qty,
     split_holdings,
     target_to_settings,
+    today_gap_source,
     update_peak,
 )
 from core.strategy.base import BuyStrategy, SellStrategy
@@ -1434,7 +1436,35 @@ class Trader:
                         self._prepare_short_term(force=True)
                     except Exception as e:
                         log(f"[개장판정] 재판정 실패 — 장전 판정 유지: {e}")
-                    open_judge_date = now.date()
+                    # **실측 갭이 실제로 반영됐을 때만** 오늘 몫을 끝낸 것으로 본다.
+                    #
+                    # 개장 직후 몇 초는 KIS 일봉에 오늘 봉이 아직 없어 `_today_bar_is_live()`
+                    # 가 False → 갭 경로가 예상체결가로 빠지는데, 그 시각엔 동시호가가 끝나
+                    # 예상체결가도 없다. 결국 갭 '미사용' 판정이 나오고 `keeps_previous_verdict`
+                    # 가 장전 판정을 지킨다 — 그 자체는 옳은 동작이다. 문제는 성공 여부와
+                    # 무관하게 날짜를 찍어버리면 **그날 개장 갭이 영영 반영되지 않는다**는 것.
+                    # 갭은 가중치 0.50 이라 방향이 통째로 뒤집힐 수 있다.
+                    #
+                    # 실측(2026-08-03~09-18 34거래일, README '시뮬 vs 실계좌 대조'): 08-12 ·
+                    # 08-26 · 08-31 세 날의 진입 방향이 09:00 봉의 고가~저가 **전 범위**로도
+                    # 설명되지 않고 '갭 미사용' 판정과만 일치했다. 08-12 하루의 격차 기여가
+                    # -13.56%p 로 34일 중 최대였다.
+                    #
+                    # 그래서 실패하면 마킹하지 않고 다음 주기에 다시 시도한다 —
+                    # `open_rejudge_window` 가 09:00~`OPEN_REJUDGE_UNTIL` 로 창을 닫으므로
+                    # 오후에 방향이 뒤집힐 위험은 그대로 없다.
+                    gap_source = today_gap_source(
+                        get_setting("short_term_candidates"), now
+                    )
+                    if gap_source == GAP_SOURCE_LIVE:
+                        log(f"[개장판정] 실측 갭 반영 완료 — 출처 '{gap_source}'")
+                        open_judge_date = now.date()
+                    else:
+                        log(
+                            f"[개장판정] 실측 갭 미반영 (현재 출처: "
+                            f"'{gap_source or '없음'}') — {OPEN_REJUDGE_UNTIL} 까지 "
+                            f"다음 주기에 재시도"
+                        )
                 if not did_initial_buy:
                     self.execute_initial_buy(candidates)
                     did_initial_buy = True
