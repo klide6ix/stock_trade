@@ -869,6 +869,13 @@ def render_buy_candidates() -> None:
     else:
         data = st.session_state.buy_candidates or []
 
+    if status == "disabled":
+        st.info(
+            "🛒 매수 활성화가 꺼져 있어 후보를 탐색하지 않습니다 — "
+            "사이드바에서 켜거나, 위 '후보 새로고침' 으로 수동 탐색할 수 있습니다."
+        )
+        return
+
     if status == "refreshing":
         msg = "🔄 매수 후보 탐색 중..."
         if started_at:

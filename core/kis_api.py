@@ -37,6 +37,21 @@ THROTTLE_FILE = os.path.join(_DATA_DIR, f".kis_throttle_{'mock' if IS_MOCK else 
 _MAX_CALLS_PER_SEC = 2 if IS_MOCK else 10
 _MIN_INTERVAL = 1.0 / _MAX_CALLS_PER_SEC
 
+# 원장(브로커리지 백엔드) 계열 TR 은 게이트웨이보다 **훨씬 빡빡한 초당 한도**가 걸린다
+# (EGW00215). 잔고·매수가능금액·일별체결·주문이 전부 여기 속하고 접두 4글자로 구분된다
+# (TTTC=실전 / VTTC=모의). 게이트웨이 한도(10/s)로 내보내면 한 사이클에서 잔고 → 매수가능
+# → 체결조회가 0.1초 간격으로 연달아 나가며 원장 한도를 넘어 재시도로 되돌아온다
+# (2026-09 운영 로그 실측: `[API] 초당 한도 초과 (TTTC8434R/EGW00215)`).
+# 사이클이 60초이고 원장 호출은 사이클당 몇 건뿐이라, 간격을 늘려도 의사결정은 지연되지 않는다.
+_LEDGER_TR_PREFIXES = ("TTTC", "VTTC")
+_MAX_LEDGER_CALLS_PER_SEC = 2
+_MIN_LEDGER_INTERVAL = max(_MIN_INTERVAL, 1.0 / _MAX_LEDGER_CALLS_PER_SEC)
+
+
+def _is_ledger_tr(tr_id: str) -> bool:
+    """원장 계열 TR 인지 — 더 낮은 초당 한도를 적용할 대상."""
+    return str(tr_id or "").upper().startswith(_LEDGER_TR_PREFIXES)
+
 _token = None
 _token_expired_at = None
 
@@ -132,21 +147,27 @@ class KisApiError(RuntimeError):
     """KIS API 호출 실패. 서버가 반환한 status·msg_cd·msg1 본문을 메시지에 포함한다."""
 
 
-def _throttle() -> None:
+def _throttle(tr_id: str = "") -> None:
     """모든 KIS REST 호출 직전에 호출. 프로세스 경계를 넘어 최소 호출 간격을 보장한다.
 
     동작('슬롯 예약' 패턴):
       1. lock 파일에 flock(LOCK_EX) — 동시에 한 호출자만 진입.
-      2. 파일에 저장된 '다음 허용 시각'(prev)을 읽는다.
-      3. 내 슬롯 = max(now, prev). 다음 호출자를 위해 (슬롯 + _MIN_INTERVAL)을 기록.
+      2. 파일에 저장된 '다음 허용 시각'(게이트웨이·원장 2개)을 읽는다.
+      3. 내 슬롯 = max(now, 해당 슬롯들). 다음 호출자를 위해 전진시켜 기록.
       4. flock 해제 후, 슬롯 시각까지 sleep (lock 을 쥔 채 자지 않아 다른 호출자를
          불필요하게 막지 않는다 — 예약은 이미 파일에 반영됨).
+
+    **슬롯이 둘인 이유**: 원장 계열(`_is_ledger_tr`)은 게이트웨이와 별개로 더 낮은 한도가
+    걸린다(EGW00215). 원장 호출은 **양쪽 한도를 모두** 지켜야 하므로 두 슬롯의 max 를
+    취하고 둘 다 전진시키며, 시세 조회 같은 일반 호출은 게이트웨이 슬롯만 쓴다 — 원장
+    호출 때문에 시세 조회가 0.5초씩 밀리지 않게 하기 위함이다.
 
     두 프로세스(trader·대시보드)가 같은 머신의 wall clock(time.time())을 공유하므로
     프로세스 간에도 슬롯이 단조 증가하며 간격이 유지된다. 가용성 우선 — 파일/flock 에
     문제가 생기면 throttle 없이 호출을 진행한다(거래를 막지 않음)."""
     if fcntl is None:
         return
+    ledger = _is_ledger_tr(tr_id)
     try:
         fd = os.open(THROTTLE_FILE, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError:
@@ -154,16 +175,23 @@ def _throttle() -> None:
     f = os.fdopen(fd, "r+")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
+        # 파일 형식: "<게이트웨이 다음 허용 시각> <원장 다음 허용 시각>".
+        # 값이 하나뿐인 레거시 파일도 그대로 읽힌다(원장 슬롯 0 = 제약 없음).
+        prev_gw = prev_ledger = 0.0
         try:
-            content = f.read().strip()
-            prev = float(content) if content else 0.0
+            parts = f.read().strip().split()
+            if parts:
+                prev_gw = float(parts[0])
+            if len(parts) > 1:
+                prev_ledger = float(parts[1])
         except (ValueError, OSError):
-            prev = 0.0
+            prev_gw = prev_ledger = 0.0
         now = time.time()
-        slot = max(now, prev)
+        slot = max(now, prev_gw, prev_ledger) if ledger else max(now, prev_gw)
+        next_ledger = (slot + _MIN_LEDGER_INTERVAL) if ledger else prev_ledger
         f.seek(0)
         f.truncate()
-        f.write(f"{slot + _MIN_INTERVAL:.6f}")
+        f.write(f"{slot + _MIN_INTERVAL:.6f} {next_ledger:.6f}")
         f.flush()
     finally:
         try:
@@ -196,7 +224,7 @@ def _request(method: str, url: str, tr_id: str, *, params=None, json_body=None) 
     last_exc: Exception | None = None
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
-            _throttle()  # 프로세스 경계 넘어 초당 한도 준수 (재시도 호출도 포함).
+            _throttle(tr_id)  # 프로세스 경계 넘어 초당 한도 준수 (재시도 호출도 포함).
             res = requests.request(
                 method, url,
                 headers=_headers(tr_id),

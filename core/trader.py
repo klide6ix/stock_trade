@@ -604,12 +604,18 @@ class Trader:
             log(f"[매수후보] 탐색 실패: {e}")
             return []
 
-    def _write_candidates_status(self, strategy_name: str) -> None:
+    def _write_candidates_status(
+        self, strategy_name: str | None, status: str = "refreshing"
+    ) -> None:
+        """후보 파일에 상태 마커만 쓴다 (`refreshing` 갱신 중 / `disabled` 매수 OFF).
+
+        직전 세션의 stale 후보가 대시보드에 남아 있는 것을 막는 게 목적이다.
+        """
         try:
             with open(BUY_CANDIDATES_FILE, "w", encoding="utf-8") as f:
                 json.dump(
                     {
-                        "status": "refreshing",
+                        "status": status,
                         "started_at": datetime.now().isoformat(),
                         "strategy": strategy_name,
                         "candidates": [],
@@ -617,7 +623,7 @@ class Trader:
                     f, ensure_ascii=False, indent=2,
                 )
         except Exception as e:
-            log(f"[매수후보] 갱신 마커 저장 실패: {e}")
+            log(f"[매수후보] 상태 마커 저장 실패: {e}")
 
     # ── 매수 실행 ──────────────────────────────────────────────────────────────
 
@@ -1134,8 +1140,22 @@ class Trader:
 
         Returns:
             매수 실행용 primary 전략 후보 리스트 (개장 후 초기매수에 사용).
+            `buy_enabled` 가 꺼져 있으면 빈 리스트 (스캔 자체를 건너뛴다).
         """
-        candidates = self.scan_buy_candidates()
+        # 매수가 꺼져 있으면 후보를 찾을 이유가 없다. primary + view 전략 스캔은 종목당
+        # 여러 번씩 수십~수백 회 시세 API 를 때리는데, `execute_initial_buy` 가 어차피
+        # `buy_enabled` 에서 막으므로 그 결과는 통째로 버려진다.
+        #
+        # 호출을 아끼면 두 가지가 같이 좋아진다.
+        #   - 원장 API(잔고·주문)가 게이트웨이 슬롯을 기다리는 시간이 줄어 EGW00215 완화.
+        #   - 09:00 이후 기동했을 때 스캔이 끝나기를 기다리느라 단기 매매 진입이 수 분
+        #     밀리던 문제가 사라진다 (README '장전 준비 창 이전 기동이 전제' 항목).
+        if get_setting("buy_enabled"):
+            candidates = self.scan_buy_candidates()
+        else:
+            candidates = []
+            self._write_candidates_status(None, status="disabled")
+            log("[매수후보] 매수 활성화 OFF — 후보 탐색 건너뜀")
         self._prepare_short_term(force=force_short_term)
         return candidates
 

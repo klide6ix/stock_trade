@@ -156,12 +156,15 @@ def _bars_with_today(volume):
              "volume": volume}] + past
 
 
-def _judge_with(bars, now):
-    """실제 `_gap_signal` 을 태워 어느 경로로 갔는지 본다."""
+def _judge_with(bars, now, chg=0.0, open_px=0.0):
+    """실제 `_gap_signal` 을 태워 어느 경로로 갔는지 본다.
+
+    `chg`/`open_px` 는 장중 스냅샷 응답 — 기본값(0.0, 0.0)은 **개장 직후 미갱신** 상태다.
+    """
     calls = []
     def fake_snapshot(code):
         calls.append("realtime")
-        return {"전일대비등락률(%)": 0.0}
+        return {"전일대비등락률(%)": chg, "시가": open_px}
     def fake_expected(code):
         calls.append("expected")
         return {"예상체결가": 0, "기준가": 0, "예상거래량": 0}
@@ -183,14 +186,30 @@ check("오늘 봉 거래량 > 0 + 장중 → 실시간 등락률 경로",
 check("오늘 봉 자체가 없으면 예상체결가 경로",
       _judge_with(_bars_with_today(0)[1:], _NOW_PRE)[1] == ["expected"])
 
-# placeholder 를 장중으로 오인하면 갭이 0.00% 로 편입되어 분모만 2배가 된다.
-# 갭을 미사용 처리하면 나머지 가중치(0.50)로 재정규화되므로 점수가 정확히 2배가 되어야 한다.
-_v_fixed, _ = _judge_with(_bars_with_today(0), _NOW_PRE)      # 갭 미사용 → 재정규화
-_v_bug, _ = _judge_with(_bars_with_today(5000), _NOW_OPEN)    # 갭 0.00% 로 편입
-check("0% 갭 편입은 확신도를 정확히 절반으로 희석시킨다",
-      abs(_v_bug["score"]) > 0.01 and abs(_v_fixed["score"] - 2 * _v_bug["score"]) < 1e-6,
-      f"수정 후 {_v_fixed['score']:+.4f} = 2 × {_v_bug['score']:+.4f}(0% 편입)")
+_v_fixed, _ = _judge_with(_bars_with_today(0), _NOW_PRE)       # 갭 미사용 → 재정규화
 check("갭 미사용이면 gap_source 가 None", _v_fixed["gap_source"] is None)
+
+print("\n── 5-d. 장중 스냅샷 미갱신 판별 (개장 직후 0.00%) ──")
+# 2026-09-21 09:00:03 실측: 일봉은 이미 오늘 것인데 `inquire-price` 현재가는 전일 종가
+# 그대로라 등락률이 +0.00% 로 왔다(실제 개장 갭 +0.79%). 그대로 쓰면 가중치 0.50 짜리
+# 갭이 '0' 으로 들어가 판정이 절반으로 희석되고, 그날 방향이 통째로 뒤집혔다.
+_v_stale, _calls_stale = _judge_with(_bars_with_today(5000), _NOW_OPEN, chg=0.0, open_px=0.0)
+check("장중 경로를 타긴 한다 (스냅샷은 조회한다)", _calls_stale == ["realtime"])
+check("등락률 0.00% 는 갭으로 쓰지 않는다", _v_stale["gap_source"] is None)
+check("그래서 희석이 사라진다 — 갭 미사용과 같은 점수",
+      abs(_v_stale["score"] - _v_fixed["score"]) < 1e-6,
+      f"{_v_stale['score']:+.4f} vs {_v_fixed['score']:+.4f}")
+check("등락률이 0 이 아니고 시가가 잡히면 갭을 쓴다",
+      _judge_with(_bars_with_today(5000), _NOW_OPEN, chg=1.5,
+                  open_px=_WALK_CLOSES[0] * 1.015)[0]["gap_source"] == md.GAP_SOURCE_LIVE)
+check("등락률이 있어도 시가가 0 이면 미갱신으로 본다",
+      _judge_with(_bars_with_today(5000), _NOW_OPEN,
+                  chg=1.5, open_px=0.0)[0]["gap_source"] is None)
+# 희석의 크기 — 0% 를 편입했다면 점수가 정확히 절반이 됐을 것이라는 항등식.
+_half = _v_fixed["score"] / 2
+check("0% 를 편입했다면 확신도가 정확히 절반이었다 (회피한 손해의 크기)",
+      abs(_half) > 0.01 and abs(_v_fixed["score"] - 2 * _half) < 1e-9,
+      f"{_v_fixed['score']:+.4f} → 편입 시 {_half:+.4f}")
 check("placeholder 봉은 과거봉에서 제외되어 전일 종가가 어긋나지 않는다",
       _v_fixed["prev_close"] == _WALK_CLOSES[0],
       f"{_v_fixed['prev_close']:.2f} (직전 확정 종가 {_WALK_CLOSES[0]:.2f})")
