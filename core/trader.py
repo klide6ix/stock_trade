@@ -230,6 +230,13 @@ def short_term_buy_start_label(now: datetime | None = None) -> str:
 # 않게 하기 위함이다 — 이 전략은 어디까지나 '개장 시점의 방향' 에 하루를 건다.
 OPEN_REJUDGE_UNTIL = "09:05"
 
+# 장 운영 시간 외 '대기 중' heartbeat 간격(초).
+# 매 사이클(60초) 찍으면 하루 1,000줄이 넘어(주말은 1,440줄) 정작 봐야 할 매매·판정
+# 기록을 덮는다 — 로그는 5일치가 보관되므로 사후 추적에서 그만큼 손해다. 대기 구간에
+# **처음 들어갈 때 1회** + 이후 이 간격마다 한 줄만 남겨, 프로세스가 살아 있다는 신호는
+# 유지하면서 부피만 줄인다.
+IDLE_LOG_INTERVAL = 3600
+
 
 def open_rejudge_window(now: datetime | None = None) -> bool:
     """개장 직후 최종 방향 재판정 허용 시간 여부 — 평일 09:00 ~ `OPEN_REJUDGE_UNTIL`."""
@@ -1434,6 +1441,9 @@ class Trader:
         prep_date = now.date() if (is_trading_time() or is_pre_market(now)) else None
         # 개장 직후 최종 재판정을 마친 날짜 — 실측 갭으로 하루 1회만 다시 판정한다.
         open_judge_date = None
+        # 마지막 '대기 중' 로그 시각. 장 시간·장전으로 넘어가면 None 으로 되돌려,
+        # 다음 대기 구간에 들어갈 때 다시 한 줄을 남긴다.
+        idle_logged = None
 
         if is_trading_time():
             self.execute_initial_buy(candidates)
@@ -1446,6 +1456,7 @@ class Trader:
             self._sync_sell_settings()
             now = datetime.now()
             if is_trading_time():
+                idle_logged = None
                 # 개장 직후 1회 — 실측 갭(실시간 등락률)으로 오늘 방향을 최종 확정한 뒤 진입한다.
                 # 장전 예상체결가는 어디까지나 추정이라, 확정 시가가 나온 직후의 판정이
                 # 가장 정확하다. 진입은 다음 몇십 초 뒤로 밀리지만 실측 비용은 +0.03% 수준
@@ -1497,6 +1508,7 @@ class Trader:
                 except Exception as e:
                     log(f"[단기매매] 처리 중 오류: {e}")
             elif is_pre_market(now):
+                idle_logged = None
                 # 장 전 준비: 매매 없이 후보만 사전 선정. 개장 시 신선한 후보로 진입.
                 if prep_date != now.date():
                     log(f"[장전준비] 매수 후보·시장 방향 사전 선정 시작 (매매는 개장 후 — 현재 {now.strftime('%H:%M')})")
@@ -1513,7 +1525,13 @@ class Trader:
                     # 무거운 매수 후보 스캔(scan_buy_candidates)은 위에서 하루 1회만 돈다.
                     self._prepare_short_term(force=True, quiet=True)
             else:
-                log("장 운영 시간 외 - 대기 중")
+                if (idle_logged is None
+                        or (now - idle_logged).total_seconds() >= IDLE_LOG_INTERVAL):
+                    log(
+                        "장 운영 시간 외 - 대기 중 (다음 장전 준비 "
+                        f"{pre_market_open_time().strftime('%H:%M')})"
+                    )
+                    idle_logged = now
 
             time.sleep(CHECK_INTERVAL)
 

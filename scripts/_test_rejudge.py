@@ -169,9 +169,14 @@ class _Stop(Exception):
     pass
 
 
-def run_loop(cycles=38, gap_at=None):
-    # 시계는 클래스 변수라 이전 호출의 끝 시각이 남는다 — 매번 장전 직전으로 되감는다.
-    FakeDT.current = FakeDT.start
+def run_loop(cycles=38, gap_at=None, start=None, log_sink=None):
+    """가상 시계로 메인 루프를 돌리고 호출 순서를 기록한다.
+
+    Args:
+        start: 기동 시각 (기본 장전 직전). `log_sink` 를 주면 로그 문자열도 모은다.
+    """
+    # 시계는 클래스 변수라 이전 호출의 끝 시각이 남는다 — 매번 시작 시각으로 되감는다.
+    FakeDT.current = start or FakeDT.start
     calls = []
     trader = tr.Trader.__new__(tr.Trader)
     trader.buy_strategy = trader.sell_strategy = trader.short_term_strategy = object()
@@ -211,9 +216,13 @@ def run_loop(cycles=38, gap_at=None):
         "reconcile": lambda self, c: None})()
 
     settings = {"pre_market_open_time": "08:30"}
+    def fake_log(msg, *a, **k):
+        if log_sink is not None:
+            log_sink.append(str(msg))
+
     with patch.object(tr, "datetime", FakeDT), \
          patch.object(tr.time, "sleep", side_effect=sleep), \
-         patch.object(tr, "log", lambda *a, **k: None), \
+         patch.object(tr, "log", fake_log), \
          patch.object(tr, "get_setting", side_effect=settings.get):
         try:
             trader.run()
@@ -254,6 +263,24 @@ open_late = [c for c in run_loop(gap_at="09:02")
 check("반영된 주기까지만 재시도하고 멈춤",
       len(open_late) == 3 and open_late[-1][0] == "09:02", str([c[0] for c in open_late]))
 check("장전에는 매매 판정 없음", all(c[0] >= "09:00" for c in short_term), str(short_term[:1]))
+
+print("\n── 5. 장 운영 시간 외 '대기 중' 로그 빈도 ──")
+# 매 사이클(60초) 찍으면 하루 1,000줄이 넘어 매매 기록을 덮는다. 대기 진입 1회 +
+# IDLE_LOG_INTERVAL(60분) 마다 한 줄만 남아야 한다.
+_logs = []
+run_loop(cycles=150, start=datetime(2026, 8, 3, 6, 0), log_sink=_logs)
+_idle = [m for m in _logs if "대기 중" in m]
+_expected = 1 + (149 * 60) // tr.IDLE_LOG_INTERVAL      # 06:00~08:29 = 149분 대기
+check("대기 로그는 진입 1회 + 시간당 1회", len(_idle) == _expected,
+      f"{len(_idle)}회 / 149분 (기대 {_expected}회)")
+check("대기 로그에 다음 장전 준비 시각이 붙는다",
+      _idle and "08:30" in _idle[0], _idle[0] if _idle else "(없음)")
+
+# 장전·장중을 거친 뒤 다시 대기로 들어가면 heartbeat 타이머가 리셋돼 한 줄이 남아야 한다.
+_logs2 = []
+run_loop(cycles=600, start=datetime(2026, 8, 3, 8, 50), log_sink=_logs2)
+_idle2 = [m for m in _logs2 if "대기 중" in m]
+check("장 마감 후 대기 진입 시 다시 기록된다", len(_idle2) >= 1, f"{len(_idle2)}회")
 
 print()
 if fails:
