@@ -194,16 +194,17 @@ def render_cash_balance() -> None:
         st.caption("⚠️ 잔액은 마지막 조회 기준입니다.")
 
 
-def render_header(market_open: bool, buy_strategy_label: str, sell_strategy_label: str) -> None:
-    st.title("📈 트레이더 대시보드")
-    render_cash_balance()
-    st.divider()
+def render_cash_summary(market_open: bool) -> None:
+    """최상단 — 타이틀 · 장 시간 외 안내 한 줄 · 계좌 금액.
 
-    real_open = is_market_open()
-    pre_market = is_pre_market()
+    **금액 바로 아래에 단기 매매가 오도록** 상태 패널(장 상태·전략·확인 주기)과 분리했다.
+    매일 실제로 보는 것은 '지금 얼마가 있고, 단기 매매가 무엇을 들고 있는가' 이고
+    나머지는 참고용이라 `render_status_panel` 로 내렸다.
+    """
+    st.title("📈 트레이더 대시보드")
 
     if not market_open:
-        if pre_market:
+        if is_pre_market():
             st.info(
                 f"🕗 장 전 준비 시간입니다 ({pre_market_open_time().strftime('%H:%M')}~09:00). "
                 "매매는 개장(09:00) 후 시작되며, 지금은 매수 후보와 오늘의 시장 방향을 미리 정합니다."
@@ -211,10 +212,21 @@ def render_header(market_open: bool, buy_strategy_label: str, sell_strategy_labe
         else:
             st.info("⏸ 장 운영 시간 외입니다. 보유 종목과 마지막 가격 기준으로 표시합니다.")
 
+    render_cash_balance()
+
+
+def render_status_panel(
+    market_open: bool, buy_strategy_label: str, sell_strategy_label: str
+) -> None:
+    """참고용 상태 패널 — 장 상태 · 활성 전략 · 확인 주기 · 마지막 갱신.
+
+    매매 판단에 직접 쓰이지 않으므로 단기 매매 섹션 **아래**에 둔다.
+    """
+    real_open = is_market_open()
     c1, c2, c3, c4, c5 = st.columns(5)
     if real_open:
         market_status = "🟢 운영 중"
-    elif pre_market:
+    elif is_pre_market():
         market_status = "🕗 장 전 준비"
     else:
         market_status = "🔴 마감"
@@ -1517,11 +1529,17 @@ def render_sidebar() -> tuple[bool, int, str, str, float]:
 market_open = is_trading_time()
 auto_refresh, refresh_interval, buy_label, sell_label, stop_loss_pct = render_sidebar()
 
-render_header(market_open, buy_label, sell_label)
-st.divider()
-render_holdings(market_open, stop_loss_pct)
+# 섹션 순서 — 매일 실제로 쓰는 것이 위로 온다.
+#   계좌 금액 → 단기 매매(주력 전략) → 참고 정보(장 상태 · 보유 종목) → 매수 후보 ...
+# 단기 매매 섹션은 가격·보유를 자체 조회하므로(fetch_price / _general_holding_codes)
+# 보유 종목 렌더보다 먼저 와도 의존성 문제가 없다.
+render_cash_summary(market_open)
 st.divider()
 render_short_term(market_open)
+st.divider()
+render_status_panel(market_open, buy_label, sell_label)
+st.divider()
+render_holdings(market_open, stop_loss_pct)
 st.divider()
 render_buy_candidates()
 if not market_open:
