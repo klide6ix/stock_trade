@@ -59,9 +59,8 @@ def cleanup_old_logs(retention_days: int = RETENTION_TRADING_DAYS) -> list[str]:
     파일명 날짜를 쓰는 이유는 mtime 이 touch·복사로 바뀌어도 '기록된 날' 기준으로
     일관되게 판정하기 위함이다.
 
-    한계: 공휴일 휴장일에도 프로세스가 켜져 있으면 그날 파일이 생기고, 평일이므로
-    운영일로 함께 세어진다. 연휴가 긴 달에는 실제 거래일이 그만큼 줄어든다 — 파일
-    내용을 읽어 거래 유무를 판별하는 대신 비용 0 의 근사를 택했다.
+    공휴일은 `market_calendar` 에 저장된 휴장일 달력으로 걸러낸다(API 는 부르지 않는다).
+    달력이 없는 날짜(달력 도입 전 · 조회 실패)는 평일 = 운영일로 근사한다.
 
     트리거: (1) 새 일별 파일이 처음 생성될 때(log() 내부 — 자정 경과·당일 첫 기록),
             (2) 프로세스 기동 시(main.py).
@@ -81,8 +80,10 @@ def cleanup_old_logs(retention_days: int = RETENTION_TRADING_DAYS) -> list[str]:
         except ValueError:
             continue
 
-    # 평일(운영일)만 최신순으로 세어 N 번째 평일을 컷오프로 잡는다.
-    weekdays = sorted({d for d, _ in dated if d.weekday() < 5}, reverse=True)
+    # 운영일만 최신순으로 세어 N 번째 운영일을 컷오프로 잡는다. 휴장일 달력(저장분만,
+    # API 호출 없음)이 있으면 공휴일을 빼고, 없으면 평일로 근사한다.
+    from core.market_calendar import is_open_day
+    weekdays = sorted({d for d, _ in dated if is_open_day(d, fetch=False)}, reverse=True)
     if len(weekdays) <= retention_days:
         return []                       # 아직 보관 한도에 못 미친다
     cutoff = weekdays[retention_days - 1]

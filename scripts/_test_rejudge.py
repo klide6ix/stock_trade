@@ -220,7 +220,9 @@ def run_loop(cycles=38, gap_at=None, start=None, log_sink=None):
         if log_sink is not None:
             log_sink.append(str(msg))
 
-    with patch.object(tr, "datetime", FakeDT), \
+    # 달력은 고정한다 — 실제 휴장일 파일·API 에 테스트가 의존하지 않게.
+    with patch.object(tr, "is_open_day", lambda d, **k: d.weekday() < 5), \
+         patch.object(tr, "datetime", FakeDT), \
          patch.object(tr.time, "sleep", side_effect=sleep), \
          patch.object(tr, "log", fake_log), \
          patch.object(tr, "get_setting", side_effect=settings.get):

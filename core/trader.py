@@ -30,6 +30,7 @@ from core.kis_api import (
     get_cash_balance,
 )
 from core.logger import log
+from core.market_calendar import is_open_day
 from core.market_direction import GAP_SOURCE_LIVE
 from core.settings import get as get_setting, set_value as set_setting
 from core.short_term import (
@@ -148,9 +149,12 @@ def plan_initial_buy(
 
 
 def is_market_open() -> bool:
-    """실제 장 운영 시간 체크 (평일 09:00 ~ 15:30). 모드와 무관한 '실제 시장' 상태."""
+    """실제 장 운영 시간 체크 (개장일 09:00 ~ 15:30). 모드와 무관한 '실제 시장' 상태.
+
+    개장일은 요일이 아니라 KIS 휴장일 달력으로 본다(`market_calendar.is_open_day`).
+    """
     now = datetime.now()
-    if now.weekday() >= 5:
+    if not is_open_day(now):
         return False
     t = now.time()
     return datetime.strptime("09:00", "%H:%M").time() <= t <= datetime.strptime("15:30", "%H:%M").time()
@@ -192,7 +196,7 @@ def is_pre_market(now: datetime | None = None) -> bool:
     부터 시작되는 경우에 대응하기 위한 '준비 창'.
     """
     now = now or datetime.now()
-    if now.weekday() >= 5:
+    if not is_open_day(now):
         return False
     t = now.time()
     market_open_t = datetime.strptime("09:00", "%H:%M").time()
@@ -246,7 +250,7 @@ IDLE_LOG_INTERVAL = 3600
 def open_rejudge_window(now: datetime | None = None) -> bool:
     """개장 직후 최종 방향 재판정 허용 시간 여부 — 평일 09:00 ~ `OPEN_REJUDGE_UNTIL`."""
     now = now or datetime.now()
-    if now.weekday() >= 5:
+    if not is_open_day(now):
         return False
     t = now.time()
     return _parse_hhmm("09:00", "09:00") <= t <= _parse_hhmm(OPEN_REJUDGE_UNTIL, "09:05")

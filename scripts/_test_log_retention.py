@@ -13,6 +13,12 @@ from datetime import date, timedelta
 from unittest.mock import patch
 
 from core import logger as lg
+from core import market_calendar as mc
+
+# 휴장일 달력을 비운다 — 이 테스트는 '평일 = 운영일' 근사를 검증한다(휴장일 반영은
+# _test_market_calendar 6절). 실제 data/market_calendar.json 에 의존하지 않게.
+mc.CALENDAR_FILE = os.path.join(tempfile.mkdtemp(), 'none.json')
+mc._mem.update({'fetched_on': None, 'days': {}})
 
 fails = []
 

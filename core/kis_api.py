@@ -44,7 +44,7 @@ _MIN_INTERVAL = 1.0 / _MAX_CALLS_PER_SEC
 # (2026-09 운영 로그 실측: `[API] 초당 한도 초과 (TTTC8434R/EGW00215)`).
 # 사이클이 60초이고 원장 호출은 사이클당 몇 건뿐이라, 간격을 늘려도 의사결정은 지연되지 않는다.
 _LEDGER_TR_PREFIXES = ("TTTC", "VTTC")
-_MAX_LEDGER_CALLS_PER_SEC = 2
+_MAX_LEDGER_CALLS_PER_SEC = 1
 _MIN_LEDGER_INTERVAL = max(_MIN_INTERVAL, 1.0 / _MAX_LEDGER_CALLS_PER_SEC)
 
 
