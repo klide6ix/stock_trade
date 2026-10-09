@@ -40,17 +40,21 @@ from core.short_term import (
     candidates_need_refresh,
     candidates_to_settings,
     clear_position,
+    drop_entry_intent,
+    entry_intent,
     has_pending,
     has_position,
     is_blocked,
     keeps_previous_verdict,
     mark_entry,
     position_qty,
+    resolve_entry_intent,
     set_position_qty,
     split_holdings,
     target_to_settings,
     today_gap_source,
     update_peak,
+    with_entry_intent,
 )
 from core.strategy.base import BuyStrategy, SellStrategy
 
@@ -879,6 +883,12 @@ class Trader:
         # 4. 미보유 — 진입 시도
         if not auto_enabled:
             return
+        if entry_intent(slot):
+            log(
+                f"[단기매매][{name}({code})] 직전 진입 주문 정산 대기 중 — 잔고 반영 전까지 "
+                f"추가 주문 보류"
+            )
+            return
         if is_blocked(slot):
             log(
                 f"[단기매매][{name}({code})] 오늘은 청산 후 재진입 차단 상태 "
@@ -958,13 +968,24 @@ class Trader:
             f"{'지정가' if limit else '시장가'} {qty}주 × {order_price:,.0f}원 "
             f"≈ {qty * order_price:,.0f}원 (자금풀 {pool:,.0f}원 · {price_reason} · {qty_reason})"
         )
+        # 주문 전 잔고를 기준선으로 의도를 먼저 남긴다(write-ahead). 기준선을 못 구하면
+        # 끊겼을 때 회수할 방법이 없으므로 주문하지 않는다.
+        try:
+            baseline = int((get_holdings().get(code) or {}).get("qty") or 0)
+        except Exception as e:
+            log(f"[단기매매][{name}({code})] 주문 전 잔고 확인 실패 — 진입 보류: {e}")
+            return
+        slot = with_entry_intent(slot, baseline_qty=baseline, planned_qty=qty, price=order_price)
+        set_setting("short_term_trade", slot)
+
         try:
             result = (
                 buy_limit_order(code, qty, order_price) if limit
                 else buy_market_order(code, qty)
             )
         except Exception as e:
-            log(f"[단기매매][{name}({code})] 매수 실패: {e}")
+            # 응답이 실패해도 주문은 체결됐을 수 있다 — 의도를 남겨 두고 다음 주기 정산에 맡긴다.
+            log(f"[단기매매][{name}({code})] 매수 응답 실패: {e} — 다음 주기에 잔고로 정산")
             return
 
         # 실제 체결가·체결수량·지출액을 확정 — 이후 손익 계산이 전부 이 값을 따른다.
@@ -980,13 +1001,16 @@ class Trader:
         self._cancel_remainder(result, fill, code, name)
 
         if fill["qty"] <= 0:
-            log(f"[단기매매][{name}({code})] 미체결 — 진입 취소, 다음 주기 재시도")
+            log(f"[단기매매][{name}({code})] 미체결 — 다음 주기에 잔고로 정산 후 재시도")
             return
-        self.log_trade("buy", code, name, fill["price"], fill["qty"], reason=f"[단기매매] {reason}")
+        # 원장 확정이 먼저다. 이력 저장(log_trade)이 예외를 내도 포지션은 잃지 않는다.
         set_setting(
             "short_term_trade",
-            mark_entry(slot, fill["price"], fill["qty"], invested=fill["amount"]),
+            drop_entry_intent(
+                mark_entry(slot, fill["price"], fill["qty"], invested=fill["amount"])
+            ),
         )
+        self.log_trade("buy", code, name, fill["price"], fill["qty"], reason=f"[단기매매] {reason}")
 
     # ── 단기 매매: 청산 ────────────────────────────────────────────────────────
 
@@ -1084,6 +1108,21 @@ class Trader:
             실제 체결가이므로 진입가를 그것으로 보정한다. 시장가 주문은 주문 시점 현재가와
             체결가가 어긋날 수 있어, 확인 가능한 시점에 진짜 체결가로 맞춰준다.
         """
+        # 진입 의도가 남아 있으면 무엇보다 먼저 정산한다 — 주문은 나갔는데 원장 기록 전에
+        # 끊긴 경우, 그 체결분을 여기서 회수하지 않으면 아래 진입 분기가 다시 사 버린다.
+        slot, status = resolve_entry_intent(slot, holdings)
+        intent_name = slot.get("name") or slot.get("code")
+        if status == "adopted":
+            log(
+                f"[단기매매][{intent_name}({slot.get('code')})] 원장 밖 체결분 편입 — "
+                f"{position_qty(slot)}주 @ {float(slot.get('entry_price') or 0):,.0f}원 "
+                f"(주문 후 원장 기록 전에 중단됐던 진입)"
+            )
+            set_setting("short_term_trade", slot)
+        elif status == "expired":
+            log(f"[단기매매][{intent_name}] 진입 의도 만료 — 잔고 변화 없음, 미체결로 보고 정리")
+            set_setting("short_term_trade", slot)
+
         code = slot.get("code")
         qty = position_qty(slot)
         if not code or qty <= 0:

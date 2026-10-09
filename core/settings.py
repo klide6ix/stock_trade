@@ -1,6 +1,8 @@
 """앱 사용자 설정 (매수 on/off 등) — data/settings.json 에 영속화."""
 import json
 import os
+import tempfile
+from contextlib import contextmanager
 from typing import Any
 
 from config import (
@@ -20,6 +22,12 @@ _DATA_DIR = os.path.join(_BASE_DIR, "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
 
 SETTINGS_FILE = os.path.join(_DATA_DIR, "settings.json")
+_LOCK_FILE = SETTINGS_FILE + ".lock"
+
+try:
+    import fcntl
+except ImportError:          # Windows — 잠금 없이 원자적 교체만 쓴다
+    fcntl = None
 
 DEFAULTS: dict[str, Any] = {
     "buy_enabled": False,  # 안전을 위해 기본 비활성
@@ -97,9 +105,47 @@ def load_settings() -> dict[str, Any]:
     return {**DEFAULTS, **data}
 
 
+@contextmanager
+def _write_lock():
+    """트레이더·대시보드 두 프로세스의 읽기-수정-쓰기를 직렬화하는 파일 잠금.
+
+    `set_value` 는 파일 전체를 읽어 키 하나를 바꾸고 다시 쓴다. 잠금이 없으면 두 프로세스가
+    동시에 그 사이를 지날 때 나중에 쓴 쪽이 먼저 쓴 쪽의 변경(예: 방금 기록한 단기 매매
+    원장)을 통째로 되돌린다.
+    """
+    if fcntl is None:
+        yield
+        return
+    fd = os.open(_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def save_settings(settings: dict[str, Any]) -> None:
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
+    """임시 파일에 쓴 뒤 `os.replace` 로 교체 — 읽는 쪽은 항상 완성된 파일만 본다.
+
+    `open(..., "w")` 로 직접 쓰면 파일을 비운 순간부터 다 쓸 때까지 반쯤 쓰인 내용이 보인다.
+    그때 다른 프로세스가 읽으면 JSON 파싱 실패 → `load_settings` 가 **기본값(빈 원장)** 을
+    돌려주고, 그 상태로 `set_value` 가 저장하면 원장이 기본값으로 덮인다.
+    """
+    directory = os.path.dirname(SETTINGS_FILE) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".settings.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SETTINGS_FILE)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 
 def get(key: str) -> Any:
@@ -107,6 +153,7 @@ def get(key: str) -> Any:
 
 
 def set_value(key: str, value: Any) -> None:
-    settings = load_settings()
-    settings[key] = value
-    save_settings(settings)
+    with _write_lock():
+        settings = load_settings()
+        settings[key] = value
+        save_settings(settings)

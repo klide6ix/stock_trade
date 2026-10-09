@@ -514,6 +514,105 @@ def clear_position(
     }
 
 
+# ── 진입 의도 기록(write-ahead) ─────────────────────────────────────────────
+#
+# 주문을 낸 **뒤에** 원장에 쓰면, 그 사이(주문 응답 타임아웃·체결 조회 실패·이력 저장 예외)
+# 에서 끊겼을 때 체결된 수량이 원장 밖으로 빠진다. 다음 주기는 '미보유' 로 보고 다시
+# 사고, 잔고 대조(`_reconcile_short_term_ledger`)는 수량을 **낮추기만** 하므로 아무도
+# 그 물량을 회수하지 못한다.
+#
+# 2026-09-30 실측: 09:05:46 TIGER 200 28주 전량 체결이 원장에 남지 않았고, 09:06:50 에
+# 남은 현금으로 2주를 다시 사 원장이 2주로 기록됐다. 이후 청산은 2주만 팔았고 28주는
+# '일반 보유' 로 분류돼, 대체 ETF(RISE 200) 회피까지 겹치며 열흘간 30만원 안팎의 현금
+# 으로만 매매가 돌았다.
+#
+# 그래서 주문 직전에 의도(종목 · 주문 전 잔고 수량 · 계획 수량)를 먼저 남기고, 체결 확정과
+# **같은 쓰기**에서 지운다. 의도가 남아 있으면 다음 주기가 새 주문보다 먼저 잔고 증가분을
+# 원장에 편입한다.
+
+# 의도가 남아 있는데 잔고가 늘지 않았을 때 '미체결' 로 보고 정리하기까지의 대기(초).
+# 체결이 잔고에 반영되는 지연을 넉넉히 덮되, 진짜 미체결이면 몇 주기 안에 재시도하게 한다.
+ENTRY_INTENT_TTL_SEC = 180
+
+
+def with_entry_intent(
+    slot: dict[str, Any],
+    *,
+    baseline_qty: int,
+    planned_qty: int,
+    price: float,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """주문 직전 원장에 남기는 진입 의도. 종목은 슬롯의 `code` 를 따른다."""
+    return {
+        **slot,
+        "entry_intent": {
+            "code": slot.get("code"),
+            "baseline_qty": int(baseline_qty),
+            "planned_qty": int(planned_qty),
+            "price": float(price),
+            "at": (now or datetime.now()).isoformat(),
+        },
+    }
+
+
+def entry_intent(slot: dict[str, Any] | None) -> dict[str, Any] | None:
+    intent = slot.get("entry_intent") if isinstance(slot, dict) else None
+    return intent if isinstance(intent, dict) and intent.get("code") else None
+
+
+def drop_entry_intent(slot: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in slot.items() if k != "entry_intent"}
+
+
+def resolve_entry_intent(
+    slot: dict[str, Any],
+    holdings: dict[str, dict],
+    now: datetime | None = None,
+) -> tuple[dict[str, Any], str]:
+    """남아 있는 진입 의도를 실제 잔고로 정산한다.
+
+    Returns:
+        (새 슬롯, 상태). 상태는
+          - "none"     의도 없음 (또는 이미 원장에 포지션이 있어 의도만 정리)
+          - "adopted"  잔고가 주문 전보다 늘었다 → 그 증가분을 원장에 편입
+          - "waiting"  아직 늘지 않았다 — TTL 전까지 새 주문을 막고 기다린다
+          - "expired"  TTL 이 지나도록 늘지 않았다 → 미체결로 보고 의도 정리
+    """
+    intent = entry_intent(slot)
+    if intent is None:
+        return slot, "none"
+    if has_position(slot):
+        return drop_entry_intent(slot), "none"
+
+    now = now or datetime.now()
+    code = intent["code"]
+    held = holdings.get(code) or {}
+    try:
+        held_qty = int(held.get("qty") or 0)
+    except (TypeError, ValueError):
+        held_qty = 0
+    delta = held_qty - int(intent.get("baseline_qty") or 0)
+
+    try:
+        intent_at = datetime.fromisoformat(str(intent.get("at")))
+    except (TypeError, ValueError):
+        intent_at = now
+
+    if delta > 0:
+        # 주문 전 잔고가 0 이었으면 증권사 평단이 곧 이 체결의 평균가다. 일반 보유와 섞여
+        # 있으면 평단을 믿을 수 없으므로 주문 당시 단가로 근사한다.
+        avg = float(held.get("avg_price") or 0)
+        price = avg if int(intent.get("baseline_qty") or 0) == 0 and avg > 0 \
+            else float(intent.get("price") or avg or 0)
+        adopted = mark_entry({**slot, "code": code}, price, delta, now=intent_at)
+        return drop_entry_intent(adopted), "adopted"
+
+    if (now - intent_at).total_seconds() >= ENTRY_INTENT_TTL_SEC:
+        return drop_entry_intent(slot), "expired"
+    return slot, "waiting"
+
+
 def invested_amount(slot: dict[str, Any] | None) -> float:
     """현재 포지션에 투입된 실제 현금. 포지션이 없으면 0.
 
