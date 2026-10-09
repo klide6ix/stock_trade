@@ -769,7 +769,13 @@ def get_order_execution(
     side: str,
     date: datetime | None = None,
 ) -> dict | None:
-    """주문번호로 **실제 체결 결과**를 조회. 체결 내역이 없으면 None.
+    """주문번호로 **실제 체결 결과**를 조회. 주문을 찾지 못하면 None.
+
+    **미체결 주문도 돌려준다**(`체결수량` 0, `미체결수량` > 0). 체결된 건만 조회하면
+    '아직 걸려 있는 지정가 주문' 과 '존재하지 않는 주문' 이 둘 다 None 이 되어 구분되지
+    않는다. 2026-09-30 실측: 지정가 28주가 주문 직후 가격 상승으로 체결되지 않았는데
+    None 을 받은 호출부가 "28주 전량 체결" 로 가정해 잔량을 취소하지 않았고, 1분 뒤
+    원장이 비워진 다음 그 주문이 뒤늦게 체결돼 원장 밖 물량이 됐다.
 
     시장가 주문은 주문 시점 현재가와 체결가가 호가 스프레드만큼 어긋난다(ETF 1,125원짜리
     2,600주면 1틱 5원 차이가 1만원 이상). 손익을 현재가 기준으로 계산하면 이 오차가 계속
@@ -804,7 +810,7 @@ def get_order_execution(
         "SLL_BUY_DVSN_CD": "01" if side == "sell" else "02",
         "INQR_DVSN": "00",          # 역순 (최근 주문부터)
         "PDNO": stock_code,
-        "CCLD_DVSN": "01",          # 체결된 건만
+        "CCLD_DVSN": "00",          # 전체 — 미체결(걸려 있는) 주문도 본다
         "ORD_GNO_BRNO": "",
         "ODNO": str(order_no or ""),
         "INQR_DVSN_3": "00",
@@ -830,8 +836,6 @@ def get_order_execution(
             return 0.0
 
     filled_qty = int(_f(row, "tot_ccld_qty"))
-    if filled_qty <= 0:
-        return None
 
     summary = data.get("output2") or {}
     # 조회 결과가 우리 주문 1건뿐일 때만 제비용을 이 주문에 귀속시킨다.

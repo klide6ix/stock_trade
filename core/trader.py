@@ -33,6 +33,7 @@ from core.logger import log
 from core.market_direction import GAP_SOURCE_LIVE
 from core.settings import get as get_setting, set_value as set_setting
 from core.short_term import (
+    ENTRY_INTENT_TTL_SEC,
     SHORT_TERM_CANDIDATE_COUNT,
     EtfDayTradeStrategy,
     block_today,
@@ -423,6 +424,9 @@ def settle_order(
     if order_no:
         for attempt in range(1, _SETTLE_ATTEMPTS + 1):
             exec_info = get_order_execution(order_no, code, side)
+            # 매도는 시장가라 0주 체결 행은 '아직 반영 전' 이다 — 다시 조회한다.
+            if exec_info and side == "sell" and exec_info["체결수량"] <= 0:
+                exec_info = None
             if exec_info:
                 gross = exec_info["총체결금액"]
                 fee = exec_info["추정제비용"]
@@ -437,6 +441,24 @@ def settle_order(
                 }
             if attempt < _SETTLE_ATTEMPTS:
                 time.sleep(_SETTLE_RETRY_DELAY)
+
+    if side == "buy":
+        # 매수는 확인되지 않은 체결을 **가정하지 않는다**. 지정가는 체결 내역이 없으면 대개
+        # '아직 걸려 있다' 는 뜻이라, 전량 체결로 보면 잔량 취소를 건너뛰고 살아 있는 주문을
+        # 방치하게 된다(2026-09-30). 0주·잔량 전부로 돌려 호출부가 취소하게 하고, 실제
+        # 체결분은 진입 의도(write-ahead)가 다음 주기에 잔고로 정산한다.
+        log(
+            f"[체결조회] {code} buy 체결 확인 실패 (주문번호 {order_no or '없음'}) — "
+            f"체결 0주로 보고 잔량 {fallback_qty}주 취소 후 잔고로 정산"
+        )
+        return {
+            "qty": 0,
+            "price": float(fallback_price),
+            "amount": 0.0,
+            "fee": 0.0,
+            "remaining": int(fallback_qty),
+            "exact": False,
+        }
 
     log(
         f"[체결조회] {code} {side} 체결 확인 실패 (주문번호 {order_no or '없음'}) — "
@@ -496,6 +518,19 @@ def pick_limit_buy_price(code: str, qty: int, fallback_price: float) -> tuple[fl
     # 호가창 전체로도 수량을 못 덮으면 가장 높은 매도호가로 — 나머지는 미체결 후 취소된다.
     price = asks[-1][0]
     return price, f"매도{len(asks)}호가 {price:,.0f}원 (잔량 부족 — 누적 {cumulative:,}주 < {qty:,}주)"
+
+
+# 진입 직후 원장 수량 하향 보정(외부 청산 판정 포함)을 미루는 시간(초).
+LEDGER_CLEAR_GRACE_SEC = 300
+
+
+def _within_entry_grace(slot: dict, now: datetime | None = None) -> bool:
+    """원장 진입 시각이 유예 시간 안인지."""
+    try:
+        at = datetime.fromisoformat(str(slot.get("entry_at")))
+    except (TypeError, ValueError):
+        return False
+    return ((now or datetime.now()) - at).total_seconds() < LEDGER_CLEAR_GRACE_SEC
 
 
 class Trader:
@@ -1001,7 +1036,10 @@ class Trader:
         self._cancel_remainder(result, fill, code, name)
 
         if fill["qty"] <= 0:
-            log(f"[단기매매][{name}({code})] 미체결 — 다음 주기에 잔고로 정산 후 재시도")
+            log(
+                f"[단기매매][{name}({code})] 체결 미확인 — 잔량 취소, 진입 의도 유지 "
+                f"(다음 주기에 잔고로 정산 · 미체결이면 {ENTRY_INTENT_TTL_SEC}초 뒤 재시도)"
+            )
             return
         # 원장 확정이 먼저다. 이력 저장(log_trade)이 예외를 내도 포지션은 잃지 않는다.
         set_setting(
@@ -1131,6 +1169,15 @@ class Trader:
         held = holdings.get(code)
         held_qty = int(held.get("qty") or 0) if held else 0
         name = slot.get("name") or code
+
+        # 진입 직후에는 잔고 반영이 늦을 수 있다. 그 사이 '잔고에 없음 → 외부 청산' 으로
+        # 원장을 지우면, 다음 주기가 다시 사서 같은 물량을 두 번 들게 된다(2026-09-30).
+        if held_qty < qty and _within_entry_grace(slot):
+            log(
+                f"[단기매매][{name}({code})] 잔고 {held_qty}주 < 원장 {qty}주 — 진입 직후라 "
+                f"보정 유예 ({LEDGER_CLEAR_GRACE_SEC}초)"
+            )
+            return slot
 
         if held_qty <= 0:
             log(f"[단기매매][{name}({code})] 잔고에 없음 — 외부 청산으로 보고 원장 정리")

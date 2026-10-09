@@ -140,6 +140,92 @@ for p in common:
     p.stop()
 
 
+print("\n── 3-b. 2026-09-30 실제 경로 — 지정가가 체결되지 않고 걸려 있던 경우 ──")
+# 로그: 09:05:45 지정가 28주 × 111,065 → 09:05:48 '체결 확인 실패 — 28주로 근사'
+#       → 09:06:49 '잔고에 없음 — 외부 청산' → 2주 재진입 → 이후 28주가 뒤늦게 체결.
+with patch.object(tr.time, "sleep", lambda s: None), patch.object(tr, "log", lambda *a, **k: None):
+    with patch.object(tr, "get_order_execution", return_value=None):
+        f = tr.settle_order({"output": {"ODNO": "4072600"}}, "102110", "buy", 111_065, 28)
+    check("매수 체결 확인 실패 → 체결로 가정하지 않음 (0주 · 잔량 28)",
+          f["qty"] == 0 and f["remaining"] == 28 and not f["exact"], str(f))
+    resting = {"체결수량": 0, "미체결수량": 28, "체결평균가": 0, "총체결금액": 0, "추정제비용": 0}
+    with patch.object(tr, "get_order_execution", return_value=resting):
+        f = tr.settle_order({"output": {"ODNO": "4072600"}}, "102110", "buy", 111_065, 28)
+    check("걸려 있는 주문(0주 체결) → 잔량 28 로 보고", f["qty"] == 0 and f["remaining"] == 28, str(f))
+    with patch.object(tr, "get_order_execution", return_value=None):
+        f = tr.settle_order({"output": {"ODNO": "1"}}, "114800", "sell", 1_000, 300)
+    check("매도(시장가)는 기존대로 주문 시점 값으로 근사", f["qty"] == 300 and not f["exact"])
+
+store2 = {"short_term_trade": dict(BASE)}
+held2 = {"qty": 0}
+cancels = []
+
+
+def holdings2():
+    return {"102110": {"qty": held2["qty"], "avg_price": 111_065}} if held2["qty"] else {}
+
+
+def run_entry(cancel_effect):
+    with patch.object(tr, "get_setting", side_effect=lambda k: store2.get(k)), \
+         patch.object(tr, "set_setting", side_effect=lambda k, v: store2.__setitem__(k, v)), \
+         patch.object(tr, "get_holdings", side_effect=holdings2), \
+         patch.object(tr, "log", lambda *a, **k: None), \
+         patch.object(tr.time, "sleep", lambda s: None), \
+         patch.object(tr, "short_term_pool", return_value=3_204_105), \
+         patch.object(tr, "use_limit_buy", return_value=True), \
+         patch.object(tr, "pick_limit_buy_price", return_value=(111_065, "매도1호가")), \
+         patch.object(tr, "plan_market_buy_qty", return_value=(28, "자금풀")), \
+         patch.object(tr, "buy_limit_order",
+                      return_value={"output": {"ODNO": "4072600", "KRX_FWDG_ORD_ORGNO": "91252"}}), \
+         patch.object(tr, "get_order_execution", return_value=None), \
+         patch.object(tr, "cancel_order", side_effect=cancel_effect):
+        trader._short_term_enter(dict(BASE), 111_050, "상승 판정")
+
+
+trader2 = tr.Trader.__new__(tr.Trader)
+trader = trader2
+run_entry(lambda o, g, **k: cancels.append(o))
+slot = store2["short_term_trade"]
+check("걸려 있던 잔량을 취소한다", cancels == ["4072600"], str(cancels))
+check("원장에는 기록하지 않고 진입 의도만 남긴다",
+      position_qty(slot) == 0 and entry_intent(slot) is not None)
+
+with patch.object(tr, "set_setting", side_effect=lambda k, v: store2.__setitem__(k, v)), \
+     patch.object(tr, "log", lambda *a, **k: None):
+    s_wait = trader2._reconcile_short_term_ledger(slot, holdings2())
+check("1분 뒤 잔고 0 → '외부 청산' 이 아니라 정산 대기 (재진입 없음)",
+      entry_intent(s_wait) is not None and position_qty(s_wait) == 0)
+
+# 취소 직전에 체결돼 버린 경우 — 취소는 실패하고 잔고가 늘어난다
+store2["short_term_trade"] = dict(BASE)
+held2["qty"] = 0
+
+
+def cancel_too_late(o, g, **k):
+    held2["qty"] = 28
+    raise RuntimeError("APBK0915 취소 가능 수량 없음")
+
+
+run_entry(cancel_too_late)
+with patch.object(tr, "set_setting", side_effect=lambda k, v: store2.__setitem__(k, v)), \
+     patch.object(tr, "log", lambda *a, **k: None):
+    trader2._reconcile_short_term_ledger(store2["short_term_trade"], holdings2())
+check("취소 전에 체결됐으면 다음 주기에 28주 편입 (고아 없음)",
+      position_qty(store2["short_term_trade"]) == 28
+      and entry_intent(store2["short_term_trade"]) is None)
+
+print("\n── 3-c. 진입 직후 '잔고에 없음' 유예 ──")
+fresh = {**BASE, "qty": 28, "entry_price": 111_065, "entry_at": datetime.now().isoformat()}
+stale = {**fresh, "entry_at": (datetime.now() - timedelta(minutes=10)).isoformat()}
+out = {}
+with patch.object(tr, "set_setting", side_effect=lambda k, v: out.__setitem__(k, v)), \
+     patch.object(tr, "log", lambda *a, **k: None):
+    r1 = trader2._reconcile_short_term_ledger(dict(fresh), {})
+    r2 = trader2._reconcile_short_term_ledger(dict(stale), {})
+check("진입 5분 이내면 잔고에 없어도 원장을 지우지 않는다", position_qty(r1) == 28)
+check("유예가 지나면 기존대로 외부 청산으로 정리", position_qty(r2) == 0)
+
+
 print("\n── 4. set_value 잠금 — 두 프로세스 동시 쓰기 ──")
 
 
