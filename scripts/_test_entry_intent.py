@@ -106,7 +106,8 @@ with patch.object(trader, "_sync_short_term_settings", lambda: None), \
      patch.object(trader, "_short_term_refresh_candidates", side_effect=lambda s, g: s), \
      patch.object(tr, "get_quote_snapshot", return_value={"현재가": 111_065}), \
      patch.object(trader, "_short_term_enter", side_effect=lambda *a, **k: entered.append(1)), \
-     patch.object(tr, "short_term_buy_window_open", return_value=True):
+     patch.object(tr, "short_term_buy_window_open", return_value=True), \
+     patch.object(tr, "short_term_entry_closed", return_value=False):
     trader.short_term_strategy = type("S", (), {"should_buy": lambda self, s, snap: (True, "상승")})()
     trader.check_short_term()
 check("정산 대기 중에는 추가 주문이 나가지 않는다 (09:06:50 의 2주 매수 차단)", entered == [])
@@ -127,7 +128,8 @@ with patch.object(tr, "short_term_pool", return_value=3_100_000), \
      patch.object(tr, "plan_market_buy_qty", return_value=(28, "자금풀")), \
      patch.object(tr, "buy_limit_order", side_effect=ok_order), \
      patch.object(tr, "settle_order", return_value={"qty": 28, "price": 111_065, "amount": 3_109_950,
-                                                    "fee": 130, "remaining": 0, "exact": True}), \
+                                                    "fee": 130, "remaining": 0, "exact": True,
+                                                    "closed": True}), \
      patch.object(trader, "_cancel_remainder", lambda *a, **k: None), \
      patch.object(trader, "log_trade", side_effect=OSError("disk full")):
     try:

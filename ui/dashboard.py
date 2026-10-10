@@ -474,6 +474,7 @@ def render_short_term(market_open: bool) -> None:
         short_term_budget,
         short_term_buy_delay_min,
         short_term_buy_start_label,
+        short_term_entry_deadline,
         short_term_pool,
     )
 
@@ -514,6 +515,7 @@ def render_short_term(market_open: bool) -> None:
     pool = short_term_pool()
     buy_delay = short_term_buy_delay_min()
     buy_start = short_term_buy_start_label()
+    buy_until = short_term_entry_deadline().strftime("%H:%M")
     hold_desc = (
         f"당일 **{FORCE_CLOSE_TIME}** 강제청산 (오버나이트 미보유)"
         if strategy.close_at_market_end
@@ -529,7 +531,9 @@ def render_short_term(market_open: bool) -> None:
             f"추종하는 **대체 ETF**(예: KODEX 200 → TIGER 200)로 자동 회피해 평단이 섞이지 않게 합니다.\n"
             f"- **매수**: {buy_start} 이후"
             + (" (개장 즉시)" if buy_delay == 0 else f" (개장 후 {buy_delay}분)")
-            + f" 시장가 매수. 수량은 **min(자금 풀 ÷ 현재가, KIS 최대매수수량)** — "
+            + f" ~ **{buy_until} 까지만** 신규 진입합니다(이후에는 자동매매를 켜도 다음 거래일까지 "
+            f"진입하지 않으며, 직접 '교체' 한 종목만 예외). 지정가가 일부만 체결되면 잔량을 취소하고 "
+            f"남은 예산으로 곧바로 다시 주문합니다. 수량은 **min(자금 풀 ÷ 현재가, KIS 최대매수수량)** — "
             f"시장가는 KIS 가 상한가(+30%) 기준으로 증거금을 계산하므로 실제 매수 여력으로 상한을 씌웁니다.\n"
             f"- **자금 풀**: 배정액 {seed:,.0f}원에서 출발해 청산할 때마다 **실현손익이 그대로 누적**됩니다. "
             f"번 만큼 다음 진입 금액이 커지고(복리), 잃은 만큼 작아집니다 — 일반 매수 자금에서 손실을 "

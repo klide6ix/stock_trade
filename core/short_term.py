@@ -686,6 +686,26 @@ def is_blocked(slot: dict[str, Any] | None, now: datetime | None = None) -> bool
     return str(raw) == now.date().isoformat()
 
 
+# ── 진입 마감 예외 (사용자 교체) ──────────────────────────────────────────────
+#
+# 신규 진입은 마감 시각(`trader.SHORT_TERM_ENTRY_UNTIL`) 이후 막힌다. 다만 대시보드의
+# '교체' 는 사용자가 그 시각에 직접 고른 것이라 마감과 무관하게 진입시킨다. 날짜로
+# 표시하므로 다음 날에는 저절로 풀린다.
+
+
+def allow_late_entry(slot: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+    """오늘에 한해 진입 마감 이후에도 진입을 허용하도록 표시."""
+    now = now or datetime.now()
+    return {**slot, "late_entry_date": now.date().isoformat()}
+
+
+def late_entry_allowed(slot: dict[str, Any] | None, now: datetime | None = None) -> bool:
+    if not isinstance(slot, dict) or not slot.get("late_entry_date"):
+        return False
+    now = now or datetime.now()
+    return str(slot["late_entry_date"]) == now.date().isoformat()
+
+
 # ── 일반 슬롯과의 보유 분리 ───────────────────────────────────────────────────
 
 

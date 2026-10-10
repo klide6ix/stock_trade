@@ -795,9 +795,14 @@ def get_order_execution(
         side: "buy" | "sell".
         date: 주문일 (기본 오늘).
 
+    취소 확인: 잔량을 취소하면 원주문 행의 `rmn_qty` 가 0 이 되고, `orgn_odno` 가 원주문을
+    가리키는 **취소 행**이 따로 생긴다(실측 2026-08-26: 원주문 25주·체결 1·잔여 0 +
+    취소 행 24주). 그래서 `체결수량 + 취소수량 == 주문수량` 이고 `미체결수량 == 0` 이면
+    그 주문은 더 체결될 수 없다 — 재주문 전에 호출부가 이 등식으로 확인한다.
+
     Returns:
-        {주문번호, 체결수량, 체결평균가, 총체결금액, 미체결수량, 추정제비용, 제비용신뢰}
-        또는 None (아직 체결 미반영·조회 실패).
+        {주문번호, 주문수량, 체결수량, 체결평균가, 총체결금액, 미체결수량, 취소수량,
+        추정제비용, 제비용신뢰} 또는 None (아직 체결 미반영·조회 실패).
     """
     day = (date or datetime.now()).strftime("%Y%m%d")
     url = f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
@@ -836,6 +841,13 @@ def get_order_execution(
             return 0.0
 
     filled_qty = int(_f(row, "tot_ccld_qty"))
+    # 이 주문을 원주문으로 하는 취소 행의 수량 합 (거부된 취소는 뺀다).
+    order_key = str(order_no).lstrip("0")
+    cancelled_qty = sum(
+        max(0, int(_f(r, "ord_qty")) - int(_f(r, "rjct_qty")))
+        for r in rows
+        if order_key and str(r.get("orgn_odno", "")).lstrip("0") == order_key
+    )
 
     summary = data.get("output2") or {}
     # 조회 결과가 우리 주문 1건뿐일 때만 제비용을 이 주문에 귀속시킨다.
@@ -844,10 +856,12 @@ def get_order_execution(
 
     return {
         "주문번호": str(row.get("odno", "")),
+        "주문수량": int(_f(row, "ord_qty")),
         "체결수량": filled_qty,
         "체결평균가": _f(row, "avg_prvs"),
         "총체결금액": _f(row, "tot_ccld_amt"),
         "미체결수량": int(_f(row, "rmn_qty")),
+        "취소수량": cancelled_qty,
         "추정제비용": fee,
         "제비용신뢰": fee_trusted,
     }

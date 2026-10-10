@@ -37,6 +37,7 @@ from core.short_term import (
     ENTRY_INTENT_TTL_SEC,
     SHORT_TERM_CANDIDATE_COUNT,
     EtfDayTradeStrategy,
+    allow_late_entry,
     block_today,
     invested_amount,
     candidates_need_refresh,
@@ -48,6 +49,7 @@ from core.short_term import (
     has_position,
     is_blocked,
     keeps_previous_verdict,
+    late_entry_allowed,
     mark_entry,
     position_qty,
     resolve_entry_intent,
@@ -268,6 +270,33 @@ def short_term_buy_window_open(now: datetime | None = None) -> bool:
     return now >= open_time + timedelta(minutes=short_term_buy_delay_min())
 
 
+# 단기 매매 신규 진입 마감 시각. 이 전략은 '개장 시점의 방향' 에 하루를 거는데, 하한(개장 +
+# 지연)만 있으면 자동매매를 오후에 켜거나 미체결 재시도가 이어질 때 장 전 판정 그대로
+# 14시에도 진입한다. 진입 시각 검증(_check_open_drift ④)이 09:00~09:30 까지만 다뤘으므로
+# 그 밖은 근거가 없는 구간이다. 청산은 이 시각과 무관하게 종일 판정한다.
+SHORT_TERM_ENTRY_UNTIL = "09:30"
+
+# 매수 지연을 길게 잡아 시작 시각이 마감에 붙거나 넘어가도 최소한 이만큼(분)은 창을 연다.
+# 지연은 사용자가 명시한 설정이라, 마감 때문에 진입이 통째로 막히면 안 된다.
+SHORT_TERM_ENTRY_MIN_WINDOW_MIN = 10
+
+
+def short_term_entry_deadline(now: datetime | None = None) -> datetime:
+    """오늘의 신규 진입 마감 시각 — max(`SHORT_TERM_ENTRY_UNTIL`, 매수 시작 + 최소 창)."""
+    now = now or datetime.now()
+    start = now.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(
+        minutes=short_term_buy_delay_min()
+    )
+    until = datetime.combine(now.date(), _parse_hhmm(SHORT_TERM_ENTRY_UNTIL, "09:30"))
+    return max(until, start + timedelta(minutes=SHORT_TERM_ENTRY_MIN_WINDOW_MIN))
+
+
+def short_term_entry_closed(now: datetime | None = None) -> bool:
+    """신규 진입 마감이 지났는지. 마감 시각 정각까지는 진입을 허용한다."""
+    now = now or datetime.now()
+    return now > short_term_entry_deadline(now)
+
+
 # 단기 매매에 배정하는 초기 자금(원). settings.json 의 `short_term_budget` 로 조절.
 # 이 값은 '씨드(seed)' 이고, 실제로 굴리는 금액은 아래 자금 풀(`short_term_pool`)이다.
 SHORT_TERM_BUDGET_DEFAULT = 3_000_000
@@ -401,6 +430,34 @@ _SETTLE_ATTEMPTS = 3
 _SETTLE_RETRY_DELAY = 1.0
 
 
+def _fill_from_execution(
+    exec_info: dict,
+    side: str,
+    fallback_price: float,
+    fallback_qty: int,
+) -> dict:
+    """체결 조회 결과(`get_order_execution`)를 정산용 dict 로 바꾼다.
+
+    `closed` 는 `미체결 0 ∧ 체결 + 취소 == 주문` 일 때만 True 다. 미체결 0 만 보지 않는
+    이유는, 등식까지 맞아야 '취소가 원장에 반영됐다' 를 확인한 것이기 때문이다.
+    """
+    gross = exec_info["총체결금액"]
+    fee = exec_info["추정제비용"]
+    filled = int(exec_info["체결수량"])
+    remaining = int(exec_info["미체결수량"])
+    ordered = int(exec_info.get("주문수량") or fallback_qty)
+    cancelled = int(exec_info.get("취소수량") or 0)
+    return {
+        "qty": filled,
+        "price": exec_info["체결평균가"] or fallback_price,
+        "amount": gross + fee if side == "buy" else gross - fee,
+        "fee": fee,
+        "remaining": remaining,
+        "exact": True,
+        "closed": remaining <= 0 and filled + cancelled == ordered,
+    }
+
+
 def settle_order(
     order_result: dict,
     code: str,
@@ -422,7 +479,8 @@ def settle_order(
     호출부가 근사치임을 로그에 남길 수 있게 한다.
 
     Returns:
-        {qty, price, amount, fee, exact} — exact=False 면 fallback 근사치.
+        {qty, price, amount, fee, remaining, exact, closed} — exact=False 면 fallback 근사치.
+        closed=True 면 그 주문은 더 체결될 수 없다(전량 체결됐거나 잔량이 취소됐다).
     """
     order_no = ((order_result or {}).get("output") or {}).get("ODNO", "")
     if order_no:
@@ -432,17 +490,7 @@ def settle_order(
             if exec_info and side == "sell" and exec_info["체결수량"] <= 0:
                 exec_info = None
             if exec_info:
-                gross = exec_info["총체결금액"]
-                fee = exec_info["추정제비용"]
-                amount = gross + fee if side == "buy" else gross - fee
-                return {
-                    "qty": exec_info["체결수량"],
-                    "price": exec_info["체결평균가"] or fallback_price,
-                    "amount": amount,
-                    "fee": fee,
-                    "remaining": exec_info["미체결수량"],
-                    "exact": True,
-                }
+                return _fill_from_execution(exec_info, side, fallback_price, fallback_qty)
             if attempt < _SETTLE_ATTEMPTS:
                 time.sleep(_SETTLE_RETRY_DELAY)
 
@@ -462,6 +510,7 @@ def settle_order(
             "fee": 0.0,
             "remaining": int(fallback_qty),
             "exact": False,
+            "closed": False,
         }
 
     log(
@@ -475,6 +524,7 @@ def settle_order(
         "fee": 0.0,
         "remaining": 0,
         "exact": False,
+        "closed": False,
     }
 
 
@@ -522,6 +572,36 @@ def pick_limit_buy_price(code: str, qty: int, fallback_price: float) -> tuple[fl
     # 호가창 전체로도 수량을 못 덮으면 가장 높은 매도호가로 — 나머지는 미체결 후 취소된다.
     price = asks[-1][0]
     return price, f"매도{len(asks)}호가 {price:,.0f}원 (잔량 부족 — 누적 {cumulative:,}주 < {qty:,}주)"
+
+
+# 진입 1회에 낼 수 있는 지정가 주문 횟수. 첫 주문이 부분 체결·미체결로 닫히면 남은 예산으로
+# 같은 주기 안에서 다시 낸다. 다음 주기(60초 뒤)로 미루면 그만큼 가격이 더 달아난다.
+ENTRY_MAX_ROUNDS = 3
+
+# 잔량 취소가 원장에 반영됐는지 확인하는 체결 재조회 횟수.
+_CANCEL_CONFIRM_ATTEMPTS = 3
+
+
+def pick_reorder_price(code: str) -> tuple[float, str] | None:
+    """재주문 단가 — 조회된 가장 깊은 매도호가를 **상한**으로 건다.
+
+    첫 주문은 '수량을 덮는 호가' 에 걸지만, 그게 안 닿았다는 건 호가가 조회와 주문 사이에
+    걷히고 있다는 뜻이다(2026-08-26: 25주 중 1주만 체결, 2026-09-30: 0주). 같은 방식으로
+    다시 걸면 또 놓칠 수 있어 상한을 호가창 끝까지 올린다. 지정가 매수는 상한이 아니라
+    걸려 있는 낮은 호가부터 체결되므로 물량이 있으면 더 내는 돈은 없다.
+
+    Returns:
+        (주문 단가, 근거 문자열). 호가를 못 구하면 None — 낡은 가격으로 주문하지 않는다.
+    """
+    try:
+        asks = get_orderbook(code).get("매도호가") or []
+    except Exception as e:
+        log(f"[지정가] {code} 재주문용 호가 조회 실패: {e}")
+        return None
+    if not asks:
+        return None
+    price = max(p for p, _ in asks)
+    return price, f"매도{len(asks)}호가 {price:,.0f}원 상한"
 
 
 # 진입 직후 원장 수량 하향 보정(외부 청산 판정 포함)을 미루는 시간(초).
@@ -886,6 +966,17 @@ class Trader:
         # 포지션도 없고 자동매매도 꺼져 있으면 시세를 조회할 이유가 없다 (불필요한 API 호출 회피).
         if not holding and not auto_enabled:
             return
+        # 진입 마감이 지났으면 오늘은 새로 들어가지 않는다 — 시세도 조회하지 않는다.
+        # 걸려 있던 진입 의도는 위 원장 대조가 마감과 무관하게 정산한다.
+        if not holding and short_term_entry_closed() and not late_entry_allowed(slot):
+            today = datetime.now().date()
+            if getattr(self, "_entry_closed_logged", None) != today:
+                self._entry_closed_logged = today
+                log(
+                    f"[단기매매][{name}({code})] 진입 마감 "
+                    f"({short_term_entry_deadline():%H:%M}) 경과 — 오늘은 신규 진입하지 않음"
+                )
+            return
 
         try:
             snapshot = get_quote_snapshot(code)
@@ -967,6 +1058,42 @@ class Trader:
         except Exception as e:
             log(f"[단기매매][{name}({code})] 미체결 {remaining}주 취소 실패: {e} — 수동 확인 필요")
 
+    def _settle_entry_round(
+        self, result: dict, code: str, name: str, order_price: float, qty: int
+    ) -> tuple[dict, bool]:
+        """진입 주문 1건을 정산하고 미체결 잔량을 취소한다.
+
+        Returns:
+            (체결 내역, 확정 여부). 확정(True)은 그 주문이 **더 체결될 수 없음**을 체결 조회로
+            확인했다는 뜻이다 — 전량 체결됐거나 잔량 취소가 원장에 반영됐다. 확정이 아니면
+            호출부는 재주문하지 않는다. 살아 있을지 모르는 주문 위에 또 사면 이중 매수가 된다.
+        """
+        fill = settle_order(result, code, "buy", order_price, qty)
+        if fill.get("closed"):
+            return fill, True
+
+        # 지정가는 부분 체결로 잔량이 남을 수 있다. 살려두면 현금이 묶이고 나중에 체결되면
+        # 원장에 없는 유령 포지션이 되므로 즉시 취소한다.
+        self._cancel_remainder(result, fill, code, name)
+        if not fill["exact"]:
+            return fill, False
+
+        # 조회와 취소 사이에 더 체결됐을 수 있다. 취소가 반영된 뒤의 체결 수량이 최종이다.
+        order_no = ((result or {}).get("output") or {}).get("ODNO", "")
+        for attempt in range(1, _CANCEL_CONFIRM_ATTEMPTS + 1):
+            exec_info = get_order_execution(order_no, code, "buy") if order_no else None
+            if exec_info:
+                latest = _fill_from_execution(exec_info, "buy", order_price, qty)
+                # 취소 행이 생기면 제비용을 이 주문에 귀속할 수 없어 0 으로 온다. 체결 수량이
+                # 그대로면 취소 전에 확인한 값을 이어 쓴다.
+                if latest["qty"] == fill["qty"] and not latest["fee"] and fill["fee"]:
+                    latest = {**latest, "fee": fill["fee"], "amount": latest["amount"] + fill["fee"]}
+                fill = latest
+                if fill["closed"]:
+                    return fill, True
+            if attempt < _CANCEL_CONFIRM_ATTEMPTS:
+                time.sleep(_SETTLE_RETRY_DELAY)
+        return fill, False
 
     def _short_term_enter(self, slot: dict, current_price: float, reason: str) -> None:
         """진입 주문 + 자체 원장 기록.
@@ -978,6 +1105,12 @@ class Trader:
         주문 유형은 기본 **지정가**(`buy_order_type`)다. 단가는 주문 수량을 덮는 매도호가로
         잡아 즉시 체결을 노리되, KIS 증거금이 주문 단가 기준이라 시장가보다 약 30% 더 살 수
         있다. 미체결 잔량이 남으면 즉시 취소해 현금이 묶이거나 원장 밖 포지션이 생기지 않게 한다.
+
+        지정가가 부분 체결·미체결로 닫히면 **남은 예산으로 같은 주기 안에서 다시 주문한다**
+        (최대 `ENTRY_MAX_ROUNDS` 회). 재주문 없이 그 수량으로 확정하던 시절에는 25주 중 1주만
+        사고 자금의 97% 가 하루 유휴였다(2026-08-26). 원장은 모든 주문이 끝난 뒤 **한 번만**
+        쓴다 — 진입 의도는 첫 주문 전 잔고를 기준선으로 끝까지 남아 있으므로, 중간에 끊기거나
+        체결이 확정되지 않으면 원장에 쓰지 않고 다음 주기 잔고 정산에 맡긴다.
         """
         code = slot["code"]
         name = slot.get("name") or code
@@ -985,74 +1118,114 @@ class Trader:
         pool = short_term_pool()
         limit = use_limit_buy()
 
-        # 지정가 단가는 수량에 따라 달라지고(호가 잔량), 수량은 단가에 따라 달라진다.
-        # 현재가 기준 잠정 수량으로 단가를 먼저 잡은 뒤, 그 단가로 수량을 확정한다.
-        order_price, price_reason = (
-            pick_limit_buy_price(code, max(1, int(pool // current_price)), current_price)
-            if limit else (current_price, "시장가")
-        )
-
-        qty, qty_reason = plan_market_buy_qty(
-            code, order_price, pool, f"단기매매][{name}({code})", market_order=not limit
-        )
-        if qty <= 0:
-            log(
-                f"[단기매매][{name}({code})] 매수 여력 부족 — {qty_reason} · "
-                f"주문단가 {order_price:,.0f}원 - 스킵"
-            )
-            return
-
-        log(
-            f"[단기매매][{name}({code})] ★ 진입 ({reason}) → "
-            f"{'지정가' if limit else '시장가'} {qty}주 × {order_price:,.0f}원 "
-            f"≈ {qty * order_price:,.0f}원 (자금풀 {pool:,.0f}원 · {price_reason} · {qty_reason})"
-        )
-        # 주문 전 잔고를 기준선으로 의도를 먼저 남긴다(write-ahead). 기준선을 못 구하면
-        # 끊겼을 때 회수할 방법이 없으므로 주문하지 않는다.
+        # 주문 전 잔고가 진입 의도(write-ahead)의 기준선이다. 못 구하면 끊겼을 때 회수할 방법이
+        # 없으므로 주문하지 않는다. 호가보다 먼저 읽어 호가 조회와 주문 사이 간격을 줄인다.
         try:
             baseline = int((get_holdings().get(code) or {}).get("qty") or 0)
         except Exception as e:
             log(f"[단기매매][{name}({code})] 주문 전 잔고 확인 실패 — 진입 보류: {e}")
             return
-        slot = with_entry_intent(slot, baseline_qty=baseline, planned_qty=qty, price=order_price)
-        set_setting("short_term_trade", slot)
 
-        try:
-            result = (
-                buy_limit_order(code, qty, order_price) if limit
-                else buy_market_order(code, qty)
+        fills: list[dict] = []   # 확정된 주문별 체결
+        target_qty = 0
+        rounds = ENTRY_MAX_ROUNDS if limit else 1
+        for round_no in range(1, rounds + 1):
+            budget = pool - sum(f["amount"] for f in fills)
+
+            if round_no == 1:
+                # 지정가 단가는 수량에 따라 달라지고(호가 잔량), 수량은 단가에 따라 달라진다.
+                # 현재가 기준 잠정 수량으로 단가를 먼저 잡은 뒤, 그 단가로 수량을 확정한다.
+                order_price, price_reason = (
+                    pick_limit_buy_price(code, max(1, int(pool // current_price)), current_price)
+                    if limit else (current_price, "시장가")
+                )
+            else:
+                picked = pick_reorder_price(code)
+                if picked is None:
+                    log(f"[단기매매][{name}({code})] 재주문 중단 — 호가를 구하지 못함")
+                    break
+                order_price, price_reason = picked
+
+            qty, qty_reason = plan_market_buy_qty(
+                code, order_price, budget, f"단기매매][{name}({code})", market_order=not limit
             )
-        except Exception as e:
-            # 응답이 실패해도 주문은 체결됐을 수 있다 — 의도를 남겨 두고 다음 주기 정산에 맡긴다.
-            log(f"[단기매매][{name}({code})] 매수 응답 실패: {e} — 다음 주기에 잔고로 정산")
-            return
+            if qty <= 0:
+                if round_no == 1:
+                    log(
+                        f"[단기매매][{name}({code})] 매수 여력 부족 — {qty_reason} · "
+                        f"주문단가 {order_price:,.0f}원 - 스킵"
+                    )
+                    return
+                log(f"[단기매매][{name}({code})] 재주문 중단 — 남은 예산으로 살 수량 없음 ({qty_reason})")
+                break
 
-        # 실제 체결가·체결수량·지출액을 확정 — 이후 손익 계산이 전부 이 값을 따른다.
-        fill = settle_order(result, code, "buy", order_price, qty)
-        log(
-            f"[단기매매][{name}({code})] 체결 {fill['qty']}주 @ {fill['price']:,.0f}원 "
-            f"· 지출 {fill['amount']:,.0f}원 (제비용 {fill['fee']:,.0f}원)"
-            + ("" if fill["exact"] else " ※ 주문 시점 근사치")
-        )
+            if round_no == 1:
+                target_qty = qty
+                log(
+                    f"[단기매매][{name}({code})] ★ 진입 ({reason}) → "
+                    f"{'지정가' if limit else '시장가'} {qty}주 × {order_price:,.0f}원 "
+                    f"≈ {qty * order_price:,.0f}원 (자금풀 {pool:,.0f}원 · {price_reason} · {qty_reason})"
+                )
+                slot = with_entry_intent(
+                    slot, baseline_qty=baseline, planned_qty=qty, price=order_price
+                )
+                set_setting("short_term_trade", slot)
+            else:
+                log(
+                    f"[단기매매][{name}({code})] ↻ 재주문 {round_no}/{rounds} → "
+                    f"지정가 {qty}주 × {order_price:,.0f}원 "
+                    f"(남은 예산 {budget:,.0f}원 · {price_reason} · {qty_reason})"
+                )
 
-        # 지정가는 부분 체결로 잔량이 남을 수 있다. 살려두면 현금이 묶이고 나중에 체결되면
-        # 원장에 없는 유령 포지션이 되므로 즉시 취소한다.
-        self._cancel_remainder(result, fill, code, name)
+            try:
+                result = (
+                    buy_limit_order(code, qty, order_price) if limit
+                    else buy_market_order(code, qty)
+                )
+            except Exception as e:
+                # 응답이 실패해도 주문은 체결됐을 수 있다 — 의도를 남겨 두고 다음 주기 정산에 맡긴다.
+                log(f"[단기매매][{name}({code})] 매수 응답 실패: {e} — 다음 주기에 잔고로 정산")
+                return
 
-        if fill["qty"] <= 0:
+            # 실제 체결가·체결수량·지출액을 확정 — 이후 손익 계산이 전부 이 값을 따른다.
+            fill, confirmed = self._settle_entry_round(result, code, name, order_price, qty)
             log(
-                f"[단기매매][{name}({code})] 체결 미확인 — 잔량 취소, 진입 의도 유지 "
-                f"(다음 주기에 잔고로 정산 · 미체결이면 {ENTRY_INTENT_TTL_SEC}초 뒤 재시도)"
+                f"[단기매매][{name}({code})] 체결 {fill['qty']}주 @ {fill['price']:,.0f}원 "
+                f"· 지출 {fill['amount']:,.0f}원 (제비용 {fill['fee']:,.0f}원)"
+                + ("" if fill["exact"] else " ※ 주문 시점 근사치")
             )
+            if not confirmed:
+                log(
+                    f"[단기매매][{name}({code})] 체결 미확정 — 재주문하지 않고 진입 의도 유지 "
+                    f"(다음 주기에 잔고로 정산 · 미체결이면 {ENTRY_INTENT_TTL_SEC}초 뒤 재시도)"
+                )
+                return
+            if fill["qty"] > 0:
+                fills.append(fill)
+            if fill["qty"] >= qty:
+                break
+
+        total_qty = sum(f["qty"] for f in fills)
+        if total_qty <= 0:
+            # 낸 주문이 전부 무체결로 닫혔다. 걸려 있는 주문도 체결분도 없으니 의도를 지워
+            # 다음 주기에 바로 다시 시도한다(진입 마감 시각까지).
+            set_setting("short_term_trade", drop_entry_intent(slot))
+            log(f"[단기매매][{name}({code})] 체결 없음 — 주문 전부 취소 확인, 다음 주기에 재시도")
             return
+
+        invested = sum(f["amount"] for f in fills)
+        avg_price = sum(f["amount"] - f["fee"] for f in fills) / total_qty
         # 원장 확정이 먼저다. 이력 저장(log_trade)이 예외를 내도 포지션은 잃지 않는다.
         set_setting(
             "short_term_trade",
-            drop_entry_intent(
-                mark_entry(slot, fill["price"], fill["qty"], invested=fill["amount"])
-            ),
+            drop_entry_intent(mark_entry(slot, avg_price, total_qty, invested=invested)),
         )
-        self.log_trade("buy", code, name, fill["price"], fill["qty"], reason=f"[단기매매] {reason}")
+        if total_qty < target_qty:
+            log(
+                f"[단기매매][{name}({code})] ⚠️ 목표 {target_qty}주 중 {total_qty}주만 체결 — "
+                f"자금풀 {pool - invested:,.0f}원 유휴 (주문 {len(fills)}건 체결)"
+            )
+        self.log_trade("buy", code, name, avg_price, total_qty, reason=f"[단기매매] {reason}")
 
     # ── 단기 매매: 청산 ────────────────────────────────────────────────────────
 
@@ -1402,11 +1575,12 @@ class Trader:
             # 교체도 실현손익이 확정되는 청산이므로 자금 풀에 그대로 반영한다.
             apply_short_term_pnl(invested, fill["amount"])
 
-        new_slot = target_to_settings(
+        # 교체는 사용자가 지금 고른 것이므로 진입 마감 시각 이후여도 오늘은 진입시킨다.
+        new_slot = allow_late_entry(target_to_settings(
             pending,
             auto_enabled=auto_enabled,
             blocked_date=slot.get("blocked_date"),
-        )
+        ))
         set_setting("short_term_trade", new_slot)
         log(
             f"[단기매매] 교체 완료 → 새 종목: {new_slot['name']}({new_slot['code']}) - "
