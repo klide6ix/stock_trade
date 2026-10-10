@@ -7,7 +7,7 @@
 """
 import statistics as st
 
-from core.kis_api import get_daily_ohlcv
+from scripts._bar_cache import load_daily
 from core.market_direction import (
     MA_LONG,
     MA_SHORT,
@@ -23,7 +23,7 @@ from core.strategy.buy._indicators import sma
 
 # 주의: 아래 '전일' 은 **원신호**(부호 반전 전)다. 반전 여부는 가중치 부호로 표현한다
 # — ④⑤ 에서 음수 가중치가 곧 현재 구현의 평균회귀 사용에 해당한다.
-bars = list(reversed(get_daily_ohlcv("069500", days=120)))
+bars = list(reversed(load_daily("069500")))
 rows = []
 for i in range(MA_LONG + 1, len(bars) - 1):
     closes = [b["close"] for b in reversed(bars[:i])]

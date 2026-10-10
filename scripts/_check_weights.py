@@ -8,7 +8,7 @@ market_direction.judge_direction() 과 동일한 계산식을 과거 일봉에 �
 """
 import statistics as st
 
-from core.kis_api import get_daily_ohlcv
+from scripts._bar_cache import load_daily
 from core.market_direction import (
     MA_LONG,
     MA_SHORT,
@@ -28,7 +28,7 @@ from core.strategy.buy._indicators import sma
 
 CODE = "069500"
 
-bars = list(reversed(get_daily_ohlcv(CODE, days=120)))  # 오래된 순
+bars = list(reversed(load_daily(CODE)))  # 오래된 순
 print(f"표본: {len(bars)}개 일봉 ({bars[0]['date']} ~ {bars[-1]['date']})\n")
 
 rows = []

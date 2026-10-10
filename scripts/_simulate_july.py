@@ -19,7 +19,7 @@
 import statistics as st
 from datetime import datetime
 
-from core.kis_api import get_daily_ohlcv
+from scripts._bar_cache import load_daily
 from core.market_direction import (
     MA_LONG,
     MA_SHORT,
@@ -50,7 +50,7 @@ OLD_W = {"ma": 0.35, "prev": -0.25, "mom": 0.20, "gap": 0.20}  # prev 음수 = �
 
 
 def load(code):
-    bars = get_daily_ohlcv(code, days=120)
+    bars = load_daily(code)
     return {b["date"]: b for b in bars}, sorted(b["date"] for b in bars)
 
 

@@ -12,7 +12,8 @@ import statistics as st
 import sys
 from datetime import datetime, timedelta
 
-from core.kis_api import BASE_URL, _request, get_daily_ohlcv
+from core.kis_api import BASE_URL, _request
+from scripts._bar_cache import load_daily
 from core.market_direction import (
     MA_LONG,
     MA_SHORT,
@@ -151,7 +152,7 @@ def report(title, bars):
 
 
 print("표본 외 검증 — 3~6월(train) / 7월(test)")
-report("KODEX 200 ETF (069500) — 실제 매매 대상", get_daily_ohlcv("069500", days=120))
+report("KODEX 200 ETF (069500) — 실제 매매 대상", load_daily("069500"))
 report("코스피200 지수 (2001) — 원 데이터 교차 확인",
        fetch_index_bars("2001", "20260101", "20260731"))
 report("코스피 지수 (0001) — 참고", fetch_index_bars("0001", "20260101", "20260731"))
@@ -190,7 +191,7 @@ def marginal(rows, label):
     grp("3일 w > 0.5", lambda w: w["3일"] > 0.5)
 
 
-for title, bars in (("KODEX 200 ETF", get_daily_ohlcv("069500", days=120)),
+for title, bars in (("KODEX 200 ETF", load_daily("069500")),
                     ("코스피200 지수", fetch_index_bars("2001", "20260101", "20260731"))):
     rows = build_rows(bars)
     marginal([r for r in rows if r["date"] <= TRAIN_END], title)

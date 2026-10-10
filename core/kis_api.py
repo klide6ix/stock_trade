@@ -594,9 +594,13 @@ def get_daily_ohlcv(stock_code: str, days: int = 60) -> list[dict]:
         "FID_ORG_ADJ_PRC": "0",
     }
     output = _request("GET", url, "FHKST03010100", params=params).get("output2", [])
+    return _parse_daily_bars(output)[:days]
 
+
+def _parse_daily_bars(output: list[dict]) -> list[dict]:
+    """`inquire-daily-itemchartprice` 의 output2 를 일봉 dict 목록으로 (종가 없는 행 제외)."""
     bars: list[dict] = []
-    for bar in output:
+    for bar in output or []:
         try:
             close = float(bar.get("stck_clpr", 0))
         except (TypeError, ValueError):
@@ -611,7 +615,47 @@ def get_daily_ohlcv(stock_code: str, days: int = 60) -> list[dict]:
             "close": close,
             "volume": int(bar.get("acml_vol", 0) or 0),
         })
-    return bars[:days]
+    return bars
+
+
+# 일봉 조회 1회가 돌려주는 최대 행 수 (실측: 범위가 더 넓어도 최근 100행만 온다).
+_DAILY_PAGE_ROWS = 100
+
+
+def get_daily_ohlcv_range(stock_code: str, start: str, end: str | None = None) -> list[dict]:
+    """`start`~`end`(YYYYMMDD, 기본 오늘) 구간의 일봉 전부. 최신순 정렬.
+
+    `get_daily_ohlcv` 는 한 번만 조회하므로 최근 100행에서 끊긴다 — 검증 스크립트가 그걸
+    쓰면 실행 날짜가 하루 지날 때마다 표본 시작일이 하루씩 밀린다(2026-08-03 실행 94일
+    +72.29% → 08-04 실행 93일 +60.83%). 여기서는 구간 끝에서부터 100행씩 거슬러 받아
+    시작일을 고정한다. KIS 는 과거 구간도 그대로 내준다(실측: 2024-01 까지 확인).
+
+    값은 **수정주가**(`FID_ORG_ADJ_PRC=0`)다. 분배락이 생기면 그 이전 날짜의 값이 전부
+    다시 계산되므로(실측 KODEX 200: 2026-04-29 · 07-30), 받아 둔 값을 오래 묵혀 다른
+    시점에 받은 값과 섞어 쓰면 안 된다.
+    """
+    url = f"{BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+    cursor = datetime.strptime(end, "%Y%m%d") if end else datetime.now()
+    first = datetime.strptime(start, "%Y%m%d")
+
+    bars: dict[str, dict] = {}
+    while cursor >= first:
+        page = _parse_daily_bars(_request("GET", url, "FHKST03010100", params={
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+            "FID_INPUT_DATE_1": start,
+            "FID_INPUT_DATE_2": cursor.strftime("%Y%m%d"),
+            "FID_PERIOD_DIV_CODE": "D",
+            "FID_ORG_ADJ_PRC": "0",
+        }).get("output2", []))
+        fresh = [b for b in page if b["date"] and b["date"] not in bars]
+        if not fresh:
+            break
+        bars.update((b["date"], b) for b in fresh)
+        if len(page) < _DAILY_PAGE_ROWS:
+            break   # 구간 시작까지 다 받았다
+        cursor = datetime.strptime(min(b["date"] for b in fresh), "%Y%m%d") - timedelta(days=1)
+    return [bars[d] for d in sorted(bars, reverse=True)]
 
 
 def get_weekly_price_change(stock_code: str) -> float | None:

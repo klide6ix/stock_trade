@@ -5,13 +5,13 @@
 """
 import statistics as st
 
-from core.kis_api import get_daily_ohlcv
+from scripts._bar_cache import load_daily
 from core.market_direction import MA_LONG, MA_SHORT, MOMENTUM_DAYS
 from core.strategy.buy._indicators import sma
 
 VOL_WINDOW = 20
 
-bars = list(reversed(get_daily_ohlcv("069500", days=120)))
+bars = list(reversed(load_daily("069500")))
 rows = []
 for i in range(MA_LONG + 2, len(bars)):
     closes = [b["close"] for b in reversed(bars[:i])]  # 최신순

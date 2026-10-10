@@ -20,7 +20,7 @@ import os
 import statistics as st
 from datetime import datetime
 
-from core.kis_api import BASE_URL, _request, get_daily_ohlcv
+from core.kis_api import BASE_URL, _request
 from core.market_direction import (
     MA_LONG,
     MA_SHORT,
@@ -38,6 +38,7 @@ from core.market_direction import (
     realized_vol,
 )
 from core.strategy.buy._indicators import sma
+from scripts._bar_cache import load_daily, stale_minute_keys
 
 UP_CODE, DOWN_CODE = "069500", "114800"     # KODEX 200 / KODEX 인버스
 START, END = "20260302", "20260731"
@@ -65,6 +66,12 @@ def _load_cache() -> None:
     if os.path.exists(CACHE_PATH):
         with open(CACHE_PATH, encoding="utf-8") as f:
             _cache = json.load(f)
+    # 분배락 뒤에는 캐시된 분봉이 새로 받은 일봉과 수정주가 기준이 어긋난다 — 버리고 다시 받는다.
+    for code, keys in stale_minute_keys(_cache, DAILY).items():
+        print(f"[분봉 캐시] {code}: 수정주가 기준이 일봉과 어긋남 — {keys[0][-8:]}~{keys[-1][-8:]} "
+              f"{len(keys)}일치를 버리고 다시 받습니다")
+        for key in keys:
+            del _cache[key]
 
 
 def _save_cache() -> None:
@@ -100,7 +107,7 @@ def fetch_minutes(code: str, date: str, hours=FULL_DAY_HOURS) -> dict[str, float
                 continue
             if len(hhmmss) >= 4 and close > 0:
                 bars[hhmmss[:4]] = close
-    _cache[key] = {"scope": need, "bars": bars}
+    _cache[key] = {"scope": need, "bars": bars, "fetched": datetime.now().strftime("%Y%m%d")}
     return bars
 
 
@@ -116,8 +123,9 @@ def minute_label(delay: int) -> str:
 
 # ── 방향 판정 (실제 로직과 동일) ──────────────────────────────────────────────
 
-proxy_bars = {b["date"]: b for b in get_daily_ohlcv(UP_CODE, days=140)}
-inv_bars = {b["date"]: b for b in get_daily_ohlcv(DOWN_CODE, days=140)}
+# 표본 시작일을 고정해 받는다 — 최근 N행으로 받으면 실행 날짜마다 표본이 하루씩 밀린다.
+proxy_bars = {b["date"]: b for b in load_daily(UP_CODE)}
+inv_bars = {b["date"]: b for b in load_daily(DOWN_CODE)}
 DAILY = {UP_CODE: proxy_bars, DOWN_CODE: inv_bars}
 proxy_dates = sorted(proxy_bars)
 
