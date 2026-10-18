@@ -7,7 +7,7 @@ systemd 의 `ExecStartPre` 로 트레이더 기동 직전에 돈다. 서버는 �
   1. **검증 게이트** — 새 커밋을 임시 worktree 에 꺼내 **서버 venv 의 Python 으로** 그 커밋의
      `scripts/_test_*.py` 를 전부 돌린다(서버는 3.11 · 로컬은 3.14 라 로컬 통과가 서버 통과를
      보장하지 않는다). 하나라도 실패하면 반영하지 않는다. 테스트가 임시 worktree 안에서 돌기 때문에
-     운영 `data/` · `logs/` 는 건드리지 않는다.
+     운영 `data/` · `logs/` 는 건드리지 않고, 운영 자격 증명 대신 더미 키로 돈다(`GATE_ENV`).
   2. **기동은 절대 막지 않는다** — fetch 실패 · 시간 초과 · fast-forward 불가 · 서버의 커밋 안 된
      수정 · 테스트 실패 · 예외, 무엇이든 기존 코드 그대로 두고 0 으로 끝난다. `reset --hard` 같은
      파괴적 명령은 쓰지 않는다(`merge --ff-only` 만).
@@ -41,6 +41,19 @@ REMOTE, BRANCH = "origin", "main"
 FETCH_TIMEOUT_SEC = 30
 PIP_TIMEOUT_SEC = 300
 TEST_TIMEOUT_SEC = 120      # 테스트 파일 하나당. 현재 전체 10종이 2초 안팎이다.
+
+# 게이트의 테스트는 **운영 자격 증명 없이** 돈다. 임시 worktree 에는 .env 가 없어 `core/kis_api` 가
+# import 단계에서 죽고(ACCOUNT_NO.replace), 그렇다고 운영 키를 넘기면 테스트가 실수로 실제 API 를
+# 부를 수 있다. 더미 키면 그런 호출은 인증에서 막힌다. load_dotenv 는 이미 있는 값을 덮어쓰지 않으므로
+# .env 가 있는 트리에서도 이 값이 이긴다. 알림 채널은 빈 값으로 꺼 둔다.
+# `STOCK_TRADE_GATE` 는 '게이트 안에서 도는 중' 표시 — `_test_update_code` 가 실제 저장소 전체를
+# 게이트 환경으로 다시 돌리는 자기 검증을 이 안에서는 건너뛰게 한다(무한 재귀 방지).
+GATE_ENV = {
+    "APP_KEY": "gate-dummy", "APP_SECRET": "gate-dummy", "ACCOUNT_NO": "00000000-00",
+    "MOCK_APP_KEY": "gate-dummy", "MOCK_APP_SECRET": "gate-dummy", "MOCK_ACCOUNT_NO": "00000000-00",
+    "NOTIFY_SNS_TOPIC_ARN": "", "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "",
+    "STOCK_TRADE_GATE": "1",
+}
 
 # 부팅 중엔 아무도 프롬프트에 답할 수 없다 — 자격 증명 · 호스트 키 질문에 멈추지 않고 실패하게.
 GIT_ENV = {
@@ -78,7 +91,7 @@ def run_tests(tree: str, python: str = sys.executable) -> tuple[bool, str]:
     tests = sorted(glob.glob(os.path.join(tree, "scripts", "_test_*.py")))
     if not tests:
         return False, "회귀 테스트 파일이 없음"
-    env = {**os.environ, "PYTHONPATH": tree}
+    env = {**os.environ, **GATE_ENV, "PYTHONPATH": tree}
     for path in tests:
         name = os.path.basename(path)
         try:

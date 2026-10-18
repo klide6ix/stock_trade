@@ -10,6 +10,10 @@
   4. fetch 실패면 error, requirements 가 바뀌면 pip 먼저 · pip 실패면 거부
   5. 검증은 새 커밋의 테스트로 한다 (서버에 있던 옛 테스트가 아니라)
   6. 유닛 파일 변경 감지 · 상태 파일 기록 · main 은 예외에도 0
+  7. 게이트 환경 — 테스트는 운영 자격 증명 없이(더미 키) · 알림 채널 꺼진 채로 돈다
+  8. **실제 저장소의 회귀 전부가 게이트 환경에서 통과한다** — 2026-10-18 첫 실부팅에서 `.env` 없는
+     worktree 라 `core/kis_api` import 가 죽어 README 만 바꾼 커밋이 거부된 오탐의 재발 방지.
+     게이트 안에서 돌 때(`STOCK_TRADE_GATE`)는 건너뛴다(무한 재귀 방지)
 """
 import json
 import os
@@ -194,6 +198,42 @@ with patch.object(uc, "update", side_effect=RuntimeError("boom")), \
     code = uc.main()
 check("update 예외에도 main 은 0 · error 상태 기록", code == 0 and written and written[0]["result"] == "error"
       and "boom" in written[0]["detail"], str(written))
+
+print("── 7. 게이트 환경 ──")
+ENV_PROBE = """import os, sys
+from dotenv import load_dotenv
+load_dotenv()  # 트리에 .env 가 있어도 더미 값이 이겨야 한다
+ok = (os.environ.get("ACCOUNT_NO", "").replace("-", "") == "0000000000"   # kis_api import 패턴
+      and os.environ.get("APP_KEY") == "gate-dummy"
+      and os.environ.get("NOTIFY_SNS_TOPIC_ARN") == "" and os.environ.get("TELEGRAM_BOT_TOKEN") == ""
+      and os.environ.get("STOCK_TRADE_GATE") == "1")
+print("✅ 전부 통과" if ok else "❌ 실패 env"); sys.exit(0 if ok else 1)
+"""
+dev, server = setup()
+new = commit(dev, {"scripts/_test_env.py": ENV_PROBE,
+                   ".env": "APP_KEY=REAL-SECRET\nACCOUNT_NO=12345678-01\nNOTIFY_SNS_TOPIC_ARN=arn:aws:sns:x:1:t\n"})
+with patch.dict(os.environ, {"APP_KEY": "REAL-SECRET", "NOTIFY_SNS_TOPIC_ARN": "arn:aws:sns:x:1:t"}):
+    st = uc.update(server)
+check("운영 키·알림 대신 더미 · .env 가 있어도 더미가 이김 → 통과", st["result"] == "updated" and head(server) == new, str(st))
+
+print("── 8. 실제 저장소 회귀 전부가 게이트 환경에서 통과 ──")
+if os.environ.get("STOCK_TRADE_GATE"):
+    print("  (게이트 안에서 도는 중 — 자기 검증 건너뜀)")
+else:
+    # 서버 worktree 와 같은 조건 — git 이 아는 파일만(커밋 안 된 변경 · 새 파일 포함), .env · data/ ·
+    # logs/ 같은 ignore 대상은 빠진다. 저장소 루트에서 돌리면 .env 가 있어 더미 주입 누락을 못 잡는다.
+    real = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    clean = tempfile.mkdtemp(prefix="uc-clean-")
+    listed = subprocess.run(["git", "ls-files", "-co", "--exclude-standard", "-z"], cwd=real,
+                            capture_output=True, text=True, check=True).stdout.split("\0")
+    for rel in filter(None, listed):
+        src = os.path.join(real, rel)
+        if os.path.isfile(src):
+            os.makedirs(os.path.dirname(os.path.join(clean, rel)), exist_ok=True)
+            subprocess.run(["cp", "-p", src, os.path.join(clean, rel)], check=True)
+    check("깨끗한 사본에는 .env 가 없다 (서버 worktree 와 같은 조건)", not os.path.exists(os.path.join(clean, ".env")))
+    ok, detail = uc.run_tests(clean)
+    check("현재 코드의 scripts/_test_*.py 전부 — .env 없이 더미 자격 증명으로 통과", ok, detail)
 
 print()
 if fails:
