@@ -520,7 +520,10 @@
 - [ ] 일반 매수 후보 선정도 장전 시세 반영 여부 점검 — 08:30~09:00 ranking API 가 전일 종가 기준이면 개장 후 1회 재스캔 트리거 고려
 - [ ] 매도 발생 시 알림 (Telegram / 카카오톡 등) — 텔레그램 봇·전송 함수는 부팅 알림으로 이미 생겼다(`scripts/boot_notify.py::send_telegram`). 진입·청산 로그 지점에서 부르게 하면 된다 — 공용 모듈(`core/notify.py`)로 옮기는 게 먼저
 - [x] ~~**운영 서버 1회 설정**~~ (2026-10-18 완료) — 로컬 AWS CLI(`stock-trade` 프로필) + **SSM Run Command** 로 SSH 없이 적용했다(인스턴스 역할 `stock-trade-ec2-ssm` 추가). systemd 등록 · 스케줄 `stock-trade-start`/`stop` **ENABLED**(실패 시 3회 재시도). **실 Stop → Start 1회로 전 경로 확인**: Stop 때 `ExecStop` 의 stop.sh 가 트레이더·streamlit 정리 → Start 요청 후 약 15초 만에 서비스 active · health ok · 새 IP(15.165.39.115) 인식 → 일요일이라 `휴장일 — 5분 뒤 자동 종료` → 정확히 5분 뒤 `Client.InstanceInitiatedShutdown` 으로 **stopped**. 서버 Python 3.11 에서도 회귀 26건 통과
-  - [x] **부팅 알림을 이메일(Amazon SNS)로** (2026-10-18) — 텔레그램 대신 SNS topic `stock-trade-alerts` → 이메일 구독. 서버에 **비밀값이 없다** — 인스턴스 역할(`stock-trade-ec2-ssm`)에 이 topic 의 `sns:Publish` 만 붙였고, AL2023 기본 AWS CLI 로 보내 boto3 의존성도 늘리지 않았다. 메일 제목에 주소를 넣어(`StockTrader up 10-19 08:21 http://x.x.x.x:8501`, SNS 제약상 ASCII · 100자 미만) 알림 미리보기만으로 IP 가 보인다. 채널은 `.env` 에 설정된 것만 쓰고(`NOTIFY_SNS_TOPIC_ARN` / 텔레그램), 한 채널이 실패해도 나머지는 보낸다. 회귀 **+20건**(총 46 — 제목 제약 · publish 인자 · 리전은 ARN 에서 · CLI 없음/권한 오류/시간 초과 · 채널 분기). `any()` 단락 평가 · 제목 자르기 제거 · 리전 하드코딩 · ARN 검증 제거로 바꾸면 각각 실패하는 것까지 확인
+  - [x] **부팅 알림을 이메일(Amazon SNS)로** (2026-10-18) — 텔레그램 대신 SNS topic `stock-trade-alerts` → 이메일 구독. 서버에 **비밀값이 없다** — 인스턴스 역할(`stock-trade-ec2-ssm`)에 이 topic 의 `sns:Publish` 만 붙였고, AL2023 기본 AWS CLI 로 보내 boto3 의존성도 늘리지 않았다. 메일 제목에 주소를 넣어(`StockTrader up 10-19 08:21 http://x.x.x.x:8501`, SNS 제약상 ASCII · 100자 미만) 알림 미리보기만으로 IP 가 보인다. 채널은 `.env` 에 설정된 것만 쓰고(`NOTIFY_SNS_TOPIC_ARN` / 텔레그램), 한 채널이 실패해도 나머지는 보낸다. 회귀 **+20건**(총 46 — 제목 제약 · publish 인자 · 리전은 ARN 에서 · CLI 없음/권한 오류/시간 초과 · 채널 분기). `any()` 단락 평가 · 제목 자르기 제거 · 리전 하드코딩 · ARN 검증 제거로 바꾸면 각각 실패하는 것까지 확인. **실 Stop → Start 로 메일 수신 · 메일의 URL 접속까지 확인**(16:50 부팅 → 메일 → 16:55 휴장일 자동 종료, SNS 전달 실패 0). 다른 topic 으로의 publish 는 `AuthorizationError` 로 거부됨을 서버에서 확인
+    - **부수 수리 — 서버 `/usr/bin/python3` 링크 복구.** 배포 중 서버 AWS CLI 가 `cannot execute: required file not found` 로 죽었다. 원인은 bash history 의 `alternatives --remove python3 /usr/bin/python3.11` 로 링크가 사라진 것(`rpm -V python3` → `missing /usr/bin/python3`). 같은 shebang 을 쓰는 시스템 도구 **76개**(`aws` · `dnf` · `cfn-*` · SELinux 도구)가 함께 죽어 있었다. rpm 이 정의한 대로 `-> python3.9` 로 되돌려 `rpm -V` 차이 없음 · `aws` · `dnf` 정상. 트레이더 venv 는 python3.11 을 직접 써서 영향이 없었다
+  - [x] **부팅 시 코드 자동 갱신 — 검증 게이트 통과분만** (2026-10-18, [scripts/update_code.py](scripts/update_code.py), systemd `ExecStartPre`) — 배포가 `git push` 하나로 끝나고 다음 날 08:20 에 반영된다(장중엔 코드가 바뀌지 않는다). 실거래 서버라 두 겹으로 막는다: ① **새 커밋을 임시 worktree 에 꺼내 서버 venv Python(3.11)으로 그 커밋의 회귀 테스트 전부를 돌리고** 통과할 때만 `merge --ff-only` — 로컬 3.14 통과가 서버 통과를 보장하지 않고(이날 f-string 차이를 실제로 겪음), 테스트가 임시 트리에서 돌아 운영 `data/` · `logs/` 를 건드리지 않는다. 전체 11종이 수 초다 ② **기동은 절대 막지 않는다** — fetch 실패(30초 · 비대화형 SSH) · 서버의 커밋 안 된 수정 · 서버에만 있는 커밋 · 테스트 실패/시간 초과 · pip 실패 · 예외 모두 기존 코드로 기동(`reset --hard` 미사용). 결과는 아침 메일 제목 태그(`[new 6c375f6]` · `[update REJECTED]` · `[update FAILED]`)와 본문(`🔄 코드 갱신 0ef9ab6 → 6c375f6 (2커밋, 회귀 11종 통과)`)으로 온다. 유닛 파일을 바꾼 커밋은 이번 기동에 반영되지 않으므로 설치본과 다르면 수동 반영 명령을 안내한다. **한계**: 테스트를 통과하는 전략 동작 변경은 그대로 반영된다 — main 에는 실거래에 넣어도 되는 커밋만 push 한다
+    - 회귀 **25건** ([scripts/_test_update_code.py](scripts/_test_update_code.py) — 임시 디렉터리의 **실제 git 저장소**(bare origin ← dev push, server 가 받음): 최신 · 반영(작업 트리·커밋 수) · 테스트 실패/시간 초과/테스트 삭제 시 거부 + HEAD·worktree 보존 · 서버 로컬 수정/갈라짐 시 건너뜀 · untracked(venv.sh · logs) 무시 · fetch 실패 · requirements 변경 시 새 커밋 기준 pip · pip 실패 거부 · **새 커밋이 추가한 테스트로 검증** · 유닛 변경 감지 · 예외에도 0) + boot_notify **+15건**(결과별 본문·제목 태그 · 최장 조합 100자 미만 · 30분 지난/미래/깨진 상태 파일 무시). 게이트 제거 · 로컬 수정 검사 제거 · untracked 도 막음 · 옛 트리로 테스트 · pip 생략 · 갈라짐 검사 제거 6종을 넣으면 각각 실패한다(worktree `remove` 제거는 뒤의 `rmtree` + `prune` 이 같은 정리를 해서 결과가 같다 — 이중 정리로 둠). 전체 회귀 11종 통과
   - [ ] **남은 것** — ① (선택) 텔레그램 토큰 ② 8501·22 전체 개방(사용자 결정으로 유지) ③ 첫 평일(10-19) 08:20 기동 · 15:40 종료가 실제로 도는지 확인
 - [ ] 확인 주기를 대시보드에서 실시간 변경
 - [ ] 추가 매도 전략 (트레일링 스탑 + RSI/이평선 OR 결합 Composite)
@@ -574,7 +577,7 @@ stock_trader/
 ├── stop.sh              # 종료 스크립트
 ├── deploy/
 │   ├── README.md            # 운영 서버(EC2) 평일 장중 가동 — 스케줄러·systemd·텔레그램 설정 절차
-│   └── stock-trade.service  # systemd 유닛 (부팅 시 start.sh, 종료 시 stop.sh, 기동 후 부팅 알림)
+│   └── stock-trade.service  # systemd 유닛 (기동 전 코드 갱신 → start.sh → 부팅 알림, 종료 시 stop.sh)
 ├── core/
 │   ├── kis_api.py       # KIS API 호출 (인증, 잔고조회, 현재가, 예상체결가, 매도주문, 매수후보 탐색)
 │   ├── trader.py        # Trader 클래스 (전략 주입, 매도/매수 루프 실행, 단기 매매 처리, 보유 분리)
@@ -602,7 +605,8 @@ stock_trader/
 ├── ui/
 │   └── dashboard.py     # Streamlit 대시보드 UI
 ├── scripts/             # 전략 검증 도구 (조회 전용 — 주문 없음)
-│   ├── boot_notify.py        # 부팅 알림 — 대시보드 주소(공인 IP) 텔레그램 전송 + 휴장일 자동 종료
+│   ├── boot_notify.py        # 부팅 알림 — 대시보드 주소(공인 IP) 이메일(SNS)·텔레그램 + 코드 갱신 결과 + 휴장일 자동 종료
+│   ├── update_code.py        # 부팅 시 코드 갱신 — origin/main 을 서버 Python 회귀 테스트로 검증한 뒤에만 ff 반영
 │   ├── _test_direction.py    # 방향 판정 순수 로직 회귀 테스트 (API 불필요)
 │   ├── _check_weights.py     # 신호별 적중률·상관·포화율
 │   ├── _check_reversion.py   # 평균회귀 검증 + 무작위 가중치 한계효과
