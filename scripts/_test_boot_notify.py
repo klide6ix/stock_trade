@@ -76,6 +76,7 @@ def run_main(*, open_day, uptime, stay_up=False, dry_run=False, shutdown_ok=True
         patch.object(bn, "public_ip", return_value="1.2.3.4"),
         patch.object(bn, "is_open_day", return_value=open_day),
         patch.object(bn, "read_uptime_sec", return_value=uptime),
+        patch.object(bn, "read_update_status", return_value=None),
         patch.object(bn.os.path, "exists", side_effect=lambda p: stay_up if p == bn.STAY_UP_FILE else False),
         patch.object(bn, "log", lambda msg: None),
         patch.object(bn, "schedule_shutdown", fake_shutdown),
@@ -226,6 +227,48 @@ ok, called = run_notify({bn.SNS_TOPIC_ENV: TOPIC, **ENV}, sns_ok=False)
 check("둘 다 설정 + SNS 실패 → 텔레그램은 그래도 시도 · True", ok and called == ["sns", "telegram"])
 ok, called = run_notify({bn.SNS_TOPIC_ENV: TOPIC, **ENV}, sns_ok=False, tg_ok=False)
 check("둘 다 실패 → False", ok is False and len(called) == 2)
+
+print("── 6. 코드 갱신 결과 표시 ──")
+import json as _json
+import os as _os
+import tempfile as _tf
+from datetime import timedelta
+
+UPD = {"at": NOW.isoformat(), "old": "0ef9ab6", "new": "6c375f6", "commits": 2,
+       "result": "updated", "detail": "회귀 11종 통과", "unit_changed": False}
+text, _ = bn.build_message(NOW, True, "1.2.3.4", True, None, UPD)
+check("갱신 → 이전·이후 커밋 · 개수 · 검증 결과", "0ef9ab6 → 6c375f6 (2커밋, 회귀 11종 통과)" in text, text)
+check("갱신 → 제목 태그 [new <커밋>]", bn.build_subject(NOW, True, "1.2.3.4", False, UPD).endswith("[new 6c375f6]"))
+rej = {**UPD, "result": "rejected", "detail": "_test_a.py 실패 — ❌ 실패 1건"}
+text, _ = bn.build_message(NOW, True, "1.2.3.4", True, None, rej)
+check("거부 → 사유 · 기존 커밋으로 기동 · 반영 안 된 커밋", "갱신 거부 — _test_a.py 실패" in text
+      and "기존 0ef9ab6 로 기동" in text and "6c375f6 는 반영 안 됨" in text, text)
+check("거부 → 제목 [update REJECTED]", "[update REJECTED]" in bn.build_subject(NOW, True, "1.2.3.4", False, rej))
+for r in ("skipped", "error"):
+    s = {**UPD, "result": r, "detail": "fetch 실패 — x"}
+    text, _ = bn.build_message(NOW, True, "1.2.3.4", True, None, s)
+    check(f"{r} → '갱신 안 됨' · 제목 [update FAILED]", "갱신 안 됨 — fetch 실패" in text
+          and "[update FAILED]" in bn.build_subject(NOW, True, "1.2.3.4", False, s))
+up = {**UPD, "result": "uptodate", "new": "0ef9ab6"}
+check("최신 → 본문에 커밋만, 제목 태그 없음", "코드 최신 0ef9ab6" in bn.build_message(NOW, True, "1.2.3.4", True, None, up)[0]
+      and bn.build_subject(NOW, True, "1.2.3.4", False, up) == bn.build_subject(NOW, True, "1.2.3.4", False))
+text, _ = bn.build_message(NOW, True, "1.2.3.4", True, None, {**UPD, "unit_changed": True})
+check("유닛 변경 → 수동 반영 명령 안내", "daemon-reload" in text)
+check("상태 없음 → 본문·제목 변화 없음", bn.update_lines(None) == [] and bn.update_tag(None) == "")
+s = bn.build_subject(NOW, False, "255.255.255.255", True, rej)
+check("최장 조합(실패 + 거부 + 휴장)도 ASCII · 100자 미만", s.isascii() and len(s) < 100, s)
+
+d = _tf.mkdtemp()
+p = _os.path.join(d, "s.json")
+with open(p, "w", encoding="utf-8") as f:
+    _json.dump(UPD, f, ensure_ascii=False)
+check("방금 쓴 상태 파일은 읽는다", bn.read_update_status(NOW + timedelta(minutes=2), p)["new"] == "6c375f6")
+check("30분 넘은 상태 파일은 다른 기동의 것 → None", bn.read_update_status(NOW + timedelta(minutes=31), p) is None)
+check("미래 시각 상태 파일 → None", bn.read_update_status(NOW - timedelta(minutes=1), p) is None)
+check("파일 없음 → None", bn.read_update_status(NOW, _os.path.join(d, "none.json")) is None)
+with open(p, "w") as f:
+    f.write("{broken")
+check("깨진 파일 → None", bn.read_update_status(NOW, p) is None)
 
 print()
 if fails:

@@ -30,6 +30,7 @@ Elastic IP 는 꺼져 있는 동안에도 과금되므로 쓰지 않는다 — �
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import time
@@ -43,6 +44,9 @@ from core.market_calendar import is_open_day
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STAY_UP_FILE = os.path.join(BASE, ".stay_up")
+# `scripts/update_code.py`(ExecStartPre)가 남긴 이번 기동의 코드 갱신 결과. 오래된 건 다른 기동의 것이다.
+UPDATE_STATUS_FILE = os.path.join(BASE, "logs", ".update_status.json")
+UPDATE_STATUS_MAX_AGE_SEC = 1800
 
 DASHBOARD_PORT = 8501
 HEALTH_URL = f"http://localhost:{DASHBOARD_PORT}/_stcore/health"
@@ -115,8 +119,50 @@ def shutdown_blocker(uptime_sec: float | None, stay_up: bool) -> str | None:
     return None
 
 
+def read_update_status(now: datetime, path: str = UPDATE_STATUS_FILE) -> dict | None:
+    """이번 기동의 코드 갱신 결과. 없거나 깨졌거나 `UPDATE_STATUS_MAX_AGE_SEC` 보다 오래됐으면 None."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            status = json.load(f)
+        age = (now - datetime.fromisoformat(status["at"])).total_seconds()
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return status if 0 <= age <= UPDATE_STATUS_MAX_AGE_SEC else None
+
+
+def update_lines(status: dict | None) -> list[str]:
+    if not status:
+        return []
+    old, new, detail = status.get("old"), status.get("new"), status.get("detail") or ""
+    result = status.get("result")
+    if result == "updated":
+        lines = [f"🔄 코드 갱신 {old} → {new} ({status.get('commits', 0)}커밋, {detail})"]
+    elif result == "uptodate":
+        lines = [f"코드 최신 {old}"]
+    elif result == "rejected":
+        lines = [f"⚠️ 코드 갱신 거부 — {detail}", f"   기존 {old} 로 기동 (origin/main {new} 는 반영 안 됨)"]
+    else:  # skipped | error
+        lines = [f"⚠️ 코드 갱신 안 됨 — {detail}", f"   기존 {old} 로 기동"]
+    if status.get("unit_changed"):
+        lines.append("⚠️ systemd 유닛 파일이 바뀜 — 수동 반영 필요: "
+                     "sudo cp deploy/stock-trade.service /etc/systemd/system/ && sudo systemctl daemon-reload")
+    return lines
+
+
+def update_tag(status: dict | None) -> str:
+    """메일 제목용 짧은 태그 (ASCII). 최신이거나 정보가 없으면 빈 문자열."""
+    result = (status or {}).get("result")
+    if result == "updated":
+        return f" [new {status.get('new')}]"
+    if result == "rejected":
+        return " [update REJECTED]"
+    if result in ("skipped", "error"):
+        return " [update FAILED]"
+    return ""
+
+
 def build_message(now: datetime, started: bool, ip: str | None,
-                  open_day: bool, blocker: str | None) -> tuple[str, bool]:
+                  open_day: bool, blocker: str | None, update: dict | None = None) -> tuple[str, bool]:
     """(알림 본문, 종료 여부). 휴장일이 아니면 blocker 는 보지 않는다."""
     url = f"http://{ip}:{DASHBOARD_PORT}" if ip else "공인 IP 조회 실패"
     if started:
@@ -127,6 +173,7 @@ def build_message(now: datetime, started: bool, ip: str | None,
             url,
             "logs/startup.log 확인 필요",
         ]
+    lines += update_lines(update)
     if open_day:
         return "\n".join(lines), False
     if blocker:
@@ -136,11 +183,12 @@ def build_message(now: datetime, started: bool, ip: str | None,
     return "\n".join(lines), True
 
 
-def build_subject(now: datetime, started: bool, ip: str | None, shutdown: bool) -> str:
+def build_subject(now: datetime, started: bool, ip: str | None, shutdown: bool,
+                  update: dict | None = None) -> str:
     """메일 제목 — 알림 미리보기만 보고도 주소와 상태를 알 수 있게. SNS 제약상 ASCII 만 쓴다."""
     state = "up" if started else "FAILED"
     where = f"http://{ip}:{DASHBOARD_PORT}" if ip else "IP unknown"
-    subject = f"StockTrader {state} {now:%m-%d %H:%M} {where}"
+    subject = f"StockTrader {state} {now:%m-%d %H:%M} {where}{update_tag(update)}"
     if shutdown:
         subject += f" (holiday, off in {SHUTDOWN_DELAY_MIN}m)"
     return subject[:SNS_SUBJECT_MAX]
@@ -244,8 +292,9 @@ def main() -> int:
     now = datetime.now()
     open_day = is_open_day(now)
     blocker = None if open_day else shutdown_blocker(read_uptime_sec(), os.path.exists(STAY_UP_FILE))
-    text, shutdown = build_message(now, started, ip, open_day, blocker)
-    subject = build_subject(now, started, ip, shutdown)
+    update = read_update_status(now)
+    text, shutdown = build_message(now, started, ip, open_day, blocker, update)
+    subject = build_subject(now, started, ip, shutdown, update)
 
     log(f"[부팅알림] {text.replace(chr(10), ' | ')}")
     if args.dry_run:

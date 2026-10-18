@@ -20,12 +20,16 @@ User=ec2-user
 WorkingDirectory=/home/ec2-user/codes/stock_trade
 # 코드 전체가 datetime.now() 를 KST 로 가정한다. 서버 시간대(timedatectl)와 이중으로 고정.
 Environment=TZ=Asia/Seoul
+# 기동 전 코드 갱신 — origin/main 을 회귀 테스트로 검증한 뒤에만 fast-forward (scripts/update_code.py).
+# '-' — 갱신이 어떤 이유로 실패해도 기존 코드로 기동한다.
+ExecStartPre=-/home/ec2-user/codes/stock_trade/.venv/bin/python -m scripts.update_code
 ExecStart=/home/ec2-user/codes/stock_trade/start.sh
 # '-' — 알림이 실패해도 서비스(=트레이더)를 실패 처리하지 않는다.
 ExecStartPost=-/home/ec2-user/codes/stock_trade/.venv/bin/python -m scripts.boot_notify
 ExecStop=/home/ec2-user/codes/stock_trade/stop.sh
-# pip 동기화 + 대시보드 health 대기(최대 120초)를 넉넉히 덮는다.
-TimeoutStartSec=300
+# 코드 갱신(fetch 30초 + 의존성 변경 시 pip 최대 300초 + 회귀 테스트) + pip 동기화 + 대시보드 health
+# 대기(최대 120초)를 덮는다. 평소에는 20초 안팎이다.
+TimeoutStartSec=600
 
 [Install]
 WantedBy=multi-user.target

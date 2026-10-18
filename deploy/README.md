@@ -1,12 +1,19 @@
 # 운영 서버(EC2) 평일 장중 가동
 
-개장일에만, 장중에만 서버를 켠다. 부팅하면 트레이더가 자동으로 뜨고, 바뀐 접속 주소가 이메일(SNS)로 온다.
+개장일에만, 장중에만 서버를 켠다. 부팅하면 먼저 main 의 새 커밋을 검증해 반영하고, 트레이더를 띄운 뒤, 바뀐 접속 주소를 이메일(SNS)로 보낸다. **배포는 `git push` 하나로 끝나고, 다음 날 08:20 에 반영된다.**
 
 ```
 EventBridge Scheduler  평일 08:20 KST ──► EC2 Start
                                            │ 부팅
                                            ▼
-             systemd stock-trade.service ──► start.sh (트레이더 + 대시보드)
+             systemd stock-trade.service
+                │ ExecStartPre
+                ▼
+             scripts/update_code.py ──► fetch origin/main → 임시 worktree 에서 회귀 테스트(서버 Python)
+                                        → 통과하면 ff 반영 / 아니면 기존 코드 유지 (기동은 막지 않음)
+                │ ExecStart
+                ▼
+             start.sh (트레이더 + 대시보드)
                                            │ ExecStartPost
                                            ▼
              scripts/boot_notify.py ──► 대시보드 health 확인 → 공인 IP → 이메일(SNS)·텔레그램
@@ -38,7 +45,22 @@ sudo systemctl start stock-trade
 systemctl status stock-trade      # active (exited) 이면 정상 — start.sh 는 띄우고 끝나는 구조
 ```
 
-이후 배포는 `git pull && sudo systemctl restart stock-trade` 로 한다. `./stop.sh && ./start.sh` 도 동작하지만, 그러면 systemd 가 띄운 프로세스와 손으로 띄운 프로세스가 섞인다. 수동 재시작은 부팅 직후가 아니므로 휴장일 자동 종료가 걸리지 않는다.
+## 배포
+
+**`git push origin main` 만 하면 다음 날 08:20 부팅 때 반영된다.** 아침 메일에서 결과를 확인한다.
+
+| 메일 | 의미 |
+|---|---|
+| 제목 `... [new 6c375f6]` · 본문 `🔄 코드 갱신 0ef9ab6 → 6c375f6 (2커밋, 회귀 11종 통과)` | 반영됨 |
+| 본문 `코드 최신 6c375f6` | 새 커밋 없음 |
+| 제목 `[update REJECTED]` · 본문 `⚠️ 코드 갱신 거부 — _test_x.py 실패 — ...` | 서버 Python 에서 회귀 실패. **기존 코드로 기동했다** — 고쳐서 다시 push |
+| 제목 `[update FAILED]` · 본문 `⚠️ 코드 갱신 안 됨 — ...` | fetch 실패 · 서버에 커밋 안 된 수정 · 서버에만 있는 커밋. 기존 코드로 기동했다 |
+| 본문 `⚠️ systemd 유닛 파일이 바뀜` | `deploy/stock-trade.service` 를 고친 커밋은 유닛만 수동 반영해야 한다(유닛은 기동 전에 이미 읽힘) |
+
+- **검증 게이트**: 새 커밋을 임시 worktree 에 꺼내 **서버 venv 의 Python(3.11)** 으로 그 커밋의 `scripts/_test_*.py` 전부를 돌린다(현재 11종, 수 초). `requirements.txt` 가 바뀌었으면 pip 설치가 먼저다. 테스트는 임시 worktree 안에서 돌아 운영 `data/` · `logs/` 를 건드리지 않는다.
+- **게이트가 못 막는 것**: 테스트가 잡는 건 **고장**뿐이다. 테스트를 통과하는 전략 동작 변경(청산선 · 진입 조건)은 그대로 반영된다. **main 에는 실거래에 넣어도 되는 커밋만 push 한다.**
+- **장중 즉시 반영**이 필요하면 직접 재시작한다: `sudo systemctl restart stock-trade`(같은 게이트를 거친다). `./stop.sh && ./start.sh` 는 쓰지 않는다 — systemd 밖 프로세스가 생기고 게이트도 건너뛴다. 수동 재시작은 부팅 직후가 아니므로 휴장일 자동 종료가 걸리지 않는다.
+- 서버에서 직접 파일을 고치면(커밋 안 된 수정) 그날부터 자동 반영이 멈춘다(`[update FAILED]`). 서버에서는 고치지 않는다.
 
 ### 2. 알림 채널
 
@@ -128,7 +150,7 @@ AWS_PROFILE=stock-trade AWS_REGION=ap-northeast-2 aws ec2 describe-instances \
 ```bash
 AWS_PROFILE=stock-trade AWS_REGION=ap-northeast-2 aws ssm send-command \
   --instance-ids i-07063559d4c6bb3b2 --document-name AWS-RunShellScript \
-  --parameters 'commands=["cd /home/ec2-user/codes/stock_trade && sudo -u ec2-user git pull --ff-only && systemctl restart stock-trade"]'
+  --parameters 'commands=["systemctl restart stock-trade"]'   # 장중 즉시 반영 — 재시작이 검증 게이트를 거쳐 갱신한다
 ```
 
 | 상황 | 할 일 |
