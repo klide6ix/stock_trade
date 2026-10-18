@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import sys
 import time
 import requests
 from datetime import datetime, timedelta
@@ -47,10 +48,53 @@ _LEDGER_TR_PREFIXES = ("TTTC", "VTTC")
 _MAX_LEDGER_CALLS_PER_SEC = 1
 _MIN_LEDGER_INTERVAL = max(_MIN_INTERVAL, 1.0 / _MAX_LEDGER_CALLS_PER_SEC)
 
+# 잔고 조회(inquire-balance)끼리는 원장 간격보다 더 띄운다 — 두 프로세스를 합쳐서.
+# 원장 간격 1초를 지켜도 트레이더·대시보드의 잔고 조회가 맞물리면 EGW00215 가 난다
+# (2026-10-12~16 운영 로그: 175줄 **전부 TTTC8434R**. 진입 때 주문가능조회 → 주문 →
+# 체결조회 → 취소가 같은 1초 간격으로 연달아 나가도 0건이고, 대시보드만 잔고를 보는
+# 장전에는 5일간 1건뿐이다). 프로세스마다 잔고를 3초 캐시하므로 한 프로세스 안에서는
+# 잔고 조회가 맞붙지 않는다 — 남는 건 두 프로세스의 조회가 겹치는 경우다.
+# 실제로 KIS 가 몇 초를 요구하는지는 아직 모른다. 막힐 때마다 직전 잔고 조회와의 간격과
+# 호출 주체를 로그에 남겨(`_balance_diag`) 이 값이 충분한지 운영 로그로 확인한다.
+_BALANCE_TR_IDS = ("TTTC8434R", "VTTC8434R")
+_MIN_BALANCE_INTERVAL = 2.0
+
 
 def _is_ledger_tr(tr_id: str) -> bool:
     """원장 계열 TR 인지 — 더 낮은 초당 한도를 적용할 대상."""
     return str(tr_id or "").upper().startswith(_LEDGER_TR_PREFIXES)
+
+
+def _is_balance_tr(tr_id: str) -> bool:
+    return str(tr_id or "").upper() in _BALANCE_TR_IDS
+
+
+def _caller_label() -> str:
+    """throttle 파일에 남기는 호출 주체 — `역할:pid` (ASCII, 공백 없음)."""
+    if "streamlit" in sys.modules:
+        role = "dashboard"
+    elif os.path.basename(sys.argv[0] or "") == "main.py":
+        role = "trader"
+    else:
+        role = "other"
+    return f"{role}:{os.getpid()}"
+
+
+def _describe_caller(label: str) -> str:
+    role, _, pid = (label or "").partition(":")
+    name = {"dashboard": "대시보드", "trader": "트레이더", "other": "기타"}.get(role, role or "?")
+    return name + (" · 같은 프로세스" if pid == str(os.getpid()) else "")
+
+
+def _balance_diag(info: dict | None) -> str:
+    """EGW00215 로그에 덧붙이는 잔고 조회 진단 — 직전 잔고 조회와의 간격·주체."""
+    if not info:
+        return ""
+    me = _describe_caller(_caller_label()).replace(" · 같은 프로세스", "")
+    if info.get("gap") is None:
+        return f" · 이 호출 {me} · 직전 잔고 조회 기록 없음"
+    return (f" · 이 호출 {me} · 직전 잔고 조회 {info['gap']:.2f}초 전 "
+            f"({_describe_caller(info.get('prev', ''))})")
 
 _token = None
 _token_expired_at = None
@@ -147,7 +191,7 @@ class KisApiError(RuntimeError):
     """KIS API 호출 실패. 서버가 반환한 status·msg_cd·msg1 본문을 메시지에 포함한다."""
 
 
-def _throttle(tr_id: str = "") -> None:
+def _throttle(tr_id: str = "") -> dict | None:
     """모든 KIS REST 호출 직전에 호출. 프로세스 경계를 넘어 최소 호출 간격을 보장한다.
 
     동작('슬롯 예약' 패턴):
@@ -162,36 +206,57 @@ def _throttle(tr_id: str = "") -> None:
     취하고 둘 다 전진시키며, 시세 조회 같은 일반 호출은 게이트웨이 슬롯만 쓴다 — 원장
     호출 때문에 시세 조회가 0.5초씩 밀리지 않게 하기 위함이다.
 
+    잔고 조회는 세 번째 슬롯(`_MIN_BALANCE_INTERVAL`)도 지킨다. 마지막 잔고 조회의 시각과
+    주체도 함께 남겨, 잔고 조회라면 `{"gap": 직전 잔고 조회 후 초, "prev": 주체}` 를 돌려준다
+    (한도에 걸렸을 때 로그에 남기는 진단용). 그 밖의 호출은 None.
+
     두 프로세스(trader·대시보드)가 같은 머신의 wall clock(time.time())을 공유하므로
     프로세스 간에도 슬롯이 단조 증가하며 간격이 유지된다. 가용성 우선 — 파일/flock 에
     문제가 생기면 throttle 없이 호출을 진행한다(거래를 막지 않음)."""
     if fcntl is None:
-        return
+        return None
     ledger = _is_ledger_tr(tr_id)
+    balance = _is_balance_tr(tr_id)
     try:
         fd = os.open(THROTTLE_FILE, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError:
-        return
-    f = os.fdopen(fd, "r+")
+        return None
+    f = os.fdopen(fd, "r+", encoding="ascii", errors="replace")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        # 파일 형식: "<게이트웨이 다음 허용 시각> <원장 다음 허용 시각>".
-        # 값이 하나뿐인 레거시 파일도 그대로 읽힌다(원장 슬롯 0 = 제약 없음).
-        prev_gw = prev_ledger = 0.0
+        # 파일 형식: "<게이트웨이 다음> <원장 다음> <잔고 다음> <마지막 잔고 조회 시각> <그 주체>".
+        # 앞쪽 값만 있는 레거시 파일도 그대로 읽힌다(없는 슬롯 0 = 제약 없음).
+        prev_gw = prev_ledger = prev_balance = last_balance = 0.0
+        last_who = "-"
         try:
             parts = f.read().strip().split()
             if parts:
                 prev_gw = float(parts[0])
             if len(parts) > 1:
                 prev_ledger = float(parts[1])
+            if len(parts) > 3:
+                prev_balance, last_balance = float(parts[2]), float(parts[3])
+            if len(parts) > 4:
+                last_who = parts[4]
         except (ValueError, OSError):
-            prev_gw = prev_ledger = 0.0
+            prev_gw = prev_ledger = prev_balance = last_balance = 0.0
         now = time.time()
-        slot = max(now, prev_gw, prev_ledger) if ledger else max(now, prev_gw)
+        floors = [now, prev_gw]
+        if ledger:
+            floors.append(prev_ledger)
+        if balance:
+            floors.append(prev_balance)
+        slot = max(floors)
         next_ledger = (slot + _MIN_LEDGER_INTERVAL) if ledger else prev_ledger
+        if balance:
+            info = {"gap": (slot - last_balance) if last_balance else None, "prev": last_who}
+            next_balance, last_balance, last_who = slot + _MIN_BALANCE_INTERVAL, slot, _caller_label()
+        else:
+            info, next_balance = None, prev_balance
         f.seek(0)
         f.truncate()
-        f.write(f"{slot + _MIN_INTERVAL:.6f} {next_ledger:.6f}")
+        f.write(f"{slot + _MIN_INTERVAL:.6f} {next_ledger:.6f} {next_balance:.6f} "
+                f"{last_balance:.6f} {last_who}")
         f.flush()
     finally:
         try:
@@ -203,6 +268,7 @@ def _throttle(tr_id: str = "") -> None:
     wait = slot - now
     if wait > 0:
         time.sleep(wait)
+    return info
 
 
 def _request(method: str, url: str, tr_id: str, *, params=None, json_body=None) -> dict:
@@ -224,7 +290,7 @@ def _request(method: str, url: str, tr_id: str, *, params=None, json_body=None) 
     last_exc: Exception | None = None
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
-            _throttle(tr_id)  # 프로세스 경계 넘어 초당 한도 준수 (재시도 호출도 포함).
+            balance_info = _throttle(tr_id)  # 프로세스 경계 넘어 초당 한도 준수 (재시도 호출도 포함).
             res = requests.request(
                 method, url,
                 headers=_headers(tr_id),
@@ -255,7 +321,8 @@ def _request(method: str, url: str, tr_id: str, *, params=None, json_body=None) 
         if msg_cd in _RATE_LIMIT_CODES and attempt < _MAX_ATTEMPTS:
             wait = _RATE_LIMIT_BACKOFF * attempt + random.uniform(0, 0.5)
             msg1 = (body_json.get("msg1") or "").strip()
-            log(f"[API] 초당 한도 초과 ({tr_id}/{msg_cd}) {msg1} — {wait:.1f}s 후 재시도 {attempt}/{_MAX_ATTEMPTS - 1}")
+            log(f"[API] 초당 한도 초과 ({tr_id}/{msg_cd}) {msg1} — {wait:.1f}s 후 재시도 "
+                f"{attempt}/{_MAX_ATTEMPTS - 1}" + _balance_diag(balance_info))
             time.sleep(wait)
             continue
 

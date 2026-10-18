@@ -65,6 +65,7 @@ class Day:
     rejudge_tries: int = 0
     rejudge_done: str = ""
     egw: int = 0
+    egw_diag: list[tuple[float, bool]] = field(default_factory=list)   # (직전 잔고 조회 후 초, 다른 프로세스)
     errors: list[tuple[str, str]] = field(default_factory=list)
     ledger: list[tuple[str, str]] = field(default_factory=list)
     entry_closed_logs: int = 0
@@ -105,6 +106,9 @@ def parse(day: date, path: str) -> Day:
             d.rejudge_done = t
         if "초당 한도 초과" in msg and "재시도 1/" in msg:
             d.egw += 1
+            diag = re.search(r"직전 잔고 조회 ([\d.]+)초 전 \(([^)]*)\)", msg)
+            if diag:
+                d.egw_diag.append((float(diag.group(1)), "같은 프로세스" not in diag.group(2)))
         if ("오류" in msg and "[API]" not in msg) or "Traceback" in msg or "수동 확인 필요" in msg:
             d.errors.append((t, msg))
         if "진입 마감" in msg and "경과" in msg:
@@ -173,6 +177,13 @@ def checks(d: Day) -> list[tuple[bool, str]]:
     if d.entry_closed_logs > 1:
         out.append((False, f"'진입 마감' 로그 {d.entry_closed_logs}줄 (하루 1줄이어야 함)"))
     out.append((True, f"EGW00215 초당 한도 초과 {d.egw}건 (재시도로 성공했으면 기능 피해 없음)"))
+    if d.egw_diag:
+        # 2026-10-19 배포(잔고 조회 간격 2초) 이후 로그에만 있다.
+        gaps = sorted(g for g, _ in d.egw_diag)
+        cross = sum(1 for _, other in d.egw_diag if other)
+        wide = sum(1 for g in gaps if g >= 2.0)
+        out.append((True, f"  직전 잔고 조회 간격 중앙값 {gaps[len(gaps) // 2]:.2f}초 · 최소 {gaps[0]:.2f}초 · "
+                          f"다른 프로세스와 맞물림 {cross}/{len(gaps)}건 · 2초 이상인데도 막힘 {wide}건"))
     out.append((not d.errors, f"오류 {len(d.errors)}건" if d.errors else "오류 없음"))
     return out
 
