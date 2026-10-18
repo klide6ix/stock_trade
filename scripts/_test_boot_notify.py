@@ -5,7 +5,10 @@
   2. `build_message` — 개장일엔 종료 문구가 없고, 휴장일엔 종료 예고 또는 막힌 사유가 붙는다
   3. `main` 배선 — 휴장일 + 부팅 직후에만 종료 예약, dry-run 은 전송·종료 모두 생략,
      예약 실패 시 경고 알림, 텔레그램 설정 누락·전송 오류에도 0 으로 끝난다
+  5. SNS — 메일 제목 제약(ASCII · 한 줄 · 100자 미만), publish 인자(리전은 ARN 에서),
+     CLI 실패·없음·시간 초과에도 False, 채널 분기(설정된 것만 · 하나 실패해도 나머지 시도)
 """
+import subprocess
 import sys
 from datetime import datetime
 from unittest.mock import MagicMock, patch
@@ -58,7 +61,7 @@ def run_main(*, open_day, uptime, stay_up=False, dry_run=False, shutdown_ok=True
              env=None, post=None):
     sent, shut = [], []
 
-    def fake_send(text):
+    def fake_send(subject, text):
         sent.append(text)
         return True
 
@@ -79,12 +82,14 @@ def run_main(*, open_day, uptime, stay_up=False, dry_run=False, shutdown_ok=True
         patch("builtins.print", lambda *a, **k: None),
     ]
     if post is None:
-        patches.append(patch.object(bn, "send_telegram", fake_send))
+        patches.append(patch.object(bn, "notify", fake_send))
     else:
         patches += [patch.object(bn.requests, "post", post), patch.object(bn.time, "sleep", lambda s: None),
                     patch.dict(bn.os.environ, env or {}, clear=False)]
     for p in patches:
         p.start()
+    if post is not None:  # 실제 텔레그램 경로만 보도록 SNS 채널을 끈다 (patch.dict 가 끝나면 복원)
+        bn.os.environ.pop(bn.SNS_TOPIC_ENV, None)
     try:
         code = bn.main()
     finally:
@@ -139,6 +144,88 @@ with patch("builtins.open", side_effect=OSError):
     check("/proc/uptime 없음 → None", bn.read_uptime_sec() is None)
 with patch.object(bn.requests, "put", side_effect=requests.ConnectTimeout()):
     check("IMDS 미응답(EC2 밖) → None", bn.public_ip() is None)
+
+print("── 5. SNS 이메일 ──")
+TOPIC = "arn:aws:sns:ap-northeast-2:104531737677:stock-trade-alerts"
+
+
+def subject_ok(s):
+    return s.isascii() and "\n" not in s and len(s) < 100
+
+
+cases = [
+    bn.build_subject(NOW, True, "1.2.3.4", False),
+    bn.build_subject(NOW, True, "255.255.255.255", True),
+    bn.build_subject(NOW, False, None, True),
+]
+check("제목은 ASCII · 한 줄 · 100자 미만 (최장 IP + 휴장 + 실패 포함)", all(subject_ok(s) for s in cases), str(cases))
+check("제목에 주소가 들어간다", "http://1.2.3.4:8501" in cases[0] and "up" in cases[0], cases[0])
+check("휴장일 종료 예고가 제목에 보인다", "holiday" in cases[1])
+check("기동 실패가 제목에 보인다", "FAILED" in cases[2] and "IP unknown" in cases[2])
+long = bn.build_subject(NOW, True, "1" * 120, True)
+check("비정상적으로 긴 값도 100자 미만으로 자른다", len(long) < 100)
+
+
+def run_sns(env, result=None, exc=None):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append((cmd, kw))
+        if exc:
+            raise exc
+        return result
+
+    with patch.dict(bn.os.environ, env, clear=False), patch.object(bn.subprocess, "run", fake_run), \
+            patch.object(bn, "log", lambda m: None):
+        if bn.SNS_TOPIC_ENV not in env:
+            bn.os.environ.pop(bn.SNS_TOPIC_ENV, None)
+        ok = bn.send_sns("subj", "본문\n둘째 줄")
+    return ok, calls
+
+
+ok, calls = run_sns({bn.SNS_TOPIC_ENV: TOPIC}, subprocess.CompletedProcess([], 0, "mid-1\n", ""))
+cmd = calls[0][0] if calls else []
+check("정상 publish → True", ok is True)
+check("리전은 topic ARN 에서 (ap-northeast-2)", cmd[cmd.index("--region") + 1] == "ap-northeast-2" if "--region" in cmd else False, str(cmd))
+check("topic · 제목 · 본문(한글·줄바꿈 그대로) 전달",
+      cmd[cmd.index("--topic-arn") + 1] == TOPIC and cmd[cmd.index("--subject") + 1] == "subj"
+      and cmd[cmd.index("--message") + 1] == "본문\n둘째 줄", str(cmd))
+check("셸을 거치지 않는다 (인자 목록 · timeout 있음)", isinstance(cmd, list) and "timeout" in calls[0][1])
+ok, calls = run_sns({}, None)
+check("topic 미설정 → CLI 호출 없이 False", ok is False and not calls)
+ok, calls = run_sns({bn.SNS_TOPIC_ENV: "arn:aws:sqs:ap-northeast-2:1:q"}, None)
+check("SNS 가 아닌 ARN → 호출 없이 False", ok is False and not calls)
+ok, _ = run_sns({bn.SNS_TOPIC_ENV: TOPIC}, subprocess.CompletedProcess([], 254, "", "AuthorizationError: not authorized\n"))
+check("권한 오류(exit≠0) → False", ok is False)
+ok, _ = run_sns({bn.SNS_TOPIC_ENV: TOPIC}, exc=FileNotFoundError("aws"))
+check("aws CLI 없음 → False (예외 전파 없음)", ok is False)
+ok, _ = run_sns({bn.SNS_TOPIC_ENV: TOPIC}, exc=subprocess.TimeoutExpired("aws", 60))
+check("시간 초과 → False", ok is False)
+
+
+def run_notify(env, sns_ok=True, tg_ok=True):
+    called = []
+    with patch.dict(bn.os.environ, env, clear=False), patch.object(bn, "log", lambda m: None), \
+            patch.object(bn, "send_sns", lambda s, t: called.append("sns") or sns_ok), \
+            patch.object(bn, "send_telegram", lambda t: called.append("telegram") or tg_ok):
+        for k in (bn.SNS_TOPIC_ENV, "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+            if k not in env:
+                bn.os.environ.pop(k, None)
+        return bn.notify("s", "t"), called
+
+
+ok, called = run_notify({})
+check("채널 없음 → 아무것도 안 보내고 False", ok is False and called == [])
+ok, called = run_notify({bn.SNS_TOPIC_ENV: TOPIC})
+check("SNS 만 설정 → SNS 만", ok and called == ["sns"])
+ok, called = run_notify({"TELEGRAM_BOT_TOKEN": "t"})
+check("텔레그램 토큰만 있고 chat_id 없음 → 채널 아님", ok is False and called == [])
+ok, called = run_notify({bn.SNS_TOPIC_ENV: TOPIC, **ENV})
+check("둘 다 설정 + 둘 다 성공 → 두 채널 모두 보낸다 (단락 평가 없음)", ok and called == ["sns", "telegram"])
+ok, called = run_notify({bn.SNS_TOPIC_ENV: TOPIC, **ENV}, sns_ok=False)
+check("둘 다 설정 + SNS 실패 → 텔레그램은 그래도 시도 · True", ok and called == ["sns", "telegram"])
+ok, called = run_notify({bn.SNS_TOPIC_ENV: TOPIC, **ENV}, sns_ok=False, tg_ok=False)
+check("둘 다 실패 → False", ok is False and len(called) == 2)
 
 print()
 if fails:

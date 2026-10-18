@@ -1,4 +1,4 @@
-"""부팅 알림 — EC2 가 켜질 때마다 바뀌는 공인 IP 로 대시보드 주소를 텔레그램으로 보낸다.
+"""부팅 알림 — EC2 가 켜질 때마다 바뀌는 공인 IP 로 대시보드 주소를 이메일(SNS)·텔레그램으로 보낸다.
 
 운영 서버는 평일 08:20 에 켜지고 15:40 에 꺼진다(EventBridge Scheduler, `deploy/README.md`).
 Elastic IP 는 꺼져 있는 동안에도 과금되므로 쓰지 않는다 — 그래서 부팅마다 공인 IP 가 바뀌고,
@@ -18,8 +18,14 @@ Elastic IP 는 꺼져 있는 동안에도 과금되므로 쓰지 않는다 — �
     .venv/bin/python -m scripts.boot_notify             # systemd ExecStartPost 가 실행
     .venv/bin/python -m scripts.boot_notify --dry-run   # 보내지도 끄지도 않고 메시지만 출력
 
-`.env` 에 `TELEGRAM_BOT_TOKEN` · `TELEGRAM_CHAT_ID` 가 필요하다. 이 스크립트는 어떤 경우에도
-0 으로 끝난다 — 알림 실패가 systemd 서비스 실패로 번져 트레이더까지 내려가면 안 된다.
+알림 채널 (`.env` 에 설정된 것만, 둘 다 있으면 둘 다 보낸다)
+  - `NOTIFY_SNS_TOPIC_ARN` — Amazon SNS topic 으로 publish, 구독한 이메일로 온다. 인스턴스 역할
+    자격 증명(IMDS)을 쓰므로 서버에 비밀값이 없다. AL2023 기본 탑재 AWS CLI 로 보내 boto3 의존성을
+    늘리지 않는다. 메일 제목에 주소를 넣어 알림 미리보기만으로 IP 가 보이게 한다.
+  - `TELEGRAM_BOT_TOKEN` · `TELEGRAM_CHAT_ID` — 텔레그램 봇.
+
+이 스크립트는 어떤 경우에도 0 으로 끝난다 — 알림 실패가 systemd 서비스 실패로 번져 트레이더까지
+내려가면 안 된다.
 """
 from __future__ import annotations
 
@@ -49,6 +55,9 @@ FRESH_BOOT_SEC = 600
 IMDS = "http://169.254.169.254/latest"
 TELEGRAM_API = "https://api.telegram.org"
 SEND_RETRIES = 3
+SNS_TOPIC_ENV = "NOTIFY_SNS_TOPIC_ARN"
+# SNS 제목 제약 — ASCII · 줄바꿈 없음 · 100자 미만. 어기면 publish 자체가 거부된다.
+SNS_SUBJECT_MAX = 99
 
 
 def public_ip() -> str | None:
@@ -127,6 +136,63 @@ def build_message(now: datetime, started: bool, ip: str | None,
     return "\n".join(lines), True
 
 
+def build_subject(now: datetime, started: bool, ip: str | None, shutdown: bool) -> str:
+    """메일 제목 — 알림 미리보기만 보고도 주소와 상태를 알 수 있게. SNS 제약상 ASCII 만 쓴다."""
+    state = "up" if started else "FAILED"
+    where = f"http://{ip}:{DASHBOARD_PORT}" if ip else "IP unknown"
+    subject = f"StockTrader {state} {now:%m-%d %H:%M} {where}"
+    if shutdown:
+        subject += f" (holiday, off in {SHUTDOWN_DELAY_MIN}m)"
+    return subject[:SNS_SUBJECT_MAX]
+
+
+def send_sns(subject: str, text: str) -> bool:
+    """SNS topic 으로 publish. 리전은 topic ARN 에서 읽는다(arn:aws:sns:<region>:<account>:<name>)."""
+    topic = os.getenv(SNS_TOPIC_ENV)
+    if not topic:
+        return False
+    parts = topic.split(":")
+    if len(parts) != 6 or parts[2] != "sns":
+        log(f"[부팅알림] {SNS_TOPIC_ENV} 형식이 SNS topic ARN 이 아닙니다: {topic}")
+        return False
+    try:
+        res = subprocess.run(
+            ["aws", "sns", "publish", "--region", parts[3], "--topic-arn", topic,
+             "--subject", subject, "--message", text, "--query", "MessageId", "--output", "text"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"[부팅알림] SNS 전송 실패: {type(e).__name__}")
+        return False
+    if res.returncode != 0:
+        err = res.stderr.strip().splitlines()
+        log(f"[부팅알림] SNS 전송 실패 (exit {res.returncode}): {err[-1] if err else ''}")
+        return False
+    return True
+
+
+def configured_channels() -> list[str]:
+    channels = []
+    if os.getenv(SNS_TOPIC_ENV):
+        channels.append("sns")
+    if os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"):
+        channels.append("telegram")
+    return channels
+
+
+def notify(subject: str, text: str) -> bool:
+    """설정된 모든 채널로 보낸다(한 채널이 실패해도 나머지는 시도). 하나라도 성공하면 True."""
+    channels = configured_channels()
+    if not channels:
+        log(f"[부팅알림] 알림 채널이 없습니다 — .env 에 {SNS_TOPIC_ENV} 또는 "
+            "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID 를 넣어 주세요")
+        return False
+    results = []
+    for ch in channels:
+        results.append(send_sns(subject, text) if ch == "sns" else send_telegram(text))
+    return any(results)
+
+
 def send_telegram(text: str) -> bool:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -179,15 +245,17 @@ def main() -> int:
     open_day = is_open_day(now)
     blocker = None if open_day else shutdown_blocker(read_uptime_sec(), os.path.exists(STAY_UP_FILE))
     text, shutdown = build_message(now, started, ip, open_day, blocker)
+    subject = build_subject(now, started, ip, shutdown)
 
     log(f"[부팅알림] {text.replace(chr(10), ' | ')}")
     if args.dry_run:
-        print(f"\n--- dry-run: 전송·종료 생략 (종료 대상={shutdown}) ---\n{text}")
+        print(f"\n--- dry-run: 전송·종료 생략 (종료 대상={shutdown}) ---\n제목: {subject}\n{text}")
         return 0
 
-    send_telegram(text)
+    notify(subject, text)
     if shutdown and not schedule_shutdown():
-        send_telegram("⚠️ 휴장일 자동 종료 예약 실패 — 서버가 계속 켜져 있습니다 (로그 확인)")
+        notify("StockTrader holiday shutdown FAILED - server still running",
+               "⚠️ 휴장일 자동 종료 예약 실패 — 서버가 계속 켜져 있습니다 (로그 확인)")
     return 0
 
 

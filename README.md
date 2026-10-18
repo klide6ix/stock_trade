@@ -466,7 +466,7 @@
   - **부팅 알림** ([scripts/boot_notify.py](scripts/boot_notify.py), `ExecStartPost`) — 대시보드 `/_stcore/health` 가 `ok` 를 줄 때까지(최대 120초) 기다린 뒤 IMDSv2 로 공인 IP 를 읽어 `🟢 트레이더 기동 · http://<IP>:8501` 을 보낸다. 응답이 없으면 `🔴 기동 실패`. 08:25 까지 알림이 없으면 기동 실패라는 heartbeat 를 겸한다. 어떤 실패에도 0 으로 끝나 알림 문제가 트레이더를 내리지 않는다(유닛도 `-` 접두)
   - **휴장일 자동 종료** — 스케줄러는 평일 cron 뿐이라 공휴일을 모른다. `market_calendar.is_open_day` 로 판별해 휴장일이면 알림에 예고를 붙이고 **5분 뒤** `shutdown -h`(EC2 기본 설정에서 Stop). 조회 실패 시 개장일로 간주하므로 거래일을 놓치지 않는다. **끄지 않는 경우**: 가동 10분 초과(수동 `systemctl restart`) · 저장소 루트 `.stay_up` 존재(휴일 점검용) · 가동 시간 미상 — 모르면 끄지 않는다. 5분 안에 `sudo shutdown -c` 로 취소 가능
   - **검증** — 회귀 **26건** ([scripts/_test_boot_notify.py](scripts/_test_boot_notify.py) — 종료 차단 사유 4종 · 경계값 · 개장일/휴장일 메시지 · 기동 실패 · main 배선(휴장일+부팅 직후에만 종료, dry-run 무전송·무종료, 예약 실패 시 경고 알림) · 텔레그램 토큰 누락 · 네트워크 오류 · 401 재시도 후 0 종료 · IMDS 미응답). 가동 시간 경계(`>` → `>=`) · `.stay_up` 무시 · 개장일 무시로 바꾸면 각각 실패하는 것까지 확인. 로컬 dry-run 실측: EC2 밖(일요일) → `IP 조회 실패 · 휴장일 — 자동 종료 안 함 (가동 시간 확인 불가)` · exit 0. 전체 회귀 10종 통과
-  - **한계** — ① 서버 쪽 설정(systemd 등록 · `.env` 의 `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` · 스케줄러 Role)은 아직 하지 않았다. 실제 부팅 경로는 **첫 평일 08:20 알림**으로 확인된다 ② 대시보드는 인증이 없다 — Security Group 의 8501 을 내 IP 로 제한하거나 Tailscale 로 포트를 닫는 것을 권장(deploy/README.md §4) ③ 배포는 이제 `git pull && sudo systemctl restart stock-trade` 다. `./stop.sh && ./start.sh` 를 섞으면 systemd 밖 프로세스가 생긴다
+  - **한계** — ① 서버 설정은 같은 날 적용·실검증했다(아래 '다음 작업 후보' 의 운영 서버 1회 설정). 텔레그램 토큰만 남았다 ② 대시보드는 인증이 없다 — Security Group 의 8501 을 내 IP 로 제한하거나 Tailscale 로 포트를 닫는 것을 권장(deploy/README.md §4) ③ 배포는 이제 `git pull && sudo systemctl restart stock-trade` 다. `./stop.sh && ./start.sh` 를 섞으면 systemd 밖 프로세스가 생긴다
 
 ## 다음 작업 후보
 
@@ -519,7 +519,9 @@
 - [ ] **(보류) 단기 매매 자금 선차감** — `execute_initial_buy` 가 주문가능금액 **전액**을 후보 수로 균등 분할하고 메인 루프에서 단기 매매보다 먼저 실행되므로, 일반 매수(`buy_enabled`)를 켜면 단기 매매가 "예산 부족" 으로 진입하지 못할 수 있다. 예산 상한은 한도일 뿐 예약이 아님. 해결안: `plan_initial_buy` 에 넘기는 cash 에서 자금 풀 잔액(포지션 미보유 시)을 미리 빼두어 물리적으로 예약. **현재는 자금 풀을 수동 관리하기로 하여 보류** — 두 매수를 함께 켤 계획이 생기면 착수
 - [ ] 일반 매수 후보 선정도 장전 시세 반영 여부 점검 — 08:30~09:00 ranking API 가 전일 종가 기준이면 개장 후 1회 재스캔 트리거 고려
 - [ ] 매도 발생 시 알림 (Telegram / 카카오톡 등) — 텔레그램 봇·전송 함수는 부팅 알림으로 이미 생겼다(`scripts/boot_notify.py::send_telegram`). 진입·청산 로그 지점에서 부르게 하면 된다 — 공용 모듈(`core/notify.py`)로 옮기는 게 먼저
-- [ ] **운영 서버 1회 설정** ([deploy/README.md](deploy/README.md) §1~4) — systemd 등록 · 텔레그램 토큰 · 스케줄러 Role/일정 · 8501 접근 제한. 첫 평일 08:20 알림과 15:40 종료, 다음 공휴일 자동 종료를 확인
+- [x] ~~**운영 서버 1회 설정**~~ (2026-10-18 완료) — 로컬 AWS CLI(`stock-trade` 프로필) + **SSM Run Command** 로 SSH 없이 적용했다(인스턴스 역할 `stock-trade-ec2-ssm` 추가). systemd 등록 · 스케줄 `stock-trade-start`/`stop` **ENABLED**(실패 시 3회 재시도). **실 Stop → Start 1회로 전 경로 확인**: Stop 때 `ExecStop` 의 stop.sh 가 트레이더·streamlit 정리 → Start 요청 후 약 15초 만에 서비스 active · health ok · 새 IP(15.165.39.115) 인식 → 일요일이라 `휴장일 — 5분 뒤 자동 종료` → 정확히 5분 뒤 `Client.InstanceInitiatedShutdown` 으로 **stopped**. 서버 Python 3.11 에서도 회귀 26건 통과
+  - [x] **부팅 알림을 이메일(Amazon SNS)로** (2026-10-18) — 텔레그램 대신 SNS topic `stock-trade-alerts` → 이메일 구독. 서버에 **비밀값이 없다** — 인스턴스 역할(`stock-trade-ec2-ssm`)에 이 topic 의 `sns:Publish` 만 붙였고, AL2023 기본 AWS CLI 로 보내 boto3 의존성도 늘리지 않았다. 메일 제목에 주소를 넣어(`StockTrader up 10-19 08:21 http://x.x.x.x:8501`, SNS 제약상 ASCII · 100자 미만) 알림 미리보기만으로 IP 가 보인다. 채널은 `.env` 에 설정된 것만 쓰고(`NOTIFY_SNS_TOPIC_ARN` / 텔레그램), 한 채널이 실패해도 나머지는 보낸다. 회귀 **+20건**(총 46 — 제목 제약 · publish 인자 · 리전은 ARN 에서 · CLI 없음/권한 오류/시간 초과 · 채널 분기). `any()` 단락 평가 · 제목 자르기 제거 · 리전 하드코딩 · ARN 검증 제거로 바꾸면 각각 실패하는 것까지 확인
+  - [ ] **남은 것** — ① (선택) 텔레그램 토큰 ② 8501·22 전체 개방(사용자 결정으로 유지) ③ 첫 평일(10-19) 08:20 기동 · 15:40 종료가 실제로 도는지 확인
 - [ ] 확인 주기를 대시보드에서 실시간 변경
 - [ ] 추가 매도 전략 (트레일링 스탑 + RSI/이평선 OR 결합 Composite)
 - [ ] 매도 전략별 임계값(예: RSI `rsi_max`, 이평선 short/long)도 사이드바에서 변경 가능하게
@@ -662,7 +664,8 @@ MOCK_APP_KEY=모의_앱키
 MOCK_APP_SECRET=모의_앱시크릿
 MOCK_ACCOUNT_NO=모의_계좌번호
 
-# 운영 서버 부팅 알림 (선택 — deploy/README.md §2)
+# 운영 서버 부팅 알림 (선택 — deploy/README.md §2, 설정된 채널로만 보낸다)
+NOTIFY_SNS_TOPIC_ARN=arn:aws:sns:ap-northeast-2:<계정ID>:stock-trade-alerts
 TELEGRAM_BOT_TOKEN=123456:ABC...
 TELEGRAM_CHAT_ID=123456789
 ```

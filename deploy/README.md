@@ -1,6 +1,6 @@
 # 운영 서버(EC2) 평일 장중 가동
 
-개장일에만, 장중에만 서버를 켠다. 부팅하면 트레이더가 자동으로 뜨고, 바뀐 접속 주소가 텔레그램으로 온다.
+개장일에만, 장중에만 서버를 켠다. 부팅하면 트레이더가 자동으로 뜨고, 바뀐 접속 주소가 이메일(SNS)로 온다.
 
 ```
 EventBridge Scheduler  평일 08:20 KST ──► EC2 Start
@@ -9,7 +9,7 @@ EventBridge Scheduler  평일 08:20 KST ──► EC2 Start
              systemd stock-trade.service ──► start.sh (트레이더 + 대시보드)
                                            │ ExecStartPost
                                            ▼
-             scripts/boot_notify.py ──► 대시보드 health 확인 → 공인 IP → 텔레그램
+             scripts/boot_notify.py ──► 대시보드 health 확인 → 공인 IP → 이메일(SNS)·텔레그램
                                         (휴장일이면 5분 뒤 스스로 종료)
 EventBridge Scheduler  평일 15:40 KST ──► EC2 Stop ──► systemd 가 stop.sh 실행
 ```
@@ -40,7 +40,25 @@ systemctl status stock-trade      # active (exited) 이면 정상 — start.sh �
 
 이후 배포는 `git pull && sudo systemctl restart stock-trade` 로 한다. `./stop.sh && ./start.sh` 도 동작하지만, 그러면 systemd 가 띄운 프로세스와 손으로 띄운 프로세스가 섞인다. 수동 재시작은 부팅 직후가 아니므로 휴장일 자동 종료가 걸리지 않는다.
 
-### 2. 텔레그램 봇
+### 2. 알림 채널
+
+`.env` 에 설정된 채널로만 보낸다. 둘 다 설정하면 둘 다 보낸다.
+
+#### 이메일 (Amazon SNS, 운영 기본)
+
+서버에 비밀값이 없다. 서버는 인스턴스 역할 자격 증명으로 publish 하고, 그 역할에는 이 topic 하나에 대한 `sns:Publish` 만 허용한다. 서버의 AL2023 기본 AWS CLI 로 보내므로 boto3 가 필요 없다. 메일 제목에 주소가 들어가서(`StockTrader up 10-19 08:21 http://x.x.x.x:8501`) 알림 미리보기만으로 IP 가 보인다. 요금은 월 1,000건까지 무료다.
+
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+TOPIC=$(aws sns create-topic --name stock-trade-alerts --attributes DisplayName=StockTrader --query TopicArn --output text)
+aws sns subscribe --topic-arn "$TOPIC" --protocol email --notification-endpoint <받을 주소>   # 확인 메일의 링크를 클릭
+aws iam put-role-policy --role-name stock-trade-ec2-ssm --policy-name sns-publish-alerts \
+  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"sns:Publish\",\"Resource\":\"$TOPIC\"}]}"
+```
+
+서버 `.env` 에 `NOTIFY_SNS_TOPIC_ARN=<TOPIC>` 을 넣는다. 구독 확인을 하기 전에 보낸 메시지는 버려진다.
+
+#### 텔레그램 (선택)
 
 1. 텔레그램에서 `@BotFather` → `/newbot` → 토큰을 받는다.
 2. 만든 봇에게 아무 메시지나 한 번 보낸 뒤, `https://api.telegram.org/bot<토큰>/getUpdates` 를 열어 `"chat":{"id": ...}` 값을 확인한다.
@@ -96,6 +114,22 @@ Role 을 만든 직후에는 IAM 전파에 몇 초가 걸려 `create-schedule` �
 - **더 나은 대안**: Tailscale(개인 무료)을 쓰면 inbound 포트를 전부 닫고도 `http://<호스트명>:8501` 처럼 고정된 이름으로 들어갈 수 있다. 그러면 IP 변경 문제 자체가 사라지고, 텔레그램 알림은 heartbeat 용도로만 남는다. KIS 호출에는 outbound 인터넷이 필요하므로 public IP 는 그대로 둔다.
 
 ## 운영 중 확인
+
+현재 주소는 로컬에서 바로 확인할 수 있다(텔레그램이 없어도 된다).
+
+```bash
+AWS_PROFILE=stock-trade AWS_REGION=ap-northeast-2 aws ec2 describe-instances \
+  --instance-ids i-07063559d4c6bb3b2 \
+  --query 'Reservations[0].Instances[0].[State.Name,PublicIpAddress]' --output text
+```
+
+서버 명령은 SSH 대신 SSM Run Command 로도 실행할 수 있다. 인스턴스 역할 `stock-trade-ec2-ssm`(`AmazonSSMManagedInstanceCore`)이 붙어 있다.
+
+```bash
+AWS_PROFILE=stock-trade AWS_REGION=ap-northeast-2 aws ssm send-command \
+  --instance-ids i-07063559d4c6bb3b2 --document-name AWS-RunShellScript \
+  --parameters 'commands=["cd /home/ec2-user/codes/stock_trade && sudo -u ec2-user git pull --ff-only && systemctl restart stock-trade"]'
+```
 
 | 상황 | 할 일 |
 |---|---|
