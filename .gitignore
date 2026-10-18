@@ -18,3 +18,6 @@ logs/
 
 # PID file (start.sh)
 .trader.pid
+
+# 휴장일 자동 종료 해제 플래그 (scripts/boot_notify.py)
+.stay_up

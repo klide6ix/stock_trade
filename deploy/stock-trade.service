@@ -1,0 +1,31 @@
+# stock_trade 트레이더 + 대시보드 — 부팅 시 자동 기동, OS 종료 시 정리.
+#
+# 설치 (서버에서 1회):
+#   sudo cp deploy/stock-trade.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable stock-trade
+#
+# start.sh 는 nohup 으로 띄우고 곧바로 끝나므로 oneshot + RemainAfterExit 로 감싼다.
+# 띄운 프로세스는 이 서비스의 cgroup 에 남아 있다가, EC2 Stop(= OS 정상 종료) 때
+# ExecStop(stop.sh) 으로 정리되고 남은 것은 systemd 가 거둔다.
+[Unit]
+Description=stock_trade trader + dashboard
+Wants=network-online.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=ec2-user
+# start.sh 가 .trader.pid · .venv · logs/ 를 상대 경로로 쓴다.
+WorkingDirectory=/home/ec2-user/codes/stock_trade
+# 코드 전체가 datetime.now() 를 KST 로 가정한다. 서버 시간대(timedatectl)와 이중으로 고정.
+Environment=TZ=Asia/Seoul
+ExecStart=/home/ec2-user/codes/stock_trade/start.sh
+# '-' — 알림이 실패해도 서비스(=트레이더)를 실패 처리하지 않는다.
+ExecStartPost=-/home/ec2-user/codes/stock_trade/.venv/bin/python -m scripts.boot_notify
+ExecStop=/home/ec2-user/codes/stock_trade/stop.sh
+# pip 동기화 + 대시보드 health 대기(최대 120초)를 넉넉히 덮는다.
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

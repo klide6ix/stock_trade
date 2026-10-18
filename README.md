@@ -461,6 +461,13 @@
   - **다음 판단 기준 (배포 일주일 뒤)** — 건수가 0 에 가까우면 끝. 남아 있는데 간격이 대부분 2초 근처면 간격을 늘린다. 간격이 넓은데도(예: 5초 이상) 막히거나 같은 프로세스끼리 막히면 '맞물림' 가설이 틀린 것이다 — 그때는 대시보드가 트레이더의 잔고 결과를 파일로 받아 쓰게 해 잔고 호출 자체를 줄인다
   - 회귀 **16건 추가** ([scripts/_test_throttle.py](scripts/_test_throttle.py) 5 · 6 — 잔고끼리 2초 · 잔고 뒤 다른 원장 TR 은 1초 · 사이에 다른 호출이 끼어도 잔고끼리 2초 · 이전 2칸 형식 파일 호환 · 진단 간격·주체 · 같은 프로세스 표시 · 한도 초과 로그에 진단이 붙고 `재시도 1/` 집계는 그대로)
 
+- [x] **운영 서버 평일 장중 가동 + 부팅 알림** ([deploy/README.md](deploy/README.md)) — AWS 무료 플랜 종료 대응. 상시 가동(t3.micro + Elastic IP, 월 약 $14) 대신 **평일 08:20 ~ 15:40 KST 만 켠다**(EventBridge Scheduler, 월 약 $3.5). 2024-02 부터 public IPv4 는 시간당 과금이고 **Elastic IP 는 꺼져 있어도 과금**되므로 고정 IP 를 두지 않는다. 대신 부팅마다 바뀌는 주소를 텔레그램으로 받는다
+  - **자동 기동** — [deploy/stock-trade.service](deploy/stock-trade.service)(systemd). `start.sh` 가 nohup 으로 띄우고 끝나는 구조라 `oneshot` + `RemainAfterExit` 로 감쌌다. EC2 Stop 은 OS 정상 종료라 `ExecStop` 의 `stop.sh` 가 돈다. `TZ=Asia/Seoul` 을 유닛에도 고정(코드 전체가 `datetime.now()` = KST 가정, EC2 기본은 UTC). 08:20 기동이면 장전 준비 시각(08:30) 전이라 트레이더는 기존 `prep_date` 로직대로 08:30 에 새 데이터로 준비한다 — 상시 가동과 동작이 같다
+  - **부팅 알림** ([scripts/boot_notify.py](scripts/boot_notify.py), `ExecStartPost`) — 대시보드 `/_stcore/health` 가 `ok` 를 줄 때까지(최대 120초) 기다린 뒤 IMDSv2 로 공인 IP 를 읽어 `🟢 트레이더 기동 · http://<IP>:8501` 을 보낸다. 응답이 없으면 `🔴 기동 실패`. 08:25 까지 알림이 없으면 기동 실패라는 heartbeat 를 겸한다. 어떤 실패에도 0 으로 끝나 알림 문제가 트레이더를 내리지 않는다(유닛도 `-` 접두)
+  - **휴장일 자동 종료** — 스케줄러는 평일 cron 뿐이라 공휴일을 모른다. `market_calendar.is_open_day` 로 판별해 휴장일이면 알림에 예고를 붙이고 **5분 뒤** `shutdown -h`(EC2 기본 설정에서 Stop). 조회 실패 시 개장일로 간주하므로 거래일을 놓치지 않는다. **끄지 않는 경우**: 가동 10분 초과(수동 `systemctl restart`) · 저장소 루트 `.stay_up` 존재(휴일 점검용) · 가동 시간 미상 — 모르면 끄지 않는다. 5분 안에 `sudo shutdown -c` 로 취소 가능
+  - **검증** — 회귀 **26건** ([scripts/_test_boot_notify.py](scripts/_test_boot_notify.py) — 종료 차단 사유 4종 · 경계값 · 개장일/휴장일 메시지 · 기동 실패 · main 배선(휴장일+부팅 직후에만 종료, dry-run 무전송·무종료, 예약 실패 시 경고 알림) · 텔레그램 토큰 누락 · 네트워크 오류 · 401 재시도 후 0 종료 · IMDS 미응답). 가동 시간 경계(`>` → `>=`) · `.stay_up` 무시 · 개장일 무시로 바꾸면 각각 실패하는 것까지 확인. 로컬 dry-run 실측: EC2 밖(일요일) → `IP 조회 실패 · 휴장일 — 자동 종료 안 함 (가동 시간 확인 불가)` · exit 0. 전체 회귀 10종 통과
+  - **한계** — ① 서버 쪽 설정(systemd 등록 · `.env` 의 `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` · 스케줄러 Role)은 아직 하지 않았다. 실제 부팅 경로는 **첫 평일 08:20 알림**으로 확인된다 ② 대시보드는 인증이 없다 — Security Group 의 8501 을 내 IP 로 제한하거나 Tailscale 로 포트를 닫는 것을 권장(deploy/README.md §4) ③ 배포는 이제 `git pull && sudo systemctl restart stock-trade` 다. `./stop.sh && ./start.sh` 를 섞으면 systemd 밖 프로세스가 생긴다
+
 ## 다음 작업 후보
 
 - [x] ~~**🔴 운영(AWS) 배포 버전·설정 확인**~~ (2026-09-20 완료 — 위 진행 상태 참조). 운영 대시보드(`http://3.37.17.19:8501`)의 Streamlit 렌더 트리를 **조회 전용**으로 받아(WebSocket `/_stcore/stream` → `ForwardMsg` 파싱, 위젯 조작 없음) 적용값을 직접 읽었다.
@@ -511,7 +518,8 @@
 - [ ] 매도 주문도 매도가능수량(`inquire-psbl-sell`) 검증 추가 — 실계좌에서 지정가 매도 거부(2026-07-27 13:28 KODEX 인버스 2600주) 사례 확인. 당일 매수분 매도 제약 여부 점검 필요
 - [ ] **(보류) 단기 매매 자금 선차감** — `execute_initial_buy` 가 주문가능금액 **전액**을 후보 수로 균등 분할하고 메인 루프에서 단기 매매보다 먼저 실행되므로, 일반 매수(`buy_enabled`)를 켜면 단기 매매가 "예산 부족" 으로 진입하지 못할 수 있다. 예산 상한은 한도일 뿐 예약이 아님. 해결안: `plan_initial_buy` 에 넘기는 cash 에서 자금 풀 잔액(포지션 미보유 시)을 미리 빼두어 물리적으로 예약. **현재는 자금 풀을 수동 관리하기로 하여 보류** — 두 매수를 함께 켤 계획이 생기면 착수
 - [ ] 일반 매수 후보 선정도 장전 시세 반영 여부 점검 — 08:30~09:00 ranking API 가 전일 종가 기준이면 개장 후 1회 재스캔 트리거 고려
-- [ ] 매도 발생 시 알림 (Telegram / 카카오톡 등)
+- [ ] 매도 발생 시 알림 (Telegram / 카카오톡 등) — 텔레그램 봇·전송 함수는 부팅 알림으로 이미 생겼다(`scripts/boot_notify.py::send_telegram`). 진입·청산 로그 지점에서 부르게 하면 된다 — 공용 모듈(`core/notify.py`)로 옮기는 게 먼저
+- [ ] **운영 서버 1회 설정** ([deploy/README.md](deploy/README.md) §1~4) — systemd 등록 · 텔레그램 토큰 · 스케줄러 Role/일정 · 8501 접근 제한. 첫 평일 08:20 알림과 15:40 종료, 다음 공휴일 자동 종료를 확인
 - [ ] 확인 주기를 대시보드에서 실시간 변경
 - [ ] 추가 매도 전략 (트레일링 스탑 + RSI/이평선 OR 결합 Composite)
 - [ ] 매도 전략별 임계값(예: RSI `rsi_max`, 이평선 short/long)도 사이드바에서 변경 가능하게
@@ -562,6 +570,9 @@ stock_trader/
 ├── config.py            # 설정값 (손절%, 주기, URL 등)
 ├── start.sh             # 실행 스크립트
 ├── stop.sh              # 종료 스크립트
+├── deploy/
+│   ├── README.md            # 운영 서버(EC2) 평일 장중 가동 — 스케줄러·systemd·텔레그램 설정 절차
+│   └── stock-trade.service  # systemd 유닛 (부팅 시 start.sh, 종료 시 stop.sh, 기동 후 부팅 알림)
 ├── core/
 │   ├── kis_api.py       # KIS API 호출 (인증, 잔고조회, 현재가, 예상체결가, 매도주문, 매수후보 탐색)
 │   ├── trader.py        # Trader 클래스 (전략 주입, 매도/매수 루프 실행, 단기 매매 처리, 보유 분리)
@@ -589,6 +600,7 @@ stock_trader/
 ├── ui/
 │   └── dashboard.py     # Streamlit 대시보드 UI
 ├── scripts/             # 전략 검증 도구 (조회 전용 — 주문 없음)
+│   ├── boot_notify.py        # 부팅 알림 — 대시보드 주소(공인 IP) 텔레그램 전송 + 휴장일 자동 종료
 │   ├── _test_direction.py    # 방향 판정 순수 로직 회귀 테스트 (API 불필요)
 │   ├── _check_weights.py     # 신호별 적중률·상관·포화율
 │   ├── _check_reversion.py   # 평균회귀 검증 + 무작위 가중치 한계효과
@@ -649,6 +661,10 @@ ACCOUNT_NO=실전_계좌번호       # 예: 12345678-01
 MOCK_APP_KEY=모의_앱키
 MOCK_APP_SECRET=모의_앱시크릿
 MOCK_ACCOUNT_NO=모의_계좌번호
+
+# 운영 서버 부팅 알림 (선택 — deploy/README.md §2)
+TELEGRAM_BOT_TOKEN=123456:ABC...
+TELEGRAM_CHAT_ID=123456789
 ```
 
 > 모의투자는 **실전과 다른 별도 APP Key/Secret/계좌번호**가 필요합니다 (실전 키로 모의 서버 접속 불가).
@@ -690,6 +706,8 @@ python3.14 -m venv .venv
 | `./stop.sh`  | 실행 중인 트레이더 종료                                                  |
 
 > 실행 중 오류는 `logs/startup.log` 파일에서 확인할 수 있습니다.
+
+> **운영 서버(EC2)** 는 systemd 가 부팅 때 `start.sh` 를 실행하고, 평일 08:20~15:40 에만 켜집니다. 설정 절차와 배포 명령(`git pull && sudo systemctl restart stock-trade`)은 [deploy/README.md](deploy/README.md) 를 봅니다.
 
 ### 스크립트 실행 권한 설정 (최초 1회)
 
