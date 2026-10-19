@@ -22,7 +22,7 @@ import argparse
 import statistics as st
 from datetime import datetime
 
-from core.short_term import SELL_HOLDING_PERIOD, EtfDayTradeStrategy, mark_entry
+from core.short_term import SELL_HOLDING_PERIOD, EtfDayTradeStrategy, blocks_reentry, mark_entry
 from scripts._check_open_drift import (
     DOWN_CODE,
     FEE_RATE,
@@ -116,9 +116,8 @@ def simulate(days: list[str], vols: dict[str, float], strategy,
             if hit:
                 _, price = hit
                 pos["slot"]["peak"] = pos["peak"]
-                decision = strategy.should_sell(
-                    pos["slot"], price,
-                    now=datetime.strptime(date + " 0900", "%Y%m%d %H%M"))
+                open_now = datetime.strptime(date + " 0900", "%Y%m%d %H%M")
+                decision = strategy.should_sell(pos["slot"], price, now=open_now)
                 # 방향이 같으면 보유기간 만료만 건너뛴다. 손절·트레일링은 이월 중에도
                 # 그대로 청산해야 한다 — 그것까지 미루면 안전장치가 사라진다.
                 # 방향을 못 정한 날(판정불가)은 '같다' 고 볼 수 없으므로 청산한다.
@@ -126,9 +125,9 @@ def simulate(days: list[str], vols: dict[str, float], strategy,
                         and decision.kind == SELL_HOLDING_PERIOD
                         and today_code is not None and today_code == pos["code"])
                 if decision.sell and not keep:
-                    kind = INTRADAY_EXITS.get(decision.kind, "보유만료")
-                    close_out(price, date, kind)
-                    if kind != "보유만료":
+                    slot = pos["slot"]
+                    close_out(price, date, INTRADAY_EXITS.get(decision.kind, "보유만료"))
+                    if blocks_reentry(decision, slot, open_now):
                         blocked = date
                 elif keep:
                     row["비고"] = "방향 동일 — 보유 이월"
@@ -167,12 +166,15 @@ def simulate(days: list[str], vols: dict[str, float], strategy,
                 price = bars[t]
                 pos["peak"] = max(pos["peak"], price)
                 pos["slot"]["peak"] = pos["peak"]
-                decision = strategy.should_sell(
-                    pos["slot"], price,
-                    now=datetime.strptime(date + " " + t, "%Y%m%d %H%M"))
+                poll_now = datetime.strptime(date + " " + t, "%Y%m%d %H%M")
+                decision = strategy.should_sell(pos["slot"], price, now=poll_now)
                 if decision.sell and decision.kind in INTRADAY_EXITS:
+                    slot = pos["slot"]
                     close_out(price, date, f"{INTRADAY_EXITS[decision.kind]} {t[:2]}:{t[2:]}")
-                    blocked = date
+                    # 이월된 포지션이 장중에 걸리면 차단하지 않지만, 이 시뮬레이션은 진입을
+                    # 폴링보다 먼저 하므로 그날 재진입은 재현하지 않는다(이월 모드 한정 근사).
+                    if blocks_reentry(decision, slot, poll_now):
+                        blocked = date
                     break
 
         equity = pool

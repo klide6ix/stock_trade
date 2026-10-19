@@ -7,7 +7,8 @@
   - 진입: 판정과 같은 사이클(09:00 첫 폴링)에 그 가격으로 매수, 예산 = 자금 풀 전액
   - 청산(4중): **구현된 `EtfDayTradeStrategy.should_sell` 을 그대로 호출**한다 — 청산선은
     진입 시점 σ 의 배수(손절 2.5σ / 트레일링 2.0σ, 5~15% 클램프)로 산출된다
-  - 손절·최고가 청산이면 그날 재진입 차단, 보유기간 만료는 같은 날 재진입
+  - 재진입 차단은 **구현된 `blocks_reentry` 를 그대로 호출**한다 — 그날 산 포지션의
+    손절·최고가 청산만 차단, 보유기간 만료와 전 거래일 포지션의 개장 갭 청산은 같은 날 재진입
   - 자금 풀 복리 + 수수료 0.0042% 편도
 
 장중은 1분봉 **종가**를 폴링 가격으로 써서 트레이더의 `CHECK_INTERVAL=60s` 루프를 그대로
@@ -42,6 +43,7 @@ from core.short_term import (
     SELL_PEAK_DROP,
     SELL_STOP_LOSS,
     EtfDayTradeStrategy,
+    blocks_reentry,
     mark_entry,
 )
 from core.strategy.buy._indicators import sma
@@ -116,13 +118,15 @@ def daily_vols(days_all: list[str], vol_fn=realized_vol_adaptive) -> dict[str, f
 
 
 def run(days: list[str], vols: dict[str, float], strategy=None,
-        entry_at: str = "0900", seed: float = SEED) -> dict:
+        entry_at: str = "0900", seed: float = SEED, reentry_rule=blocks_reentry) -> dict:
     """시뮬레이션 본체 — 청산 판정은 `strategy.should_sell` 에 그대로 위임한다.
 
     Args:
         entry_at: 진입 폴링 시각 "HHMM" (개장 후 매수 지연 검증용).
             **청산은 지연과 무관하게 09:00 첫 폴링**이다 — 실제 트레이더도
             `short_term_buy_window_open()` 이 매수만 막고 매도는 막지 않는다.
+        reentry_rule: `(decision, slot, now) -> 차단 여부`. 기본은 운영 구현 `blocks_reentry`.
+            비교용으로 옛 규칙(사유만 보고 차단)을 넣을 수 있다 — `_compare_reentry_block.py`.
 
     Returns:
         {rows, trades, pool, equity} — rows 는 일자별 표, pool 은 실현 자금 풀.
@@ -142,9 +146,8 @@ def run(days: list[str], vols: dict[str, float], strategy=None,
             if hit:
                 _, price = hit
                 pos["slot"]["peak"] = pos["peak"]
-                decision = strategy.should_sell(
-                    pos["slot"], price,
-                    now=datetime.strptime(date + " 0900", "%Y%m%d %H%M"))
+                open_now = datetime.strptime(date + " 0900", "%Y%m%d %H%M")
+                decision = strategy.should_sell(pos["slot"], price, now=open_now)
                 kind = {"stop_loss": "손절", "peak_drop": "최고가"}.get(
                     decision.kind, "보유만료")
                 proceeds = price * pos["qty"] * (1 - FEE_RATE)
@@ -157,8 +160,10 @@ def run(days: list[str], vols: dict[str, float], strategy=None,
                 # 손익은 '그 포지션을 산 날' 행에 붙인다 — 매수 종목 옆에 결말이 오게.
                 pos["row"].update(청산일=date, 청산가=price, 사유=kind, 손익=pnl,
                                   수익률=pnl / pos["invested"] * 100)
-                if kind != "보유만료":
+                if reentry_rule(decision, pos["slot"], open_now):
                     blocked = date
+                elif kind != "보유만료":
+                    row["비고"] = f"전일분 {kind} 청산 후 재진입"
                 pos = None
 
         # ── 2. 방향 판정 (09:00 실측 갭) ──
@@ -195,9 +200,8 @@ def run(days: list[str], vols: dict[str, float], strategy=None,
                         price = bars[t]
                         pos["peak"] = max(pos["peak"], price)
                         pos["slot"]["peak"] = pos["peak"]
-                        decision = strategy.should_sell(
-                            pos["slot"], price,
-                            now=datetime.strptime(date + " " + t, "%Y%m%d %H%M"))
+                        poll_now = datetime.strptime(date + " " + t, "%Y%m%d %H%M")
+                        decision = strategy.should_sell(pos["slot"], price, now=poll_now)
                         if decision.sell and decision.kind in INTRADAY_EXITS:
                             kind = INTRADAY_EXITS[decision.kind]
                             proceeds = price * pos["qty"] * (1 - FEE_RATE)
@@ -209,7 +213,8 @@ def run(days: list[str], vols: dict[str, float], strategy=None,
                                            "손익": pnl, "수익률": pnl / pos["invested"] * 100})
                             row.update(청산일=date, 청산가=price, 사유=f"{kind} {t[:2]}:{t[2:]}",
                                        손익=pnl, 수익률=pnl / pos["invested"] * 100)
-                            blocked = date
+                            if reentry_rule(decision, pos["slot"], poll_now):
+                                blocked = date
                             pos = None
                             break
         elif blocked == date:

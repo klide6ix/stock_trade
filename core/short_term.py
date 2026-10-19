@@ -70,6 +70,7 @@ SELL_MARKET_END = "market_end"
 # 청산 후 **같은 날 재진입을 허용**하는 사유. 보유기간 만료는 '어제 포지션을 정리하고
 # 오늘 방향으로 새로 들어간다' 는 정상 회전이므로 재진입한다. 반대로 손절·최고가 청산은
 # 오늘 판단이 틀렸다는 신호라 같은 날 다시 들어가지 않는다(재진입 차단 → 다음 거래일 재개).
+# 단, 차단은 **오늘 진입한 포지션**에만 건다 — 판정은 사유 하나가 아니라 `blocks_reentry`.
 REENTRY_ALLOWED_KINDS = {SELL_HOLDING_PERIOD}
 
 
@@ -669,6 +670,32 @@ def block_today(slot: dict[str, Any], now: datetime | None = None) -> dict[str, 
     """오늘은 더 이상 진입하지 않도록 표시 (손절·최고가 청산 후)."""
     now = now or datetime.now()
     return {**slot, "blocked_date": now.date().isoformat()}
+
+
+def blocks_reentry(
+    decision: SellDecision,
+    slot: dict[str, Any] | None,
+    now: datetime | None = None,
+) -> bool:
+    """이 청산 뒤 오늘 재진입을 막을지.
+
+    차단의 근거는 '오늘 판단이 틀렸다' 이므로 **오늘 진입한 포지션**의 손절·최고가 청산만
+    해당한다. 전 거래일에 산 포지션이 개장 갭으로 청산선을 넘은 것은 어제 판단의 결과이고
+    오늘 방향은 아직 시험받지 않았다 — 그런 날 막으면 오늘 판정이 맞아도 들어가지 못한다.
+
+    2026-10-19: 10-16 상승 판정으로 산 TIGER 200 이 개장 갭 -3.14% 로 최고가 대비 -5.55%
+    (청산선 -5.41%) 가 되어 09:00 에 청산됐다. 보유기간 만료와 동시에 참이었지만
+    `should_sell` 이 최고가 청산을 먼저 판정해 '손실성' 으로 분류됐고, 하락 판정이 맞은
+    그날 인버스 진입이 통째로 막혔다. 청산선에 0.14%p 걸쳤느냐가 진입 여부를 갈랐다.
+
+    진입일을 모르면(구버전·외부 편입 슬롯) 예전처럼 차단한다 — 오늘 진입이 아니라는 근거가
+    없으면 보수적으로 둔다.
+    """
+    if decision.allows_reentry_today:
+        return False
+    now = now or datetime.now()
+    entry_day = entry_date(slot)
+    return entry_day is None or entry_day >= now.date()
 
 
 def clear_block(slot: dict[str, Any]) -> dict[str, Any]:

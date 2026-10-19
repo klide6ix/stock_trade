@@ -85,7 +85,7 @@ DEFAULTS: dict[str, Any] = {
         "invested": None,               # 진입에 실제로 나간 현금 (체결금액 + 매수 제비용)
         "entry_at": None,               # 진입 시각(ISO) — 보유기간 만료 판정 기준
         "peak": None,                   # 진입 이후 최고가 — 최고가 대비 청산 기준
-        "blocked_date": None,           # 손절·최고가 청산이 난 날짜 — 같은 날 재진입 금지
+        "blocked_date": None,           # 그날 산 포지션이 손절·최고가로 청산된 날짜 — 같은 날 재진입 금지
         # 보유 중 다른 후보를 고르면 즉시 갈아타지 않고 여기 대기 — 트레이더가 매도 후 전환.
         "pending_target": None,         # 교체 예약 후보 (find_targets 항목, 한글 키) | None
         "pending_action": None,         # "switch" → 트레이더가 이전 보유 전량 매도 후 pending 으로 전환

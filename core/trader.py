@@ -39,6 +39,7 @@ from core.short_term import (
     EtfDayTradeStrategy,
     allow_late_entry,
     block_today,
+    blocks_reentry,
     invested_amount,
     candidates_need_refresh,
     candidates_to_settings,
@@ -1240,7 +1241,10 @@ class Trader:
 
         - 보유기간 만료 청산 → 오늘 방향의 후보로 슬롯을 갱신해 **같은 날 재진입**한다
           (일 단위 회전이 이 전략의 정상 동작).
-        - 손절·최고가·마감 청산 → 오늘은 재진입하지 않는다 (`blocked_date` 마킹).
+        - **오늘 진입한** 포지션의 손절·최고가·마감 청산 → 오늘은 재진입하지 않는다
+          (`blocked_date` 마킹).
+        - 전 거래일 포지션이 개장 갭으로 손절·최고가에 걸린 경우 → 어제 판단의 결과일 뿐
+          오늘 방향과 무관하므로 보유기간 만료처럼 재진입한다 (`blocks_reentry`).
         """
         code = slot["code"]
         name = slot.get("name") or code
@@ -1269,12 +1273,18 @@ class Trader:
         # 실현손익을 자금 풀에 누적 — 다음 진입 금액이 이 잔액을 그대로 따라간다.
         apply_short_term_pnl(invested, fill["amount"])
 
-        if not decision.allows_reentry_today:
+        if blocks_reentry(decision, slot):
             set_setting("short_term_trade", block_today(clear_position(slot)))
             log("[단기매매] 손실성 청산 — 오늘은 재진입하지 않음 (다음 거래일 개장부터 재개)")
             return
+        if not decision.allows_reentry_today:
+            log(
+                "[단기매매] 전 거래일 포지션의 청산 — 오늘 판단과 무관하므로 재진입 차단 없이 "
+                "오늘 방향으로 재진입"
+            )
 
-        # 보유기간 만료 — 오늘 방향의 후보로 갈아타 재진입 (같은 종목이어도 무방).
+        # 보유기간 만료(또는 전 거래일 포지션 청산) — 오늘 방향의 후보로 갈아타 재진입
+        # (같은 종목이어도 무방).
         auto_enabled = bool(slot.get("auto_enabled", False))
         next_target = self._short_term_pick_from_candidates(set(general.keys()))
         new_slot = target_to_settings(
